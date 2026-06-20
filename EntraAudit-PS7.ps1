@@ -833,12 +833,15 @@ function Invoke-Check-PrivRoles {
         if ($a.Principal -like '*#EXT#*') { $sev = 'Critical'; $reasons += 'guest/external' }
 
         $extra = if ($reasons.Count) { ' (' + ($reasons -join ', ') + ')' } else { '' }
+        # Include the directory object id so two findings for similarly-named but DISTINCT
+        # accounts (e.g. niclas@contoso.se vs niclas@contoso.onmicrosoft.com) are clearly
+        # separate objects, not a double-count - and so each gets a stable per-object id.
         Add-EntraFinding -Severity $sev -CheckId 'privileged-roles' -Category 'Privileged Access' `
             -Title ("Permanent (standing) {0}: {1}" -f $a.Role, $a.Principal) `
-            -Evidence ("{0} holds {1} as a PERMANENT/standing assignment{2}." -f $a.Principal, $a.Role, $extra) `
+            -Evidence ("{0} (object id {1}) holds {2} as a PERMANENT/standing assignment{3}." -f $a.Principal, $a.PrincipalId, $a.Role, $extra) `
             -WhyItMatters 'Standing privileged access is the largest cloud attack surface - the credential is always active. PIM-eligible (just-in-time) access is the target posture; permanent high-value roles, synced admins, and SP/guest admins defeat the boundaries PIM enforces.' `
             -RecommendedAction 'Convert this assignment to PIM-eligible (JIT) and remove the standing grant. Keep only two cloud-only break-glass Global Admins permanent. Require phishing-resistant MFA on every privileged principal.' `
-            -SourceFile $src -AffectedPrincipal $a.Principal `
+            -SourceFile $src -AffectedPrincipal $a.Principal -ObjectType $a.PrincipalType -ObjectId $a.PrincipalId `
             -ResultRows @($rows | Where-Object { $_.PrincipalId -eq $a.PrincipalId })
     }
 
@@ -3522,7 +3525,9 @@ function Write-RawDataIndexReport {
     $rows = foreach ($d in $script:RawDatasets) {
         "<tr><td>$(HtmlEncode $d.Title)</td><td class='mono'>$(HtmlEncode $d.BaseName)</td><td style='text-align:right'>$($d.Rows)</td><td><a href='$(HtmlAttrEncode $d.HtmlHref)'>HTML</a> &middot; <a href='$(HtmlAttrEncode $d.CsvHref)' download>CSV</a> &middot; <a href='$(HtmlAttrEncode $d.TxtHref)' download>TXT</a></td></tr>"
     }
-    $total = @($script:RawDatasets).Count
+    # NB: use .Count directly - on PowerShell 7.6.x, wrapping a generic List in @() throws
+    # "Argument types do not match" (@($genericList) regression). $list.Count is always safe.
+    $total = $script:RawDatasets.Count
     $html = @"
 <!doctype html>
 <html lang="en">
@@ -3693,7 +3698,7 @@ function Invoke-EntraAudit {
     $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss K'
 
     $stats = @{
-        Users  = if ($script:UsersCache) { @($script:UsersCache).Count } else { '-' }
+        Users  = if ($script:UsersCache) { $script:UsersCache.Count } else { '-' }
         Guests = if ($script:UsersCache) { @($script:UsersCache | Where-Object { $_.UserType -eq 'Guest' }).Count } else { '-' }
         Apps   = $script:AppCount
     }
