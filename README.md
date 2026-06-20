@@ -55,17 +55,22 @@ Results are written to a tenant-named, timestamped folder (mirrors the AD audit 
 ```
 <TenantName>-EntraAudit-<yyyyMMdd-HHmm>\
    HTML Reports\
-      EntraAudit-Results.html     # all findings, grouped by severity, filterable
-      Risk-Report.html            # executive 0-100 score, band matrix, top risks
-      Posture-Summary.html        # per-check status grid + licensing/coverage
+      EntraAudit-Results.html           # all findings, grouped by severity, filterable
+      Risk-Report.html                  # executive 0-100 score, band matrix, top risks
+      Posture-Summary.html              # per-check status grid + licensing/coverage
+      Raw-Data.html                     # index of every raw dataset (HTML/CSV/TXT links)
    Raw Data\Source\
-      privileged_roles.csv/.txt   # one evidence file per check (full data)
-      accounts.csv/.txt
-      conditional_access.csv/.txt
+      privileged_roles.html/.csv/.txt   # each check: styled HTML table + CSV + TXT
+      accounts.html/.csv/.txt
+      conditional_access.html/.csv/.txt
       ... (etc.)
+   Findings.json                        # all findings, machine-readable (automation / trend)
+   Findings.csv                         # all findings, flat (operations hand-off)
 ```
 
-The three reports share a top navigation bar (Audit Results · Risk Report · Posture Summary) and a light/dark theme toggle, exactly like the AD reports. Each finding links to its raw evidence file under `Raw Data\Source\` for technician hand-off. Raw evidence is written for **every** check, even ones that pass, so you always have the underlying data.
+The four reports share a top navigation bar (Audit Results · Risk Report · Posture Summary · Raw Data) and a light/dark theme toggle, exactly like the AD reports.
+
+**Every check writes its full evidence three ways** — a styled, searchable **HTML** table (same design as the reports), a **CSV** (data), and a **TXT** (plain) — even when the check passes, so you always have the underlying data in a readable form. Each finding links to its dataset's HTML page, and the **Raw Data** tab indexes them all. `Findings.json` / `Findings.csv` give every finding a stable id (`TenantId|CheckId|object`) for automation and trend comparison.
 
 ---
 
@@ -79,7 +84,7 @@ The three reports share a top navigation bar (Audit Results · Risk Report · Po
 | `-accounts` | Account hygiene: disabled-but-licensed, non-expiring passwords, sync split | |
 | `-staleusers` | Stale / inactive / never-signed-in users | needs **P1** |
 | `-guests` | Guest / external user governance, privileged guests | |
-| `-mfa` | MFA capability & authentication-method strength | |
+| `-mfa` | MFA posture split — registered / capable / **strong** / **phishing-resistant**; flags admins lacking phishing-resistant methods (disabled accounts excluded) | |
 | `-legacyauth` | Legacy authentication usage (sign-in logs) | needs **P1** |
 | `-tenantposture` | Security Defaults, authorization policy & consent settings | |
 | `-capolicies` | Conditional Access policy posture | |
@@ -90,6 +95,10 @@ The three reports share a top navigation bar (Audit Results · Risk Report · Po
 | `-trusts` | Cross-tenant access & B2B trust | |
 | `-recentchanges` | Recently created users/groups & directory audit | |
 | `-tenanthealth` | Directory-sync / Password Hash Sync platform health | hybrid only |
+| `-pimpolicies` | **PIM policy quality** — activation requires MFA / approval / justification, max duration, permanent-allowed | needs **P2** |
+| `-breakglass` | **Emergency-access (break-glass) health** — count, cloud-only, GA, .onmicrosoft.com, recent test, licensing | pass `-BreakGlassUpns` |
+| `-authmethodpolicy` | Authentication-methods policy — weak (SMS/voice) vs phishing-resistant (FIDO2/WHfB), TAP reuse | |
+| `-accesspaths` | **Effective-access / attack-path graph** — duplicate privilege paths (classified **active** vs **eligible-only**), ownership-based escalation (group-, app- and SP-owners), and **CA-exclusion-group owners who can self-add to bypass MFA** | needs `Group.Read.All` (+ `Member.Read.Hidden` for hidden groups) |
 
 ### How the AD audit maps to the Entra audit
 
@@ -117,7 +126,7 @@ The three reports share a top navigation bar (Audit Results · Risk Report · Po
 | `-select <ids>` | Comma-separated check ids to run (e.g. `-select privileged-roles,mfa`) |
 | `-installdeps` | Install the Microsoft Graph SDK modules (CurrentUser scope) |
 
-> `-select` uses the **check ids** shown in the Posture-Summary (`privileged-roles`, `directory-roles`, `tenant-info`, …). The individual `-switch` form (`-privroles`, `-mfa`, …) is the convenient alias.
+> `-select` and `-exclude` accept **both** the check ids shown in the Posture-Summary (`privileged-roles`, `directory-roles`, `tenant-info`, …) **and** the switch-style aliases (`privroles`, `directoryroles`, `tenantinfo`, …), comma- **or** semicolon-separated. So a GUI-built `-exclude privroles,directoryroles` resolves correctly.
 
 ### Sign-in
 
@@ -185,8 +194,9 @@ The Risk-Report starts at **100** and deducts per finding by severity (with caps
 
 ## Notes & limitations
 
-- **Read-only guarantee:** the script self-aborts if Graph ever returns a write scope. Remediation is always left to the operator.
-- **License gating:** P1/P2-gated checks are reported as *Skipped-NoLicense*, never as "clean". Check the Posture-Summary for coverage.
+- **Read-only guarantee:** the script self-aborts if Graph returns any write scope. In **app-only** mode it goes further — it reads the app's *actual* granted app-role assignments (across all resource APIs) and **fails closed** at startup if any is write-capable. Remediation is always left to the operator.
+- **License gating:** P1-gated checks (`staleusers`, `legacyauth`) and P2-gated checks (`pimpolicies`, `riskyusers`) are reported as *Skipped-NoLicense* (not "clean") when the tier isn't detected; license detection reads enabled **service plans**, so P1/P2 bundled inside EMS/M365 SKUs is recognised. `privileged-roles` always runs (it falls back to classic role assignments without PIM).
+- **Stable finding ids:** `Findings.json`/`.csv` ids are count-independent (a finding's id doesn't change when "5 stale users" becomes "7"), so they're usable for run-over-run trend/diff. Every check also always writes its CSV (a `NoData` row when empty) so automation can rely on the file existing.
 - **Sign-in logs** are retained ~30 days; the legacy-auth check only sees that window.
 - A few signals (on-prem banned-password configuration, some Identity Protection detail) are not fully exposed by Graph read APIs and are reported with that caveat.
 

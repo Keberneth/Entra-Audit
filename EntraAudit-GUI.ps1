@@ -67,6 +67,10 @@ $AuditChecks = [ordered]@{
     trusts         = "Cross-tenant access and B2B trust"
     recentchanges  = "Recently created users/groups and directory audit"
     tenanthealth   = "Directory-sync / Password Hash Sync platform health"
+    pimpolicies    = "PIM policy quality (activation MFA/approval/justification/duration) - needs P2"
+    breakglass     = "Emergency-access (break-glass) account health - pass -BreakGlassUpns"
+    authmethodpolicy = "Tenant authentication-methods policy (weak vs phishing-resistant)"
+    accesspaths    = "Effective-access / attack-path graph (duplicate & ownership privilege paths)"
 }
 
 # -------------------------

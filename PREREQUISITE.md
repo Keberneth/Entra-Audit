@@ -86,7 +86,6 @@ Application.Read.All
 User.Read.All
 Group.Read.All
 Organization.Read.All
-UserAuthenticationMethod.Read.All
 DelegatedPermissionGrant.Read.All
 Device.Read.All
 IdentityRiskyUser.Read.All
@@ -95,6 +94,8 @@ IdentityRiskyServicePrincipal.Read.All
 CrossTenantInformation.ReadBasic.All
 OnPremDirectorySynchronization.Read.All
 Reports.Read.All
+RoleManagementPolicy.Read.Directory
+Member.Read.Hidden
 ```
 
 ### A.3 Run it
@@ -129,8 +130,7 @@ For scheduled runs with no human present. You create one dedicated, read-only ap
    User.Read.All
    Group.Read.All
    Organization.Read.All
-   UserAuthenticationMethod.Read.All
-   DelegatedPermissionGrant.Read.All
+      DelegatedPermissionGrant.Read.All
    Device.Read.All
    IdentityRiskyUser.Read.All
    IdentityRiskEvent.Read.All
@@ -138,7 +138,11 @@ For scheduled runs with no human present. You create one dedicated, read-only ap
    CrossTenantInformation.ReadBasic.All
    OnPremDirectorySynchronization.Read.All
    Reports.Read.All
+   RoleManagementPolicy.Read.Directory
+   Member.Read.Hidden
    ```
+
+   > **App-only read-only enforcement:** on every app-only run the script reads this app's *actual* granted app-role assignments (across all resource APIs) and **refuses to run** if any is write-capable — so an accidentally over-permissioned app registration fails closed at startup rather than running with write access.
 3. Click **Grant admin consent**.
 4. *(Optional, belt-and-suspenders)* also assign the **Global Reader** directory role to this app's service principal.
 
@@ -200,12 +204,15 @@ If you want to grant the absolute minimum for a subset of checks, this maps each
 | `Application.Read.All` | apps |
 | `DelegatedPermissionGrant.Read.All` | consentgrants |
 | `Group.Read.All` | guests, apps (role-assignable groups), recentchanges |
-| `UserAuthenticationMethod.Read.All` | mfa (per-user method strength) |
 | `Device.Read.All` | devices |
 | `IdentityRiskyUser.Read.All` / `IdentityRiskEvent.Read.All` / `IdentityRiskyServicePrincipal.Read.All` | riskyusers |
 | `CrossTenantInformation.ReadBasic.All` | trusts (partner resolution) |
 | `OnPremDirectorySynchronization.Read.All` | tenanthealth |
 | `Reports.Read.All` | mfa (registration report alt), usage |
+| `RoleManagementPolicy.Read.Directory` | pimpolicies (PIM activation policy rules) |
+| `Member.Read.Hidden` | accesspaths (expand hidden-membership groups; optional) |
+
+> **Least-privilege note:** the `-authmethodpolicy` check is satisfied by the broad `Policy.Read.All` (which the tool already requests for the CA / posture checks). If you want to grant the narrowest possible permission for it instead, `Policy.Read.AuthenticationMethod` is the least-privileged Graph permission for reading the authentication-methods policy.
 
 ---
 

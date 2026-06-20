@@ -70,6 +70,10 @@ param(
     [switch]$trusts,            # Cross-tenant access & B2B trust
     [switch]$recentchanges,     # Recently created users/groups & directory audit
     [switch]$tenanthealth,      # Directory-sync / PHS platform health
+    [switch]$pimpolicies,       # PIM role-management policy quality (activation MFA/approval/duration)
+    [switch]$breakglass,        # Emergency-access (break-glass) account health
+    [switch]$authmethodpolicy,  # Tenant authentication-methods policy
+    [switch]$accesspaths,       # Effective-access / attack-path correlation
 
     # ---- Auth (app-only certificate; omit for interactive) ----
     [string]$TenantId,
@@ -109,7 +113,6 @@ $script:ScopesRO = @(
     'User.Read.All'
     'Group.Read.All'
     'Organization.Read.All'
-    'UserAuthenticationMethod.Read.All'
     'DelegatedPermissionGrant.Read.All'
     'Device.Read.All'
     'IdentityRiskyUser.Read.All'
@@ -118,6 +121,8 @@ $script:ScopesRO = @(
     'CrossTenantInformation.ReadBasic.All'
     'OnPremDirectorySynchronization.Read.All'
     'Reports.Read.All'
+    'RoleManagementPolicy.Read.Directory'
+    'Member.Read.Hidden'
 )
 
 $script:RequiredModules = @(
@@ -183,6 +188,8 @@ $script:UserById    = @{}
 $script:RegCache    = $null
 $script:MfaCapableById = @{}
 $script:RoleDefById = @{}
+$script:RawDatasets = New-Object System.Collections.Generic.List[object]
+$script:PrivAssignments = $null
 
 # ===========================================================================
 # Small helpers
@@ -226,6 +233,50 @@ function Get-Ap {
     return $null
 }
 
+# Split comma/semicolon-separated input (a single "-BreakGlassUpns a;b" or a real
+# array both normalize the same way), trim, lowercase, de-duplicate.
+function Normalize-StringList {
+    param([string[]]$Values)
+    @($Values | ForEach-Object { $_ -split '[;,]' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() } | Select-Object -Unique)
+}
+
+# Switch-style names (what the GUI emits) -> registry check ids. Only the three that
+# differ need mapping; every other id equals its switch name.
+$script:CheckAliases = @{ 'tenantinfo' = 'tenant-info'; 'privroles' = 'privileged-roles'; 'directoryroles' = 'directory-roles' }
+
+function Resolve-CheckIds {
+    param([string[]]$Values)
+    $out = @()
+    foreach ($raw in (Normalize-StringList -Values $Values)) {
+        if ($script:Registry.Contains($raw)) { $out += $raw; continue }
+        if ($script:CheckAliases.ContainsKey($raw)) { $out += $script:CheckAliases[$raw]; continue }
+        Write-Warn2 "Unknown check id ignored: $raw"
+    }
+    @($out | Select-Object -Unique)
+}
+
+# Stable finding key: strip digits from the title so a changing COUNT
+# ("5 stale users" -> "7 stale users") does not change the id; the rule slug plus the
+# affected object identify the finding across runs (for new/resolved/trend comparison).
+function New-FindingKey {
+    param([string]$TenantId, [string]$CheckId, [string]$Title, [string]$AffectedPrincipal)
+    $ruleSlug = (($Title -replace '\d+','') -replace '[^A-Za-z]+','-').Trim('-').ToLowerInvariant()
+    $obj = if ($AffectedPrincipal) { $AffectedPrincipal.ToLowerInvariant() } else { 'tenant' }
+    '{0}|{1}|{2}|{3}' -f $TenantId, $CheckId, $ruleSlug, $obj
+}
+
+# A CA policy enforces MFA if it uses the built-in 'mfa' grant OR an authentication
+# strength (passwordless / phishing-resistant). Recognising auth strengths avoids
+# false "no MFA policy" findings on modern tenants.
+function Test-CaPolicyRequiresMfaOrStrength {
+    param($Policy)
+    $grant = $Policy.GrantControls
+    if (-not $grant) { return $false }
+    if (@($grant.BuiltInControls) -contains 'mfa') { return $true }
+    if ($grant.AuthenticationStrength -and $grant.AuthenticationStrength.Id) { return $true }
+    return $false
+}
+
 # ===========================================================================
 # Finding emission + raw evidence
 # ===========================================================================
@@ -251,8 +302,10 @@ function Add-EntraFinding {
     }) | Out-Null
 }
 
-# Writes tabular evidence to CSV + a readable TXT header; returns the relative
-# href (from HTML Reports\) so findings can link to their source file.
+# Writes each raw dataset three ways - CSV (data), TXT (plain), and a styled HTML
+# table in the same design as the reports - and registers it for the Raw Data index.
+# Returns the relative href (from HTML Reports\) to the HTML version so findings link
+# to a readable page; the index also links the CSV/TXT for download.
 function Write-Evidence {
     param(
         [string]$BaseName,          # e.g. 'privileged_roles'
@@ -262,26 +315,37 @@ function Write-Evidence {
     )
     $rel = $null
     try {
-        $csvPath = Join-Path $script:RawDir ($BaseName + '.csv')
-        $txtPath = Join-Path $script:RawDir ($BaseName + '.txt')
+        $csvPath  = Join-Path $script:RawDir ($BaseName + '.csv')
+        $txtPath  = Join-Path $script:RawDir ($BaseName + '.txt')
+        $htmlPath = Join-Path $script:RawDir ($BaseName + '.html')
+        $count = @($Rows).Count
 
-        $header = @()
-        $header += $Title
-        $header += ('Generated: {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss K'))
+        $header = @($Title, ('Generated: {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss K')))
         if ($Notes) { $Notes | ForEach-Object { $header += $_ } }
-        $header += ('Rows: {0}' -f (@($Rows).Count))
-        $header += ''
+        $header += ('Rows: {0}' -f $count); $header += ''
 
-        if ($Rows -and @($Rows).Count -gt 0) {
+        if ($Rows -and $count -gt 0) {
             @($Rows) | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
             $table = @($Rows) | Format-Table -AutoSize | Out-String -Width 4096
             Set-Content -LiteralPath $txtPath -Value (($header -join "`r`n") + "`r`n" + $table) -Encoding UTF8
         } else {
+            # Always write the CSV (even with no rows) so automation can rely on the file
+            # existing and can distinguish "pass / no data" from "CSV generation failed".
+            [pscustomobject]@{ Status = 'NoData'; Message = 'No rows returned for this check.' } | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
             $header += '(no matching objects)'
             Set-Content -LiteralPath $txtPath -Value ($header -join "`r`n") -Encoding UTF8
         }
+
+        New-RawDataHtml -Path $htmlPath -Title $Title -Rows $Rows -Notes $Notes -CsvName ($BaseName + '.csv') -TxtName ($BaseName + '.txt')
+
         # Reports live in HTML Reports\, raw data in Raw Data\Source\
-        $rel = '../Raw Data/Source/' + (Split-Path $txtPath -Leaf)
+        $rel = '../Raw Data/Source/' + (Split-Path $htmlPath -Leaf)
+        $script:RawDatasets.Add([pscustomobject]@{
+            BaseName = $BaseName; Title = $Title; Rows = $count
+            HtmlHref = $rel
+            CsvHref  = ('../Raw Data/Source/' + $BaseName + '.csv')
+            TxtHref  = ('../Raw Data/Source/' + $BaseName + '.txt')
+        }) | Out-Null
     } catch {
         Write-Warn2 "Could not write evidence '$BaseName': $($_.Exception.Message)"
     }
@@ -365,8 +429,48 @@ function Connect-EntraAuditGraph {
         throw "Refusing to run: a non-read-only scope was granted -> $($bad -join ', '). This tool is read-only; reconnect with only *.Read.* scopes."
     }
 
+    # App-only: Get-MgContext.Scopes is sparse, so the scope regex above is not a
+    # reliable read-only guarantee. Inspect the running app's actual app-role assignments
+    # across ALL resource APIs and FAIL CLOSED if any granted permission is write-capable.
+    if ($appOnly) {
+        try { Assert-AppOnlyReadOnly -ClientId $ClientId }
+        catch {
+            try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
+            throw
+        }
+    }
+
     Write-Good ("Connected. Auth: {0} | Tenant: {1} | Account: {2}" -f $script:AuthType, $ctx.TenantId, ($ctx.Account ?? $ctx.AppName))
     return $ctx
+}
+
+# Fail-closed read-only enforcement for app-only runs: resolve the running service
+# principal's granted application permissions (across every resource SP, not just Graph)
+# and refuse to run if any is write-capable.
+function Assert-AppOnlyReadOnly {
+    param([Parameter(Mandatory)][string]$ClientId)
+    $allSps = @(Get-MgServicePrincipal -All -Property 'id,appId,displayName,appRoles' -ErrorAction Stop)
+    $self = $allSps | Where-Object { $_.AppId -eq $ClientId } | Select-Object -First 1
+    if (-not $self) { throw "Cannot verify app-only read-only posture: no service principal found for ClientId $ClientId." }
+
+    $roleMapByResourceId = @{}
+    foreach ($sp in $allSps) {
+        $m = @{}
+        foreach ($role in @($sp.AppRoles)) { if ($role.Id) { $m[[string]$role.Id] = $role.Value } }
+        $roleMapByResourceId[$sp.Id] = $m
+    }
+    $assignments = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $self.Id -All -ErrorAction Stop)
+    $writePattern = '(?i)(ReadWrite|\.Write\b|FullControl|full_access|ManageAsApp|AccessAsUser)'
+    $bad = @()
+    foreach ($a in $assignments) {
+        $value = $null
+        if ($roleMapByResourceId.ContainsKey($a.ResourceId)) { $value = $roleMapByResourceId[$a.ResourceId][[string]$a.AppRoleId] }
+        if ($value -and $value -match $writePattern) { $bad += ("{0}:{1}" -f $a.ResourceDisplayName, $value) }
+    }
+    if ($bad.Count -gt 0) {
+        throw "Refusing app-only run: write-capable application permission(s) granted to this app -> $($bad -join ', '). This tool is read-only; remove these permissions or use a dedicated read-only app registration."
+    }
+    Write-Good ("App-only read-only verified: {0} application permission(s) granted, none write-capable." -f $assignments.Count)
 }
 
 # Delegated-only scope gate. Directory.Read.All implicitly covers narrower reads.
@@ -398,8 +502,15 @@ function Invoke-AuditCheck {
         $script:CheckStatus[$CheckId] = [pscustomobject]@{ Title=$Title; Status='Skipped-NoScope'; Count=0 }
         return
     }
+    if ($NeedP1 -and -not $script:HasP1) {
+        $script:CheckStatus[$CheckId] = [pscustomobject]@{ Title=$Title; Status='Skipped-NoLicense'; Count=0 }
+        Write-Warn2 "  $Title -> Skipped-NoLicense (Entra ID P1 required)"
+        return
+    }
     if ($NeedP2 -and -not $script:HasP2) {
-        Write-Warn2 "  (license-gated: Entra ID P2 not detected - attempting anyway, results may be empty)"
+        $script:CheckStatus[$CheckId] = [pscustomobject]@{ Title=$Title; Status='Skipped-NoLicense'; Count=0 }
+        Write-Warn2 "  $Title -> Skipped-NoLicense (Entra ID P2 required)"
+        return
     }
 
     try {
@@ -429,7 +540,8 @@ function Get-EAUsers {
     if ($null -ne $script:UsersCache) { return $script:UsersCache }
     $props = @('Id','UserPrincipalName','DisplayName','AccountEnabled','UserType',
                'AssignedLicenses','LicenseAssignmentStates','PasswordPolicies',
-               'OnPremisesSyncEnabled','CreatedDateTime')
+               'OnPremisesSyncEnabled','CreatedDateTime',
+               'ExternalUserState','ExternalUserStateChangeDateTime')
     if (Test-MgScope @('AuditLog.Read.All') -Quiet) { $props += 'SignInActivity' }
     $script:UsersCache = @(Get-MgUser -All -Property $props -ErrorAction Stop)
     $script:UserById = @{}
@@ -625,7 +737,7 @@ function Invoke-Check-PrivRoles {
         -Title 'Privileged Role Assignments - Permanent vs Eligible vs Time-Bound' `
         -Notes @("PIM endpoints available: $pimAvailable", "Eligible assignments: $eligibleCount")
 
-    $bg = @(); if ($BreakGlassUpns) { $bg = @($BreakGlassUpns | ForEach-Object { $_.ToLowerInvariant() }) }
+    $bg = Normalize-StringList -Values $BreakGlassUpns
     $permanentPriv = @($rows | Where-Object { $_.IsPrivileged -and $_.State -eq 'Permanent' })
     $permanentGA   = @($permanentPriv | Where-Object { $_.IsGA })
 
@@ -829,45 +941,85 @@ function Invoke-Check-StaleUsers {
         return
     }
     $users = Get-EAUsers
-    $cut = (Get-Date).ToUniversalTime().AddDays(-$InactiveDays)
-    $cut180 = (Get-Date).ToUniversalTime().AddDays(-180)
-    $created30 = (Get-Date).ToUniversalTime().AddDays(-30)
+
+    # Privileged principals get a tighter inactivity bar (escalated severity).
+    $privIds = @{}
+    try {
+        $active = @(); try { $active += @(Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -All -ErrorAction Stop) } catch {}
+        if ($active.Count -eq 0) { try { $active += @(Get-MgRoleManagementDirectoryRoleAssignment -All -ErrorAction SilentlyContinue) } catch {} }
+        foreach ($a in $active) { if ($a.PrincipalId) { $privIds[$a.PrincipalId] = $true } }
+    } catch {}
+
+    $now0      = (Get-Date).ToUniversalTime()
+    $cut       = $now0.AddDays(-$InactiveDays)
+    $cut180    = $now0.AddDays(-180)
+    $created30 = $now0.AddDays(-30)
+    $privCut   = $now0.AddDays(-([Math]::Min($InactiveDays, 45)))   # admins held to <= 45 days
 
     $rows = @()
     foreach ($u in $users) {
         if ($u.UserType -eq 'Guest') { continue }
         $sa = $u.SignInActivity
-        $last = $null
+        $eff = $null; $conf = 'NeverSeen'
         if ($sa) {
-            $cands = @($sa.LastSignInDateTime, $sa.LastNonInteractiveSignInDateTime) | Where-Object { $_ }
-            if ($cands) { $last = ($cands | Sort-Object -Descending | Select-Object -First 1) }
+            # Prefer lastSuccessfulSignInDateTime: lastSignInDateTime can be a FAILED attempt
+            # (e.g. password-spray), which would make a dormant account look active.
+            if ($sa.LastSuccessfulSignInDateTime) {
+                $eff = [datetime]$sa.LastSuccessfulSignInDateTime; $conf = 'SuccessfulSignIn'
+            } elseif ($sa.LastSignInDateTime -or $sa.LastNonInteractiveSignInDateTime) {
+                $eff = @($sa.LastSignInDateTime, $sa.LastNonInteractiveSignInDateTime) | Where-Object { $_ } | ForEach-Object { [datetime]$_ } | Sort-Object -Descending | Select-Object -First 1
+                $conf = 'AttemptOnly'
+            }
         }
         $rows += [pscustomobject]@{
-            UserPrincipalName=$u.UserPrincipalName; Enabled=$u.AccountEnabled; Created=$u.CreatedDateTime
-            LastSignIn=$last; NeverSignedIn=($null -eq $last)
+            UserPrincipalName       = $u.UserPrincipalName
+            Enabled                 = $u.AccountEnabled
+            Privileged              = [bool]($u.Id -and $privIds.ContainsKey($u.Id))
+            Created                 = $u.CreatedDateTime
+            LastSuccessfulOrAttempt = $eff
+            Confidence              = $conf
         }
     }
-    $src = Write-Evidence -BaseName 'stale_users' -Rows $rows -Title ("Stale / Inactive Users (> {0} days)" -f $InactiveDays)
+    $src = Write-Evidence -BaseName 'stale_users' -Rows $rows -Title ("Stale / Inactive Users (> {0} days)" -f $InactiveDays) `
+        -Notes @('Activity prefers lastSuccessfulSignInDateTime. Confidence "AttemptOnly" = only failed/attempted sign-ins were recorded (no successful sign-in).')
 
-    $never = @($rows | Where-Object { $_.NeverSignedIn -and $_.Enabled -and $_.Created -and $_.Created -lt $created30 })
-    $stale = @($rows | Where-Object { -not $_.NeverSignedIn -and $_.Enabled -and $_.LastSignIn -lt $cut })
-    $stale180 = @($stale | Where-Object { $_.LastSignIn -lt $cut180 })
+    $privStale  = @($rows | Where-Object { $_.Privileged -and $_.Enabled -and (($_.Confidence -eq 'NeverSeen') -or ($_.LastSuccessfulOrAttempt -lt $privCut)) })
+    $never      = @($rows | Where-Object { -not $_.Privileged -and $_.Confidence -eq 'NeverSeen' -and $_.Enabled -and $_.Created -and $_.Created -lt $created30 })
+    $stale      = @($rows | Where-Object { -not $_.Privileged -and $_.Confidence -ne 'NeverSeen' -and $_.Enabled -and $_.LastSuccessfulOrAttempt -lt $cut })
+    $stale180   = @($stale | Where-Object { $_.LastSuccessfulOrAttempt -lt $cut180 })
+    $attemptOnly= @($rows | Where-Object { -not $_.Privileged -and $_.Confidence -eq 'AttemptOnly' -and $_.Enabled -and $_.LastSuccessfulOrAttempt -lt $cut })
 
+    if ($privStale.Count -gt 0) {
+        Add-EntraFinding -Severity 'High' -CheckId 'staleusers' -Category 'Identity Hygiene' `
+            -Title ("{0} privileged account(s) inactive / never successfully signed in" -f $privStale.Count) `
+            -Evidence ("Privileged accounts with no successful sign-in within {0} days: {1}" -f ([Math]::Min($InactiveDays,45)), (($privStale | Select-Object -First 10 -ExpandProperty UserPrincipalName) -join ', ')) `
+            -WhyItMatters 'A dormant account that still holds an admin role is standing privilege nobody is watching - an ideal takeover target. Admins should be held to a tighter inactivity bar than normal users.' `
+            -RecommendedAction 'Confirm the role is still needed; remove the standing privilege (move to PIM-eligible) or disable the account. Investigate any admin that has never successfully signed in.' `
+            -SourceFile $src -ResultRows @($privStale | Select-Object UserPrincipalName,LastSuccessfulOrAttempt,Confidence)
+    }
     if ($stale.Count -gt 0) {
         Add-EntraFinding -Severity 'Medium' -CheckId 'staleusers' -Category 'Identity Hygiene' `
             -Title ("{0} enabled account(s) inactive > {1} days" -f $stale.Count, $InactiveDays) `
-            -Evidence ("{0} enabled users have not signed in for over {1} days ({2} over 180 days)." -f $stale.Count, $InactiveDays, $stale180.Count) `
+            -Evidence ("{0} enabled users have no successful sign-in for over {1} days ({2} over 180 days)." -f $stale.Count, $InactiveDays, $stale180.Count) `
             -WhyItMatters 'Inactive but enabled accounts are prime password-spray targets and usually fall outside normal monitoring. Mirrors the AD inactive-account review.' `
-            -RecommendedAction 'Disable accounts inactive beyond the threshold after confirmation, and delete after a retention window. Use non-interactive sign-in to avoid false-positiving service-style accounts.' `
-            -SourceFile $src -ResultRows @($stale | Select-Object UserPrincipalName,LastSignIn,Enabled | Sort-Object LastSignIn)
+            -RecommendedAction 'Disable accounts inactive beyond the threshold after confirmation, and delete after a retention window.' `
+            -SourceFile $src -ResultRows @($stale | Select-Object UserPrincipalName,LastSuccessfulOrAttempt,Confidence | Sort-Object LastSuccessfulOrAttempt)
     }
     if ($never.Count -gt 0) {
         Add-EntraFinding -Severity 'Medium' -CheckId 'staleusers' -Category 'Identity Hygiene' `
-            -Title ("{0} enabled account(s) have never signed in" -f $never.Count) `
-            -Evidence ("{0} enabled accounts older than 30 days with no recorded sign-in." -f $never.Count) `
+            -Title ("{0} enabled account(s) have never successfully signed in" -f $never.Count) `
+            -Evidence ("{0} enabled accounts older than 30 days with no successful sign-in on record." -f $never.Count) `
             -WhyItMatters 'Never-used accounts indicate provisioning errors or dormant accounts that can be used as backdoors.' `
             -RecommendedAction 'Verify each never-signed-in account is required; disable and remove the unneeded ones.' `
             -SourceFile $src -ResultRows @($never | Select-Object UserPrincipalName,Created)
+    }
+    if ($attemptOnly.Count -gt 0) {
+        Add-EntraFinding -Severity 'Low' -CheckId 'staleusers' -Category 'Identity Hygiene' `
+            -Title ("{0} enabled account(s) show only attempted (not successful) sign-ins" -f $attemptOnly.Count) `
+            -Evidence ("{0} accounts have sign-in attempts but no recent successful sign-in - possible password-spray noise on otherwise dormant accounts." -f $attemptOnly.Count) `
+            -WhyItMatters 'Attempts without a successful sign-in can make a dormant account look active and may indicate targeting (e.g. password spray).' `
+            -RecommendedAction 'Treat these as effectively inactive for lifecycle purposes and review the sign-in logs for malicious attempts.' `
+            -SourceFile $src -ResultRows @($attemptOnly | Select-Object UserPrincipalName,LastSuccessfulOrAttempt,Confidence)
     }
 }
 
@@ -894,7 +1046,8 @@ function Invoke-Check-Guests {
 
     $authz = $null; try { $authz = Get-MgPolicyAuthorizationPolicy -ErrorAction SilentlyContinue } catch {}
     $rows = $guestUsers | Select-Object UserPrincipalName, DisplayName, AccountEnabled, CreatedDateTime,
-        @{n='ExternalUserState';e={ (Get-Ap $_ 'externalUserState') }}
+        @{n='ExternalUserState';e={ $_.ExternalUserState }},
+        @{n='StateChanged';e={ $_.ExternalUserStateChangeDateTime }}
     $notes = @()
     if ($authz) { $notes += ("AllowInvitesFrom: {0}" -f $authz.AllowInvitesFrom); $notes += ("GuestUserRoleId: {0}" -f $authz.GuestUserRoleId) }
     $src = Write-Evidence -BaseName 'guests' -Rows $rows -Title 'Guest / External Users' -Notes $notes
@@ -924,14 +1077,25 @@ function Invoke-Check-Guests {
                 -RecommendedAction 'Restrict guest invitations to admins or designated guest inviters.' -SourceFile $src
         }
     }
-    $staleGuests = @($guestUsers | Where-Object { (Get-Ap $_ 'externalUserState') -eq 'PendingAcceptance' })
-    if ($staleGuests.Count -gt 0) {
+    $now0 = (Get-Date).ToUniversalTime()
+    $pending   = @($guestUsers | Where-Object { $_.ExternalUserState -eq 'PendingAcceptance' })
+    $pending90 = @($pending | Where-Object { $_.ExternalUserStateChangeDateTime -and ([datetime]$_.ExternalUserStateChangeDateTime) -lt $now0.AddDays(-90) })
+    $pending30 = @($pending | Where-Object { $_.ExternalUserStateChangeDateTime -and ([datetime]$_.ExternalUserStateChangeDateTime) -lt $now0.AddDays(-30) -and ([datetime]$_.ExternalUserStateChangeDateTime) -ge $now0.AddDays(-90) })
+    if ($pending90.Count -gt 0) {
+        Add-EntraFinding -Severity 'Medium' -CheckId 'guests' -Category 'External Access' `
+            -Title ("{0} guest invitation(s) pending acceptance > 90 days" -f $pending90.Count) `
+            -Evidence ("Guests in PendingAcceptance for over 90 days: {0}" -f $pending90.Count) `
+            -WhyItMatters 'Long-pending invitations are stale external objects that clutter the directory and can mask abandoned or mistaken invites.' `
+            -RecommendedAction 'Remove guest objects whose invitations have been pending for over 90 days.' `
+            -SourceFile $src -ResultRows @($pending90 | Select-Object UserPrincipalName,ExternalUserStateChangeDateTime)
+    }
+    if ($pending30.Count -gt 0) {
         Add-EntraFinding -Severity 'Low' -CheckId 'guests' -Category 'External Access' `
-            -Title ("{0} guest invitation(s) never redeemed" -f $staleGuests.Count) `
-            -Evidence ("PendingAcceptance guests: {0}" -f $staleGuests.Count) `
-            -WhyItMatters 'Never-redeemed guest objects are clutter that can hide stale external access.' `
-            -RecommendedAction 'Remove guest objects whose invitations were never accepted after a reasonable window.' `
-            -SourceFile $src -ResultRows @($staleGuests | Select-Object UserPrincipalName,CreatedDateTime)
+            -Title ("{0} guest invitation(s) pending acceptance 30-90 days" -f $pending30.Count) `
+            -Evidence ("Guests in PendingAcceptance for 30-90 days: {0}" -f $pending30.Count) `
+            -WhyItMatters 'Invitations that linger unredeemed are usually abandoned and should be cleaned up.' `
+            -RecommendedAction 'Follow up on or remove guest invitations that remain unredeemed beyond 30 days.' `
+            -SourceFile $src -ResultRows @($pending30 | Select-Object UserPrincipalName,ExternalUserStateChangeDateTime)
     }
     Add-EntraFinding -Severity 'Information' -CheckId 'guests' -Category 'External Access' `
         -Title ("{0} guest/external user(s) in the tenant" -f $guestUsers.Count) `
@@ -954,40 +1118,83 @@ function Invoke-Check-Mfa {
         foreach ($a in $active) { if ($a.PrincipalId) { $privIds[$a.PrincipalId] = $true } }
     } catch {}
 
-    $rows = $reg | Select-Object UserPrincipalName, IsAdmin, IsMfaCapable, IsMfaRegistered, IsSsprRegistered,
-        @{n='Methods';e={ ($_.MethodsRegistered -join ',') }}
-    $src = Write-Evidence -BaseName 'mfa_registration' -Rows $rows -Title 'MFA Capability & Authentication Method Strength'
+    # Disabled accounts are excluded from the risk findings (a disabled account that is
+    # not MFA-capable is not a live risk).
+    $enabledById = @{}
+    try { foreach ($u in (Get-EAUsers)) { if ($u.Id) { $enabledById[$u.Id] = [bool]$u.AccountEnabled } } } catch {}
 
-    $adminNoMfa = @($reg | Where-Object { ($_.IsAdmin -or ($_.Id -and $privIds.ContainsKey($_.Id))) -and -not $_.IsMfaCapable })
-    $weak = @($reg | Where-Object { ($_.IsAdmin -or ($_.Id -and $privIds.ContainsKey($_.Id))) -and $_.IsMfaCapable -and `
-        -not (@($_.MethodsRegistered) | Where-Object { $_ -match 'fido2|windowsHelloForBusiness|passwordless|microsoftAuthenticator' }) })
-    $memberNoMfa = @($reg | Where-Object { -not $_.IsAdmin -and -not $_.IsMfaCapable })
+    # Method-strength categories from the registration report's methodsRegistered.
+    # Phishing-resistant: FIDO2 / Windows Hello / passkeys / certificate-based.
+    # Strong (not phishing-resistant): Authenticator app / OTP / TAP.
+    # Weak: SMS / voice / email (anything not matching strong or phishing-resistant).
+    # Match the real methodsRegistered enum values. TAP is a bootstrap/recovery credential,
+    # not steady-state MFA, so it is deliberately NOT counted as "strong" - a TAP-only admin
+    # should still surface in the weak/no-strong bucket.
+    $phishRx  = '(?i)(fido2|windowsHello|passKey|x509Certificate)'
+    $strongRx = '(?i)(microsoftAuthenticator|oneTimePasscode)'
 
-    if ($adminNoMfa.Count -gt 0) {
-        Add-EntraFinding -Severity 'Critical' -CheckId 'mfa' -Category 'Authentication' `
-            -Title ("{0} privileged account(s) are NOT MFA-capable" -f $adminNoMfa.Count) `
-            -Evidence ("Admins without MFA capability: {0}" -f (($adminNoMfa | Select-Object -First 10 -ExpandProperty UserPrincipalName) -join ', ')) `
-            -WhyItMatters 'An admin that is not MFA-capable is effectively password-only and cannot be challenged - the single highest-value credential-theft target in the tenant.' `
-            -RecommendedAction 'Require phishing-resistant MFA (FIDO2 / Windows Hello / passwordless) for every privileged account before any standing or eligible role use.' `
-            -SourceFile $src -ResultRows @($adminNoMfa | Select-Object UserPrincipalName,IsAdmin,IsMfaCapable)
+    $rows = @()
+    foreach ($r in $reg) {
+        $methods = @($r.MethodsRegistered)
+        $hasPhish  = (@($methods | Where-Object { $_ -match $phishRx }).Count -gt 0)
+        $hasStrong = (@($methods | Where-Object { $_ -match $strongRx }).Count -gt 0)
+        $isPriv = ([bool]$r.IsAdmin -or ($r.Id -and $privIds.ContainsKey($r.Id)))
+        $enabled = if ($r.Id -and $enabledById.ContainsKey($r.Id)) { $enabledById[$r.Id] } else { $true }
+        $rows += [pscustomobject]@{
+            UserPrincipalName=$r.UserPrincipalName; Privileged=$isPriv; Enabled=$enabled
+            MfaRegistered=[bool]$r.IsMfaRegistered; MfaCapable=[bool]$r.IsMfaCapable
+            StrongMethod=$hasStrong; PhishingResistant=$hasPhish; Methods=($methods -join ',')
+        }
     }
-    if ($weak.Count -gt 0) {
+    $src = Write-Evidence -BaseName 'mfa_registration' -Rows $rows -Title 'MFA Posture - Registered / Capable / Strong / Phishing-Resistant'
+
+    $priv         = @($rows | Where-Object { $_.Privileged -and $_.Enabled })
+    $privNoMfa    = @($priv | Where-Object { -not $_.MfaCapable })
+    $privWeakOnly = @($priv | Where-Object { $_.MfaCapable -and -not $_.StrongMethod -and -not $_.PhishingResistant })
+    $privNoPhish  = @($priv | Where-Object { $_.MfaCapable -and $_.StrongMethod -and -not $_.PhishingResistant })
+    $memberNoMfa  = @($rows | Where-Object { -not $_.Privileged -and $_.Enabled -and -not $_.MfaCapable })
+    $enabledRows  = @($rows | Where-Object { $_.Enabled })
+
+    if ($privNoMfa.Count -gt 0) {
+        Add-EntraFinding -Severity 'Critical' -CheckId 'mfa' -Category 'Authentication' `
+            -Title ("{0} privileged account(s) are NOT MFA-capable" -f $privNoMfa.Count) `
+            -Evidence ("Admins without MFA capability: {0}" -f (($privNoMfa | Select-Object -First 10 -ExpandProperty UserPrincipalName) -join ', ')) `
+            -WhyItMatters 'An admin that is not MFA-capable is effectively password-only and cannot be challenged - the single highest-value credential-theft target in the tenant.' `
+            -RecommendedAction 'Require phishing-resistant MFA (FIDO2 / Windows Hello / passkeys) for every privileged account before any standing or eligible role use.' `
+            -SourceFile $src -ResultRows @($privNoMfa | Select-Object UserPrincipalName,MfaCapable,Methods)
+    }
+    if ($privWeakOnly.Count -gt 0) {
         Add-EntraFinding -Severity 'High' -CheckId 'mfa' -Category 'Authentication' `
-            -Title ("{0} privileged account(s) rely on weak MFA methods only" -f $weak.Count) `
-            -Evidence ("Admins with only weak methods (SMS/voice/email): {0}" -f (($weak | Select-Object -First 10 -ExpandProperty UserPrincipalName) -join ', ')) `
-            -WhyItMatters 'SMS/voice/email factors are phishable and SIM-swappable; admins need phishing-resistant methods.' `
-            -RecommendedAction 'Register FIDO2 / Windows Hello for Business / passwordless for privileged users and retire SMS/voice as a primary factor.' `
-            -SourceFile $src -ResultRows @($weak | Select-Object UserPrincipalName,@{n='Methods';e={$_.MethodsRegistered -join ','}})
+            -Title ("{0} privileged account(s) rely on weak MFA methods only (SMS/voice/email)" -f $privWeakOnly.Count) `
+            -Evidence ("Admins with only weak methods: {0}" -f (($privWeakOnly | Select-Object -First 10 -ExpandProperty UserPrincipalName) -join ', ')) `
+            -WhyItMatters 'SMS/voice/email factors are phishable and SIM-swappable. An admin whose only MFA is a weak factor can be phished or SIM-swapped into a full account takeover.' `
+            -RecommendedAction 'Register FIDO2 / Windows Hello / passkeys for these admins and retire SMS/voice as a factor.' `
+            -SourceFile $src -ResultRows @($privWeakOnly | Select-Object UserPrincipalName,Methods)
+    }
+    if ($privNoPhish.Count -gt 0) {
+        Add-EntraFinding -Severity 'Medium' -CheckId 'mfa' -Category 'Authentication' `
+            -Title ("{0} privileged account(s) have MFA but no phishing-resistant method" -f $privNoPhish.Count) `
+            -Evidence ("Admins with strong-but-phishable MFA (e.g. Authenticator push, OTP): {0}" -f (($privNoPhish | Select-Object -First 10 -ExpandProperty UserPrincipalName) -join ', ')) `
+            -WhyItMatters 'Push/OTP MFA is far better than passwords but is still phishable (real-time relay, MFA fatigue). Privileged accounts should use phishing-resistant methods.' `
+            -RecommendedAction 'Roll out FIDO2 security keys / passkeys / Windows Hello to all privileged users and require phishing-resistant authentication strength via Conditional Access.' `
+            -SourceFile $src -ResultRows @($privNoPhish | Select-Object UserPrincipalName,Methods)
     }
     if ($memberNoMfa.Count -gt 0) {
-        $sev = if ($reg.Count -gt 0 -and ($memberNoMfa.Count / [double]$reg.Count) -gt 0.25) { 'Medium' } else { 'Low' }
+        $denom = [Math]::Max(1, @($rows | Where-Object { -not $_.Privileged -and $_.Enabled }).Count)
+        $sev = if (($memberNoMfa.Count / [double]$denom) -gt 0.25) { 'Medium' } else { 'Low' }
         Add-EntraFinding -Severity $sev -CheckId 'mfa' -Category 'Authentication' `
-            -Title ("{0} non-admin account(s) are not MFA-capable" -f $memberNoMfa.Count) `
-            -Evidence ("Members without MFA capability: {0} of {1} reported." -f $memberNoMfa.Count, $reg.Count) `
+            -Title ("{0} enabled non-admin account(s) are not MFA-capable" -f $memberNoMfa.Count) `
+            -Evidence ("Enabled members without MFA capability: {0} of {1} enabled members." -f $memberNoMfa.Count, $denom) `
             -WhyItMatters 'Accounts that cannot be MFA-challenged are password-only and vulnerable to spray and replay.' `
             -RecommendedAction 'Drive MFA registration / capability to 100% for enabled members via registration campaigns and Conditional Access.' `
             -SourceFile $src
     }
+    $prAdopt = if ($enabledRows.Count) { [math]::Round((100 * @($enabledRows | Where-Object { $_.PhishingResistant }).Count / $enabledRows.Count), 1) } else { 0 }
+    Add-EntraFinding -Severity 'Information' -CheckId 'mfa' -Category 'Authentication' `
+        -Title ("Phishing-resistant MFA adoption: {0}% of enabled accounts" -f $prAdopt) `
+        -Evidence ("{0} of {1} enabled accounts have a phishing-resistant method registered; {2} privileged account(s) reviewed." -f @($enabledRows | Where-Object { $_.PhishingResistant }).Count, $enabledRows.Count, $priv.Count) `
+        -WhyItMatters 'Phishing-resistant adoption is the strongest single indicator of authentication maturity.' `
+        -RecommendedAction 'Drive phishing-resistant methods to 100% for privileged users first, then the wider population.' -SourceFile $src
 }
 
 # ===========================================================================
@@ -1121,11 +1328,11 @@ function Invoke-Check-CAPolicies {
     function _Has([scriptblock]$pred) { @($enabled | Where-Object $pred).Count -gt 0 }
 
     $mfaForAdmins = _Has {
-        ($_.GrantControls.BuiltInControls -contains 'mfa') -and
+        (Test-CaPolicyRequiresMfaOrStrength $_) -and
         ($_.Conditions.Users.IncludeRoles -and @($_.Conditions.Users.IncludeRoles).Count -gt 0)
     }
     $mfaForAll = _Has {
-        ($_.GrantControls.BuiltInControls -contains 'mfa') -and
+        (Test-CaPolicyRequiresMfaOrStrength $_) -and
         ($_.Conditions.Users.IncludeUsers -contains 'All')
     }
     $blocksLegacy = _Has {
@@ -1187,6 +1394,38 @@ function Invoke-Check-CAPolicies {
             }
         }
     }
+    # Privileged accounts that are NOT required to MFA (excluded from MFA-enforcing policies)
+    $mfaPolicies = @($enabled | Where-Object { Test-CaPolicyRequiresMfaOrStrength $_ })
+    if ($mfaPolicies.Count -gt 0) {
+        $excludedUserIds = New-Object System.Collections.Generic.HashSet[string]
+        $excludedGroupIds = @()
+        foreach ($p in $mfaPolicies) {
+            foreach ($uid in @($p.Conditions.Users.ExcludeUsers)) { if ($uid -and $uid -notmatch 'All|GuestsOrExternalUsers|None') { [void]$excludedUserIds.Add($uid) } }
+            foreach ($gid in @($p.Conditions.Users.ExcludeGroups)) { if ($gid -and $gid -notmatch 'All|GuestsOrExternalUsers|None') { $excludedGroupIds += $gid } }
+        }
+        foreach ($gid in (@($excludedGroupIds) | Where-Object { $_ } | Select-Object -Unique)) {
+            try { foreach ($m in @(Get-MgGroupTransitiveMember -GroupId $gid -All -ErrorAction SilentlyContinue)) { if ($m.Id) { [void]$excludedUserIds.Add($m.Id) } } } catch {}
+        }
+        $privIds = @{}
+        foreach ($a in (Get-EAPrivAssignments)) { if ($a.PrincipalId -and $a.State -eq 'Active') { $privIds[$a.PrincipalId] = $true } }
+        $bg = Normalize-StringList -Values $BreakGlassUpns
+        $excludedPriv = @()
+        foreach ($id in $excludedUserIds) {
+            if (-not $privIds.ContainsKey($id)) { continue }
+            $upn = if ($script:UserById.ContainsKey($id)) { $script:UserById[$id].UserPrincipalName } else { $id }
+            if ($upn -and $upn.ToLowerInvariant() -in $bg) { continue }   # break-glass exclusion is expected
+            $excludedPriv += [pscustomobject]@{ Account = $upn }
+        }
+        if ($excludedPriv.Count -gt 0) {
+            Add-EntraFinding -Severity 'Critical' -CheckId 'capolicies' -Category 'Tenant Posture' `
+                -Title ("{0} privileged account(s) are EXCLUDED from MFA Conditional Access" -f $excludedPriv.Count) `
+                -Evidence ("Admins not required to MFA (directly or via an excluded group): {0}" -f (($excludedPriv | Select-Object -First 10 -ExpandProperty Account) -join ', ')) `
+                -WhyItMatters 'An admin excluded from every MFA-enforcing policy can sign in with a password alone - the exclusion silently removes MFA from the highest-value accounts. Only the two designated break-glass accounts should be excluded.' `
+                -RecommendedAction 'Remove privileged accounts from MFA-policy exclusions (and from excluded groups); keep only the two break-glass accounts excluded.' `
+                -SourceFile $src -ResultRows $excludedPriv
+        }
+    }
+
     if ($script:Findings.Where({$_.CheckId -eq 'capolicies'}).Count -eq 0) {
         Add-EntraFinding -Severity 'Information' -CheckId 'capolicies' -Category 'Tenant Posture' `
             -Title ("{0} Conditional Access policy/policies enforce baseline controls" -f $enabled.Count) `
@@ -1271,8 +1510,10 @@ function Invoke-Check-RiskyUsers {
 # CHECK 12 - apps (app / service principal hygiene & over-privilege)
 # ===========================================================================
 function Invoke-Check-Apps {
-    $apps = @(Get-MgApplication -All -ErrorAction Stop)
-    $sps  = @(Get-MgServicePrincipal -All -ErrorAction Stop)
+    # keyCredentials/passwordCredentials require an explicit $select on Get-MgApplication.
+    $appProps = 'id,appId,displayName,passwordCredentials,keyCredentials,signInAudience,verifiedPublisher,createdDateTime'
+    $apps = @(Get-MgApplication -All -Property $appProps -ErrorAction Stop)
+    $sps  = @(Get-MgServicePrincipal -All -Property 'id,appId,displayName,appRoles,servicePrincipalType,accountEnabled' -ErrorAction Stop)
     $script:AppCount = $apps.Count
     $now = (Get-Date).ToUniversalTime()
     $soon = $now.AddDays($ExpiringCredentialDays)
@@ -1307,42 +1548,137 @@ function Invoke-Check-Apps {
             -RecommendedAction 'Remove expired credentials from the application objects.' -SourceFile $credSrc -ResultRows @($expired | Select-Object App,Type,End)
     }
 
-    # --- over-privileged app-role (application) permissions ---
-    $graphAppId = '00000003-0000-0000-c000-000000000000'
-    $graphSp = $sps | Where-Object { $_.AppId -eq $graphAppId } | Select-Object -First 1
-    $appRoleNameById = @{}
-    if ($graphSp) { foreach ($r in @($graphSp.AppRoles)) { $appRoleNameById[$r.Id] = $r.Value } }
+    # --- application permissions across ALL resource APIs (not just Microsoft Graph) ---
+    # Build appRoleId -> value map per RESOURCE service principal so dangerous permissions
+    # against Exchange Online, SharePoint, Azure Service Management and custom APIs are
+    # detected too, and classify each as tier-0 (Critical) or write/high (High).
+    $spById = @{}; foreach ($sp in $sps) { if ($sp.Id) { $spById[$sp.Id] = $sp } }
+    $appById = @{}; foreach ($a in $apps) { if ($a.AppId) { $appById[$a.AppId] = $a } }
+    $resourceRoleMap = @{}
+    $writeRx = '(?i)(ReadWrite|\.Write|FullControl|full_access|ManageAsApp|Mail\.Send)'
+
+    function _ResolveAppRoleValue([string]$resourceId, [string]$appRoleId) {
+        if (-not $resourceRoleMap.ContainsKey($resourceId)) {
+            $m = @{}
+            $rsp = $spById[$resourceId]
+            if ($rsp) { foreach ($r in @($rsp.AppRoles)) { if ($r.Id) { $m[[string]$r.Id] = $r.Value } } }
+            $resourceRoleMap[$resourceId] = $m
+        }
+        $v = $resourceRoleMap[$resourceId][[string]$appRoleId]
+        if ($v) { $v } else { [string]$appRoleId }
+    }
 
     $permRows = @()
     foreach ($sp in $sps) {
         $asn = @()
         try { $asn = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -All -ErrorAction SilentlyContinue) } catch {}
         foreach ($x in $asn) {
-            $permName = $appRoleNameById[$x.AppRoleId]; if (-not $permName) { $permName = $x.AppRoleId }
-            $dangerous = ($permName -in $script:DangerousAppPermissions)
-            if ($dangerous) {
-                $permRows += [pscustomobject]@{ ServicePrincipal=$sp.DisplayName; AppId=$sp.AppId; Permission=$permName; Resource=$x.ResourceDisplayName }
+            $permName = _ResolveAppRoleValue $x.ResourceId $x.AppRoleId
+            $isTier0 = ($permName -in $script:DangerousAppPermissions)
+            $isWrite = ($permName -match $writeRx)
+            if (-not ($isTier0 -or $isWrite)) { continue }
+            $tier = if ($isTier0) { 'Tier0' } else { 'Write/High' }
+            $permRows += [pscustomobject]@{
+                ServicePrincipal=$sp.DisplayName; AppId=$sp.AppId; SpId=$sp.Id
+                Permission=$permName; Resource=$x.ResourceDisplayName; Tier=$tier
             }
         }
     }
-    $permSrc = Write-Evidence -BaseName 'app_permissions' -Rows $permRows -Title 'Over-Privileged Application Permissions'
-    if ($permRows.Count -gt 0) {
-        $spNames = @($permRows.ServicePrincipal | Select-Object -Unique)
+    $permSrc = Write-Evidence -BaseName 'app_permissions' -Rows $permRows -Title 'Application Permissions (write / high-privilege, all resource APIs)'
+
+    $tier0 = @($permRows | Where-Object { $_.Tier -eq 'Tier0' })
+    $writePerms = @($permRows | Where-Object { $_.Tier -eq 'Write/High' })
+    if ($tier0.Count -gt 0) {
+        $spNames = @($tier0.ServicePrincipal | Select-Object -Unique)
         Add-EntraFinding -Severity 'Critical' -CheckId 'apps' -Category 'Applications' `
-            -Title ("{0} service principal(s) hold tier-0 Graph application permissions" -f $spNames.Count) `
-            -Evidence ("Over-privileged apps: {0}" -f (($spNames | Select-Object -First 10) -join ', ')) `
-            -WhyItMatters 'Application permissions need no signed-in user and are fully exercised by a single leaked secret - the cloud equivalent of dangerous directory ACLs plus Kerberoastable service accounts combined. A permission like RoleManagement.ReadWrite.Directory or full mailbox access is a tenant-takeover primitive.' `
+            -Title ("{0} service principal(s) hold tier-0 application permissions" -f $spNames.Count) `
+            -Evidence ("Tier-0 over-privileged apps: {0}" -f (($spNames | Select-Object -First 10) -join ', ')) `
+            -WhyItMatters 'Application permissions need no signed-in user and are fully exercised by a single leaked secret - the cloud equivalent of dangerous directory ACLs plus Kerberoastable service accounts. Permissions like RoleManagement.ReadWrite.Directory, Directory.ReadWrite.All or full mailbox access are tenant-takeover primitives regardless of which API (Graph, Exchange, SharePoint, custom) grants them.' `
             -RecommendedAction 'Remove tier-0 application permissions that are not justified, replace with least-privilege scoped permissions, and rotate the apps to certificate credentials.' `
-            -SourceFile $permSrc -ResultRows $permRows
+            -SourceFile $permSrc -ResultRows $tier0
+    }
+    if ($writePerms.Count -gt 0) {
+        $spNames = @($writePerms.ServicePrincipal | Select-Object -Unique)
+        Add-EntraFinding -Severity 'High' -CheckId 'apps' -Category 'Applications' `
+            -Title ("{0} service principal(s) hold write-level application permissions" -f $spNames.Count) `
+            -Evidence ("Apps with write/high permissions: {0}" -f (($spNames | Select-Object -First 10) -join ', ')) `
+            -WhyItMatters 'Write-capable application permissions (ReadWrite / FullControl / Mail.Send / full_access) let a non-interactive app modify data or configuration tenant-wide. A leaked secret on such an app is a direct data-integrity and persistence risk.' `
+            -RecommendedAction 'Confirm each write permission is required; downgrade to read-only where possible and scope to specific resources. Ensure these apps use certificates and have accountable owners.' `
+            -SourceFile $permSrc -ResultRows $writePerms
     }
 
-    # --- owners (non-admin owner on a privileged or credentialed app) ---
+    # --- over-privileged SP hardening: owners, verified publisher, multi-tenant ---
+    $privSpIds = @($permRows.SpId | Select-Object -Unique)
+    # privileged user set: an over-privileged app owned by a NON-privileged or disabled user
+    # is an escalation path (that owner can add a credential and act as the app).
+    $privUserIds = @{}
+    try { foreach ($a in (Get-EAPrivAssignments)) { if ($a.PrincipalId -and $a.PrincipalType -eq 'user') { $privUserIds[$a.PrincipalId] = $true } } } catch {}
+    $hardenRows = @()
+    foreach ($spId in $privSpIds) {
+        $sp = $spById[$spId]; if (-not $sp) { continue }
+        $owners = @(); try { $owners = @(Get-MgServicePrincipalOwner -ServicePrincipalId $spId -All -ErrorAction SilentlyContinue) } catch {}
+        $ownerUpns = @($owners | ForEach-Object { Get-Ap $_ 'userPrincipalName' } | Where-Object { $_ })
+        $guestOwner = (@($ownerUpns | Where-Object { $_ -like '*#EXT#*' }).Count -gt 0)
+        $nonAdminOwner = $false
+        foreach ($o in $owners) {
+            $oid = $o.Id; $oupn = Get-Ap $o 'userPrincipalName'
+            if (-not $oupn -or $oupn -like '*#EXT#*') { continue }   # user owners only; guests counted separately
+            $disabled = ($oid -and $script:UserById.ContainsKey($oid) -and -not [bool]$script:UserById[$oid].AccountEnabled)
+            $isPriv   = ($oid -and $privUserIds.ContainsKey($oid))
+            if ($disabled -or -not $isPriv) { $nonAdminOwner = $true }
+        }
+        $app = $appById[$sp.AppId]
+        $multiTenant = [bool]($app -and $app.SignInAudience -match 'AzureADMultipleOrgs')
+        # verifiedPublisher exists on the application object, not the service principal.
+        $verifiedPub = [bool]($app -and $app.VerifiedPublisher -and $app.VerifiedPublisher.DisplayName)
+        $hardenRows += [pscustomobject]@{
+            ServicePrincipal=$sp.DisplayName; AppId=$sp.AppId; OwnerCount=$owners.Count
+            Owners=($ownerUpns -join ','); GuestOwner=$guestOwner; NonAdminOwner=$nonAdminOwner; MultiTenant=$multiTenant; VerifiedPublisher=$verifiedPub
+        }
+    }
+    if ($hardenRows.Count -gt 0) {
+        $hsrc = Write-Evidence -BaseName 'app_overprivileged_hardening' -Rows $hardenRows -Title 'Over-Privileged App Hardening (owners / publisher / tenancy)'
+        $noOwner = @($hardenRows | Where-Object { $_.OwnerCount -eq 0 })
+        $guestOwned = @($hardenRows | Where-Object { $_.GuestOwner })
+        $mtUnverified = @($hardenRows | Where-Object { $_.MultiTenant -and -not $_.VerifiedPublisher })
+        if ($noOwner.Count -gt 0) {
+            Add-EntraFinding -Severity 'Critical' -CheckId 'apps' -Category 'Applications' `
+                -Title ("{0} over-privileged service principal(s) have NO owner" -f $noOwner.Count) `
+                -Evidence ("Ownerless high-permission apps: {0}" -f (($noOwner.ServicePrincipal | Select-Object -First 10) -join ', ')) `
+                -WhyItMatters 'A high-permission app with no owner is unaccountable - nobody is responsible for its credentials or permissions, and its compromise may go unnoticed.' `
+                -RecommendedAction 'Assign an accountable administrative owner to every high-permission app, or decommission it.' -SourceFile $hsrc -ResultRows $noOwner
+        }
+        if ($guestOwned.Count -gt 0) {
+            Add-EntraFinding -Severity 'Critical' -CheckId 'apps' -Category 'Applications' `
+                -Title ("{0} over-privileged service principal(s) owned by a guest/external user" -f $guestOwned.Count) `
+                -Evidence ("Guest-owned high-permission apps: {0}" -f (($guestOwned.ServicePrincipal | Select-Object -First 10) -join ', ')) `
+                -WhyItMatters 'A guest who owns a high-permission app can add credentials to it and act with its application permissions - an externally-controlled tenant-takeover path.' `
+                -RecommendedAction 'Remove guest/external owners from high-permission apps immediately and review the app for unexpected credentials.' -SourceFile $hsrc -ResultRows $guestOwned
+        }
+        if ($mtUnverified.Count -gt 0) {
+            Add-EntraFinding -Severity 'High' -CheckId 'apps' -Category 'Applications' `
+                -Title ("{0} multi-tenant high-permission app(s) without a verified publisher" -f $mtUnverified.Count) `
+                -Evidence ("Multi-tenant + unverified-publisher high-permission apps: {0}" -f (($mtUnverified.ServicePrincipal | Select-Object -First 10) -join ', ')) `
+                -WhyItMatters 'Multi-tenant apps from unverified publishers holding high permissions are a common consent-phishing and supply-chain risk.' `
+                -RecommendedAction 'Verify the publisher and necessity of each multi-tenant high-permission app; restrict user consent to verified publishers.' -SourceFile $hsrc -ResultRows $mtUnverified
+        }
+        $nonAdminOwned = @($hardenRows | Where-Object { $_.NonAdminOwner -and -not $_.GuestOwner })
+        if ($nonAdminOwned.Count -gt 0) {
+            Add-EntraFinding -Severity 'High' -CheckId 'apps' -Category 'Applications' `
+                -Title ("{0} over-privileged app(s) owned by a non-privileged or disabled user" -f $nonAdminOwned.Count) `
+                -Evidence ("High-permission apps with a non-admin/disabled user owner: {0}" -f (($nonAdminOwned.ServicePrincipal | Select-Object -First 10) -join ', ')) `
+                -WhyItMatters 'A non-privileged (or disabled-but-still-owner) user who owns a high-permission app can add a credential to it and act with the app''s application permissions - an indirect privilege-escalation path that bypasses the directory-role model.' `
+                -RecommendedAction 'Restrict ownership of high-permission apps to accountable administrators; remove non-privileged and disabled user owners.' -SourceFile $hsrc -ResultRows $nonAdminOwned
+        }
+    }
+
+    # --- owners (no-owner credentialed app) ---
     $ownerRows = @()
     foreach ($a in $apps) {
-        $owners = @(); try { $owners = @(Get-MgApplicationOwner -ApplicationId $a.Id -All -ErrorAction SilentlyContinue) } catch {}
         if (@($a.PasswordCredentials).Count -gt 0 -or @($a.KeyCredentials).Count -gt 0) {
+            $owners = @(); try { $owners = @(Get-MgApplicationOwner -ApplicationId $a.Id -All -ErrorAction SilentlyContinue) } catch {}
             if ($owners.Count -eq 0) {
-                $ownerRows += [pscustomobject]@{ App=$a.DisplayName; Owners='(none)'; Note='Orphaned credentialed app' }
+                $ownerRows += [pscustomobject]@{ App=$a.DisplayName; AppId=$a.AppId; Note='Orphaned credentialed app' }
             }
         }
     }
@@ -1419,6 +1755,19 @@ function Invoke-Check-ConsentGrants {
             -RecommendedAction 'Review per-user high-scope grants for unrecognised apps and restrict user consent to verified publishers / low-impact permissions.' `
             -SourceFile $src -ResultRows $userHigh
     }
+    # Admin consent request workflow - if disabled while user consent is permissive,
+    # users have no safe path to request apps and may be tempted into risky self-consent.
+    try {
+        $acr = Get-MgPolicyAdminConsentRequestPolicy -ErrorAction SilentlyContinue
+        if ($acr -and -not $acr.IsEnabled) {
+            Add-EntraFinding -Severity 'Low' -CheckId 'consentgrants' -Category 'Applications' `
+                -Title 'Admin consent request workflow is disabled' `
+                -Evidence 'adminConsentRequestPolicy.isEnabled = false.' `
+                -WhyItMatters 'Without an admin-consent request workflow, users cannot request approval for apps that need admin consent - which pushes orgs toward leaving user consent permissive (the illicit-consent risk).' `
+                -RecommendedAction 'Enable the admin consent request workflow so user consent can be restricted while users still have a governed path to request apps.' -SourceFile $src
+        }
+    } catch {}
+
     if ($tenantWideHigh.Count -eq 0 -and $userHigh.Count -eq 0) {
         Add-EntraFinding -Severity 'Information' -CheckId 'consentgrants' -Category 'Applications' `
             -Title 'No high-impact OAuth consent grants detected' `
@@ -1607,6 +1956,504 @@ function Invoke-Check-TenantHealth {
 }
 
 # ===========================================================================
+# Shared privileged-assignment cache (used by the access-path / break-glass checks)
+# ===========================================================================
+function Get-EAPrivAssignments {
+    if ($null -ne $script:PrivAssignments) { return $script:PrivAssignments }
+    Get-EARoleDefMap | Out-Null
+    try { Get-EAUsers | Out-Null } catch {}
+    $list = New-Object System.Collections.Generic.List[object]
+
+    function _Add($a, $state) {
+        $rd = $script:RoleDefById[$a.RoleDefinitionId]
+        $tmpl = if ($rd) { $rd.TemplateId } else { [string]$a.RoleDefinitionId }
+        $name = if ($rd) { $rd.DisplayName } else { [string]$a.RoleDefinitionId }
+        $p = $a.Principal
+        $id = if ($a.PrincipalId) { $a.PrincipalId } elseif ($p) { $p.Id } else { $null }
+        $odt = Get-Ap $p '@odata.type'
+        $upn = Get-Ap $p 'userPrincipalName'
+        $pname = Get-Ap $p 'displayName'
+        if (-not $upn -and $id -and $script:UserById.ContainsKey($id)) { $upn = $script:UserById[$id].UserPrincipalName }
+        $ptype = if ($odt) { ($odt -replace '#microsoft.graph.','') } elseif ($upn) { 'user' } elseif ($id -and $script:UserById.ContainsKey($id)) { 'user' } else { 'group/sp' }
+        $list.Add([pscustomobject]@{
+            PrincipalId=$id; PrincipalType=$ptype; PrincipalUpn=$upn; PrincipalName=$pname
+            RoleTemplateId=$tmpl; RoleName=$name; State=$state
+            IsPrivileged=$script:PrivilegedRoleTemplates.ContainsKey($tmpl); IsGA=($tmpl -eq $script:GlobalAdminTemplateId)
+        }) | Out-Null
+    }
+
+    $active = @()
+    try { $active += @(Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -All -ExpandProperty Principal -ErrorAction Stop) } catch {}
+    if ($active.Count -eq 0) { try { $active += @(Get-MgRoleManagementDirectoryRoleAssignment -All -ExpandProperty Principal -ErrorAction SilentlyContinue) } catch {} }
+    foreach ($a in $active) { _Add $a 'Active' }
+    try { foreach ($a in @(Get-MgRoleManagementDirectoryRoleEligibilityScheduleInstance -All -ExpandProperty Principal -ErrorAction SilentlyContinue)) { _Add $a 'Eligible' } } catch {}
+
+    $script:PrivAssignments = $list
+    return $list
+}
+
+# ===========================================================================
+# CHECK 18 - pimpolicies (PIM role-management policy quality)
+# ===========================================================================
+function Invoke-Check-PimPolicies {
+    Get-EARoleDefMap | Out-Null
+    # scopeType for Entra directory-role policies is 'DirectoryRole' on most tenants but
+    # 'Directory' on some - try the documented value first, fall back to the other.
+    function _FetchPim([string]$scopeType) {
+        $u = "https://graph.microsoft.com/v1.0/policies/roleManagementPolicyAssignments?`$filter=scopeId eq '/' and scopeType eq '$scopeType'&`$expand=policy(`$expand=rules)"
+        $acc = @(); $g = 0
+        while ($u -and $g -lt 50) {
+            $r = Invoke-MgGraphRequest -Method GET -Uri $u -ErrorAction Stop
+            if ($r['value']) { $acc += @($r['value']) }
+            $u = $r['@odata.nextLink']; $g++
+        }
+        return $acc
+    }
+    $scopeUsed = 'DirectoryRole'
+    $assignments = @(_FetchPim 'DirectoryRole')
+    if ($assignments.Count -eq 0) { $scopeUsed = 'Directory'; $assignments = @(_FetchPim 'Directory') }
+
+    $rows = @()
+    $noMfaCrit = @(); $noMfaHigh = @(); $noJust = @(); $noApproval = @(); $longDur = @(); $permActiveRoles = @(); $permEligRoles = @()
+
+    foreach ($pa in $assignments) {
+        $rdId = [string]$pa['roleDefinitionId']
+        if (-not $script:PrivilegedRoleTemplates.ContainsKey($rdId)) { continue }
+        $roleName = $script:PrivilegedRoleTemplates[$rdId]
+        $isGAorPRA = ($rdId -eq $script:GlobalAdminTemplateId -or $roleName -match 'Privileged Role Administrator|Privileged Authentication')
+
+        $rules = @()
+        if ($pa['policy'] -and $pa['policy']['rules']) { $rules = @($pa['policy']['rules']) }
+        $mfa = $null; $just = $null; $appr = $null; $maxH = $null; $permA = $null; $permE = $null
+        foreach ($r in $rules) {
+            $rid = [string]$r['id']
+            switch -Regex ($rid) {
+                'Enablement_EndUser_Assignment' { $en = @($r['enabledRules']); $mfa = ($en -contains 'MultiFactorAuthentication'); $just = ($en -contains 'Justification') }
+                'Approval_EndUser_Assignment'   { if ($r['setting']) { $appr = [bool]$r['setting']['isApprovalRequired'] } }
+                'Expiration_EndUser_Assignment' {
+                    $d = [string]$r['maximumDuration']
+                    if ($d -match 'PT(\d+)H') { $maxH = [int]$matches[1] } elseif ($d -match 'PT(\d+)M') { $maxH = [math]::Round(([int]$matches[1]/60),1) }
+                }
+                'Expiration_Admin_Assignment'   { if ($r.ContainsKey('isExpirationRequired')) { $permA = (-not [bool]$r['isExpirationRequired']) } }
+                'Expiration_Admin_Eligibility'  { if ($r.ContainsKey('isExpirationRequired')) { $permE = (-not [bool]$r['isExpirationRequired']) } }
+            }
+        }
+        $rows += [pscustomobject]@{ Role=$roleName; MfaOnActivation=$mfa; JustificationRequired=$just; ApprovalRequired=$appr; MaxActivationHours=$maxH; PermanentActiveAllowed=$permA; PermanentEligibleAllowed=$permE }
+
+        if ($mfa -eq $false) { if ($isGAorPRA) { $noMfaCrit += $roleName } else { $noMfaHigh += $roleName } }
+        if ($isGAorPRA -and $just -eq $false) { $noJust += $roleName }
+        if ($isGAorPRA -and $appr -eq $false) { $noApproval += $roleName }
+        if ($maxH -and $maxH -gt 8) { $longDur += ("{0} ({1}h)" -f $roleName, $maxH) }
+        if ($permA -eq $true) { $permActiveRoles += $roleName }
+        if ($permE -eq $true) { $permEligRoles += $roleName }
+    }
+    $src = Write-Evidence -BaseName 'pim_policies' -Rows $rows -Title 'PIM Role-Management Policy Rules (privileged roles)' -Notes @("Policy scopeType used: $scopeUsed")
+
+    if ($rows.Count -eq 0) {
+        Add-EntraFinding -Severity 'Information' -CheckId 'pimpolicies' -Category 'Privileged Access' `
+            -Title 'PIM role-management policies not assessed' `
+            -Evidence 'No privileged-role PIM policies returned (requires Entra ID P2 and RoleManagementPolicy.Read.Directory).' `
+            -WhyItMatters 'PIM activation policy rules (MFA on activation, approval, justification, max duration, permanent-allowed) are the controls that make eligible access safe.' `
+            -RecommendedAction 'License Entra ID P2 and grant RoleManagementPolicy.Read.Directory to assess PIM policy quality.' -SourceFile $src
+        return
+    }
+    if ($noMfaCrit.Count -gt 0) {
+        Add-EntraFinding -Severity 'Critical' -CheckId 'pimpolicies' -Category 'Privileged Access' `
+            -Title ("{0} top-tier role(s) can be PIM-activated WITHOUT MFA" -f $noMfaCrit.Count) `
+            -Evidence ("Roles allowing activation without MFA: {0}" -f ($noMfaCrit -join ', ')) `
+            -WhyItMatters 'If Global Administrator / Privileged Role Administrator can be activated without MFA, a stolen password alone yields tenant-takeover privilege - PIM provides no real barrier.' `
+            -RecommendedAction 'Edit the PIM policy for these roles to require MFA (preferably phishing-resistant authentication strength) on activation.' -SourceFile $src
+    }
+    if ($noMfaHigh.Count -gt 0) {
+        Add-EntraFinding -Severity 'High' -CheckId 'pimpolicies' -Category 'Privileged Access' `
+            -Title ("{0} privileged role(s) can be PIM-activated without MFA" -f $noMfaHigh.Count) `
+            -Evidence ("Roles allowing activation without MFA: {0}" -f ($noMfaHigh -join ', ')) `
+            -WhyItMatters 'Activating a privileged role without MFA lets a compromised password reach admin access.' `
+            -RecommendedAction 'Require MFA on activation for every privileged role in PIM.' -SourceFile $src
+    }
+    if ($noApproval.Count -gt 0) {
+        Add-EntraFinding -Severity 'High' -CheckId 'pimpolicies' -Category 'Privileged Access' `
+            -Title ("{0} top-tier role(s) require no approval to activate" -f $noApproval.Count) `
+            -Evidence ("Roles without activation approval: {0}" -f ($noApproval -join ', ')) `
+            -WhyItMatters 'Without approval, a single compromised eligible account can self-elevate to Global Admin unobserved.' `
+            -RecommendedAction 'Require approval for activation of the most sensitive roles (GA / Privileged Role Admin).' -SourceFile $src
+    }
+    if ($noJust.Count -gt 0) {
+        Add-EntraFinding -Severity 'Medium' -CheckId 'pimpolicies' -Category 'Privileged Access' `
+            -Title ("{0} top-tier role(s) require no justification to activate" -f $noJust.Count) `
+            -Evidence ("Roles without justification: {0}" -f ($noJust -join ', ')) `
+            -WhyItMatters 'Justification provides an audit trail of why privilege was used; its absence weakens accountability.' `
+            -RecommendedAction 'Require justification on activation for sensitive roles.' -SourceFile $src
+    }
+    if ($longDur.Count -gt 0) {
+        Add-EntraFinding -Severity 'Medium' -CheckId 'pimpolicies' -Category 'Privileged Access' `
+            -Title ("{0} privileged role(s) allow activation longer than 8 hours" -f $longDur.Count) `
+            -Evidence ("Long activation windows: {0}" -f ($longDur -join ', ')) `
+            -WhyItMatters 'Long activation windows widen the time an elevated session can be abused if the device or token is compromised.' `
+            -RecommendedAction 'Reduce maximum activation duration to <=8 hours for privileged roles.' -SourceFile $src
+    }
+    if ($permActiveRoles.Count -gt 0) {
+        Add-EntraFinding -Severity 'High' -CheckId 'pimpolicies' -Category 'Privileged Access' `
+            -Title ("{0} privileged role(s) permit permanent ACTIVE assignment" -f $permActiveRoles.Count) `
+            -Evidence ("Roles allowing permanent active assignment: {0}" -f ($permActiveRoles -join ', ')) `
+            -WhyItMatters 'Allowing permanent active assignment defeats the just-in-time model - admins can hold standing privilege despite PIM being configured.' `
+            -RecommendedAction 'Set the PIM policy to require expiration on active assignments (force eligible/JIT instead of permanent active).' -SourceFile $src
+    }
+    if ($permEligRoles.Count -gt 0) {
+        Add-EntraFinding -Severity 'Low' -CheckId 'pimpolicies' -Category 'Privileged Access' `
+            -Title ("{0} privileged role(s) permit permanent ELIGIBLE assignment without review" -f $permEligRoles.Count) `
+            -Evidence ("Roles allowing permanent eligible assignment: {0}" -f ($permEligRoles -join ', ')) `
+            -WhyItMatters 'Permanent eligibility without periodic review lets stale eligibility accumulate over time.' `
+            -RecommendedAction 'Require expiration/renewal on eligible assignments and pair with access reviews.' -SourceFile $src
+    }
+    if ($script:Findings.Where({$_.CheckId -eq 'pimpolicies'}).Count -eq 0) {
+        Add-EntraFinding -Severity 'Information' -CheckId 'pimpolicies' -Category 'Privileged Access' `
+            -Title 'PIM activation policies enforce MFA / approval / time limits' `
+            -Evidence ("{0} privileged role policy/policies reviewed - no weak activation controls found." -f $rows.Count) `
+            -WhyItMatters 'Strong PIM activation policies make eligible (JIT) privileged access safe.' `
+            -RecommendedAction 'Maintain MFA-on-activation, approval for top-tier roles, and short activation windows.' -SourceFile $src -ResultRows $rows
+    }
+}
+
+# ===========================================================================
+# CHECK 19 - breakglass (emergency-access account health)
+# ===========================================================================
+function Invoke-Check-BreakGlass {
+    $users = Get-EAUsers
+    $byUpn = @{}; foreach ($u in $users) { if ($u.UserPrincipalName) { $byUpn[$u.UserPrincipalName.ToLowerInvariant()] = $u } }
+
+    # current Global Administrators
+    $gaIds = @{}
+    foreach ($a in (Get-EAPrivAssignments)) { if ($a.IsGA -and $a.State -eq 'Active' -and $a.PrincipalId) { $gaIds[$a.PrincipalId] = $true } }
+
+    $bg = Normalize-StringList -Values $BreakGlassUpns
+
+    if ($bg.Count -eq 0) {
+        Add-EntraFinding -Severity 'High' -CheckId 'breakglass' -Category 'Privileged Access' `
+            -Title 'No emergency-access (break-glass) accounts have been designated for validation' `
+            -Evidence 'Run with -BreakGlassUpns "bg1@tenant.onmicrosoft.com;bg2@tenant.onmicrosoft.com" so the script can validate them.' `
+            -WhyItMatters 'Microsoft recommends two cloud-only emergency-access Global Admins, excluded from Conditional Access, to avoid total lockout if MFA/federation/PIM breaks. Without designated accounts this control cannot be validated.' `
+            -RecommendedAction 'Create two cloud-only break-glass Global Admin accounts on the .onmicrosoft.com domain, exclude them from CA lockout policies, store credentials offline, monitor their sign-ins, and re-run with -BreakGlassUpns.' -SourceFile $null
+        return
+    }
+    if ($bg.Count -lt 2) {
+        Add-EntraFinding -Severity 'Critical' -CheckId 'breakglass' -Category 'Privileged Access' `
+            -Title 'Fewer than two emergency-access accounts configured' `
+            -Evidence ("Only {0} break-glass account designated." -f $bg.Count) `
+            -WhyItMatters 'A single emergency-access account is a single point of failure; if it is lost or locked out, recovery from a tenant-wide lockout may be impossible.' `
+            -RecommendedAction 'Maintain at least two cloud-only break-glass Global Admin accounts.' -SourceFile $null
+    }
+
+    $rows = @()
+    foreach ($upn in $bg) {
+        $u = $byUpn[$upn.ToLowerInvariant()]
+        if (-not $u) {
+            Add-EntraFinding -Severity 'High' -CheckId 'breakglass' -Category 'Privileged Access' `
+                -Title ("Designated break-glass account not found: {0}" -f $upn) `
+                -Evidence 'The UPN passed to -BreakGlassUpns does not resolve to a user.' `
+                -WhyItMatters 'A misconfigured emergency-access reference means the account you think protects you may not exist.' `
+                -RecommendedAction 'Verify the break-glass UPN is correct and the account exists.' -SourceFile $null
+            continue
+        }
+        $isGA      = [bool]($u.Id -and $gaIds.ContainsKey($u.Id))
+        $cloudOnly = -not [bool]$u.OnPremisesSyncEnabled
+        $onmsft    = ($u.UserPrincipalName -like '*.onmicrosoft.com')
+        $licensed  = (@($u.AssignedLicenses).Count -gt 0)
+        $lastSucc  = $null
+        if ($u.SignInActivity -and $u.SignInActivity.LastSuccessfulSignInDateTime) { $lastSucc = [datetime]$u.SignInActivity.LastSuccessfulSignInDateTime }
+        $rows += [pscustomobject]@{ Account=$u.UserPrincipalName; GlobalAdmin=$isGA; CloudOnly=$cloudOnly; OnMicrosoftDomain=$onmsft; Licensed=$licensed; LastSuccessfulSignIn=$lastSucc }
+
+        if (-not $isGA) {
+            Add-EntraFinding -Severity 'Critical' -CheckId 'breakglass' -Category 'Privileged Access' `
+                -Title ("Break-glass account is not a permanent Global Administrator: {0}" -f $u.UserPrincipalName) `
+                -Evidence 'The emergency-access account does not currently hold an active Global Administrator role.' `
+                -WhyItMatters 'A break-glass account must have standing Global Admin so it can recover the tenant when all other access fails.' `
+                -RecommendedAction 'Assign permanent Global Administrator to the break-glass account.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+        }
+        if (-not $cloudOnly) {
+            Add-EntraFinding -Severity 'Critical' -CheckId 'breakglass' -Category 'Privileged Access' `
+                -Title ("Break-glass account is synced/federated, not cloud-only: {0}" -f $u.UserPrincipalName) `
+                -Evidence 'onPremisesSyncEnabled is true on the emergency-access account.' `
+                -WhyItMatters 'A synced/federated break-glass account depends on on-prem AD / federation - exactly the systems that may be down during an emergency.' `
+                -RecommendedAction 'Recreate the break-glass account as a cloud-only account.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+        }
+        if (-not $onmsft) {
+            Add-EntraFinding -Severity 'High' -CheckId 'breakglass' -Category 'Privileged Access' `
+                -Title ("Break-glass account does not use the .onmicrosoft.com domain: {0}" -f $u.UserPrincipalName) `
+                -Evidence 'Emergency-access accounts should use the tenant .onmicrosoft.com domain to avoid dependency on custom/federated domains.' `
+                -WhyItMatters 'A custom or federated domain can become unavailable; the .onmicrosoft.com domain is always present and cloud-resolved.' `
+                -RecommendedAction 'Use a UPN on the tenant .onmicrosoft.com domain for break-glass accounts.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+        }
+        if ($null -eq $lastSucc -or $lastSucc -lt (Get-Date).ToUniversalTime().AddDays(-90)) {
+            Add-EntraFinding -Severity 'Medium' -CheckId 'breakglass' -Category 'Privileged Access' `
+                -Title ("Break-glass account has no successful sign-in in 90 days: {0}" -f $u.UserPrincipalName) `
+                -Evidence ("Last successful sign-in: {0}" -f ($lastSucc ?? 'never / unknown')) `
+                -WhyItMatters 'Emergency-access accounts must be periodically tested so you know they work and that alerting fires before a real emergency.' `
+                -RecommendedAction "Perform a documented emergency-access test: verify sign-in succeeds, verify alerting fires, and record the test date and owner." -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+        }
+        if ($licensed) {
+            Add-EntraFinding -Severity 'Low' -CheckId 'breakglass' -Category 'Privileged Access' `
+                -Title ("Break-glass account is licensed like a normal user: {0}" -f $u.UserPrincipalName) `
+                -Evidence 'Emergency-access accounts should carry minimal licensing.' `
+                -WhyItMatters 'Excess licensing on a break-glass account increases its footprint and exposure.' `
+                -RecommendedAction 'Keep break-glass licensing to the minimum required for sign-in and logging.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+        }
+    }
+    $src = Write-Evidence -BaseName 'break_glass' -Rows $rows -Title 'Emergency-Access (Break-Glass) Account Health'
+    if ($script:Findings.Where({$_.CheckId -eq 'breakglass'}).Count -eq 0 -and $rows.Count -gt 0) {
+        Add-EntraFinding -Severity 'Information' -CheckId 'breakglass' -Category 'Privileged Access' `
+            -Title 'Break-glass accounts meet the emergency-access baseline' `
+            -Evidence ("{0} cloud-only Global Admin emergency-access account(s) validated." -f $rows.Count) `
+            -WhyItMatters 'Healthy emergency-access accounts prevent tenant lockout.' `
+            -RecommendedAction 'Continue periodic documented break-glass tests and monitor their sign-ins.' -SourceFile $src -ResultRows $rows
+    }
+}
+
+# ===========================================================================
+# CHECK 20 - authmethodpolicy (tenant authentication-method policy)
+# ===========================================================================
+function Invoke-Check-AuthMethodPolicy {
+    $pol = Get-MgPolicyAuthenticationMethodPolicy -ErrorAction Stop
+    $configs = @($pol.AuthenticationMethodConfigurations)
+    $rows = $configs | Select-Object Id, State
+    $src = Write-Evidence -BaseName 'auth_method_policy' -Rows $rows -Title 'Authentication Methods Policy'
+
+    function _State([string]$id) { ($configs | Where-Object { $_.Id -eq $id } | Select-Object -First 1).State }
+
+    $smsOn   = ((_State 'Sms')   -eq 'enabled')
+    $voiceOn = ((_State 'Voice') -eq 'enabled')
+    $fido2On = ((_State 'Fido2') -eq 'enabled')
+    $whfbOn  = ((_State 'WindowsHelloForBusiness') -eq 'enabled')
+    $tapOn   = ((_State 'TemporaryAccessPass') -eq 'enabled')
+
+    if ($smsOn -or $voiceOn) {
+        Add-EntraFinding -Severity 'Medium' -CheckId 'authmethodpolicy' -Category 'Authentication' `
+            -Title 'Phishable authentication methods (SMS / voice) are enabled tenant-wide' `
+            -Evidence ("SMS enabled: {0}; Voice enabled: {1}" -f $smsOn, $voiceOn) `
+            -WhyItMatters 'SMS and voice are phishable and SIM-swappable. Allowing them as MFA methods keeps a weak factor available to attackers.' `
+            -RecommendedAction 'Phase out SMS/voice in favour of phishing-resistant methods (FIDO2/passkeys, Windows Hello) and limit their use via authentication strengths.' -SourceFile $src
+    }
+    if (-not ($fido2On -or $whfbOn)) {
+        Add-EntraFinding -Severity 'Low' -CheckId 'authmethodpolicy' -Category 'Authentication' `
+            -Title 'No phishing-resistant method (FIDO2 / Windows Hello) is enabled' `
+            -Evidence 'Neither FIDO2 nor Windows Hello for Business is enabled in the authentication methods policy.' `
+            -WhyItMatters 'Phishing-resistant authentication is the strongest defence for privileged accounts; if it is not enabled, admins cannot register it.' `
+            -RecommendedAction 'Enable FIDO2 security keys / passkeys and Windows Hello for Business and require them for privileged users.' -SourceFile $src
+    }
+    if ($tapOn) {
+        $tap = $configs | Where-Object { $_.Id -eq 'TemporaryAccessPass' } | Select-Object -First 1
+        $oneTime = $true
+        try { if ($tap.AdditionalProperties -and $tap.AdditionalProperties.ContainsKey('isUsableOnce')) { $oneTime = [bool]$tap.AdditionalProperties['isUsableOnce'] } } catch {}
+        if (-not $oneTime) {
+            Add-EntraFinding -Severity 'Medium' -CheckId 'authmethodpolicy' -Category 'Authentication' `
+                -Title 'Temporary Access Pass is enabled and reusable (not one-time)' `
+                -Evidence 'TAP is configured as reusable rather than one-time use.' `
+                -WhyItMatters 'A reusable Temporary Access Pass is a long-lived bypass credential that can be abused if intercepted.' `
+                -RecommendedAction 'Configure Temporary Access Pass as one-time use with a short lifetime.' -SourceFile $src
+        }
+    }
+    if ($script:Findings.Where({$_.CheckId -eq 'authmethodpolicy'}).Count -eq 0) {
+        Add-EntraFinding -Severity 'Information' -CheckId 'authmethodpolicy' -Category 'Authentication' `
+            -Title 'Authentication methods policy reviewed' `
+            -Evidence ("Phishing-resistant enabled: FIDO2={0}, WHfB={1}; SMS={2}, Voice={3}." -f $fido2On,$whfbOn,$smsOn,$voiceOn) `
+            -WhyItMatters 'The method policy decides which factors users can register and use.' `
+            -RecommendedAction 'Prefer phishing-resistant methods; minimise SMS/voice.' -SourceFile $src -ResultRows $rows
+    }
+}
+
+# ===========================================================================
+# CHECK 21 - accesspaths (effective-access / attack-path correlation)
+# ===========================================================================
+function Invoke-Check-AccessPaths {
+    $assignments = Get-EAPrivAssignments
+    try { Get-EAUsers | Out-Null } catch {}
+
+    # Direct (user) privileged assignments, tracking activation state (Active wins).
+    $directKey = @{}   # "userId|roleTemplateId" -> 'Active' | 'Eligible'
+    foreach ($a in $assignments) {
+        if ($a.IsPrivileged -and $a.PrincipalType -eq 'user' -and $a.PrincipalId) {
+            $k = '{0}|{1}' -f $a.PrincipalId, $a.RoleTemplateId
+            if ($a.State -eq 'Active' -or -not $directKey.ContainsKey($k)) { $directKey[$k] = $a.State }
+        }
+    }
+
+    # Group-based privileged assignments -> expand to user members (carrying the group's state).
+    $groupAssign = @($assignments | Where-Object { $_.IsPrivileged -and $_.PrincipalType -eq 'group' -and $_.PrincipalId })
+    $pathByUserRole = @{}     # "userId|roleTemplateId" -> list of @{Group;State}
+    $hiddenGaps = @()
+    foreach ($g in $groupAssign) {
+        $members = @()
+        try { $members = @(Get-MgGroupTransitiveMember -GroupId $g.PrincipalId -All -ErrorAction Stop) } catch {
+            $hiddenGaps += ($g.PrincipalName ?? $g.PrincipalId); continue
+        }
+        foreach ($m in $members) {
+            $mid = $m.Id
+            $mtype = [string](Get-Ap $m '@odata.type')
+            $upn = Get-Ap $m 'userPrincipalName'
+            if (-not $upn -and $mtype -ne '#microsoft.graph.user') { continue }   # count only user members (incl. UPN-less user objects)
+            $key = '{0}|{1}' -f $mid, $g.RoleTemplateId
+            if (-not $pathByUserRole.ContainsKey($key)) { $pathByUserRole[$key] = New-Object System.Collections.Generic.List[object] }
+            $pathByUserRole[$key].Add([pscustomobject]@{ Group=($g.PrincipalName ?? 'group'); State=$g.State }) | Out-Null
+        }
+    }
+
+    # Duplicate / parallel paths, classified by activation model: a duplicate that
+    # involves an ACTIVE (standing) path is more serious than eligible-only duplication.
+    $dupRows = @()
+    foreach ($key in $pathByUserRole.Keys) {
+        $paths = @($pathByUserRole[$key])
+        $groups = @($paths.Group | Select-Object -Unique)
+        $parts = $key -split '\|', 2; $uid = $parts[0]; $rtid = $parts[1]
+        $directS = if ($directKey.ContainsKey($key)) { $directKey[$key] } else { $null }
+        $pathCount = $groups.Count + [int]([bool]$directS)
+        if ($pathCount -le 1) { continue }
+        $involvesActive = ($directS -eq 'Active') -or (@($paths | Where-Object { $_.State -eq 'Active' }).Count -gt 0)
+        $activationModel = if ($involvesActive) { 'Active path' } else { 'Eligible-only' }
+        $upn = if ($script:UserById.ContainsKey($uid)) { $script:UserById[$uid].UserPrincipalName } else { $uid }
+        $dupRows += [pscustomobject]@{
+            User=$upn; Role=$script:PrivilegedRoleTemplates[$rtid]; ViaGroups=($groups -join ', ')
+            AlsoDirect=[bool]$directS; DirectState=$directS; ActivationModel=$activationModel; PathCount=$pathCount
+        }
+    }
+    $src = Write-Evidence -BaseName 'access_paths' -Rows $dupRows -Title 'Effective Access - Duplicate / Parallel Privileged Paths'
+    $dupActive = @($dupRows | Where-Object { $_.ActivationModel -eq 'Active path' })
+    $dupElig   = @($dupRows | Where-Object { $_.ActivationModel -ne 'Active path' })
+    if ($dupActive.Count -gt 0) {
+        Add-EntraFinding -Severity 'High' -CheckId 'accesspaths' -Category 'Privileged Access' `
+            -Title ("{0} user-role pair(s) reach the same privileged role via multiple ACTIVE paths" -f $dupActive.Count) `
+            -Evidence ("Standing parallel privilege paths (multiple active groups, or active direct + group): {0}" -f (($dupActive | Select-Object -First 8 | ForEach-Object { "$($_.User)->$($_.Role)" }) -join '; ')) `
+            -WhyItMatters 'When a user holds the same privileged role through more than one active path, removing one assignment does not remove the privilege. Standing parallel paths hide access and frustrate clean de-provisioning ("parallel movement").' `
+            -RecommendedAction 'Consolidate each privileged role to a single, reviewed path per user; remove redundant active grants and prefer a single PIM-eligible assignment.' `
+            -SourceFile $src -ResultRows $dupActive
+    }
+    if ($dupElig.Count -gt 0) {
+        Add-EntraFinding -Severity 'Medium' -CheckId 'accesspaths' -Category 'Privileged Access' `
+            -Title ("{0} user-role pair(s) are eligible for the same privileged role via multiple paths" -f $dupElig.Count) `
+            -Evidence ("Eligible-only parallel paths (multiple eligible groups): {0}" -f (($dupElig | Select-Object -First 8 | ForEach-Object { "$($_.User)->$($_.Role)" }) -join '; ')) `
+            -WhyItMatters 'Multiple eligible paths to the same role complicate review and de-provisioning even though access is just-in-time. Lower severity than standing duplication, but still worth consolidating.' `
+            -RecommendedAction 'Consolidate eligible assignments to a single reviewed path per user/role.' `
+            -SourceFile $src -ResultRows $dupElig
+    }
+
+    # "Already privileged" = the full effective set: direct privileged users PLUS every
+    # user reachable to a privileged role via a group. An owner who is already privileged
+    # this way is not gaining anything new, so we don't flag them as an escalation path.
+    $allPrivUserIds = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($k in $directKey.Keys) { [void]$allPrivUserIds.Add((($k -split '\|', 2)[0])) }
+    foreach ($key in $pathByUserRole.Keys) { [void]$allPrivUserIds.Add((($key -split '\|', 2)[0])) }
+
+    # Ownership-based escalation: owners of groups assigned a privileged role.
+    $ownEscRows = @()
+    foreach ($g in $groupAssign) {
+        $owners = @(); try { $owners = @(Get-MgGroupOwner -GroupId $g.PrincipalId -All -ErrorAction SilentlyContinue) } catch {}
+        foreach ($o in $owners) {
+            $oid   = $o.Id
+            $otype = [string](Get-Ap $o '@odata.type')
+            $oupn  = Get-Ap $o 'userPrincipalName'
+            $oname = Get-Ap $o 'displayName'
+            $label = if ($oupn) { $oupn } elseif ($oname) { $oname } else { $oid }
+            $isUser = (($otype -eq '#microsoft.graph.user') -or [bool]$oupn)
+            $ownerType = if ($otype) { ($otype -replace '#microsoft.graph.','') } elseif ($isUser) { 'user' } else { 'unknown' }
+
+            if ($isUser) {
+                $isGuest = ($oupn -like '*#EXT#*')
+                $alreadyPriv = ($oid -and $allPrivUserIds.Contains($oid))
+                $disabled = $false
+                if ($oid -and $script:UserById.ContainsKey($oid)) { $disabled = -not [bool]$script:UserById[$oid].AccountEnabled }
+                # A non-privileged, guest, or disabled owner can add themselves to the group
+                # and inherit the privileged role. An already-privileged owner gains nothing.
+                if ($alreadyPriv -and -not $isGuest -and -not $disabled) { continue }
+                $ownEscRows += [pscustomobject]@{
+                    Owner=$label; OwnerType=$ownerType; Group=($g.PrincipalName ?? $g.PrincipalId); GrantsRole=$g.RoleName
+                    OwnerGuest=$isGuest; OwnerDisabled=$disabled; OwnerAlreadyPrivileged=$alreadyPriv
+                }
+            } else {
+                # Non-human owner (service principal / nested group) that can add members to a
+                # role-granting group - a real but distinct path; label it rather than mis-report as a user.
+                $ownEscRows += [pscustomobject]@{
+                    Owner=$label; OwnerType=$ownerType; Group=($g.PrincipalName ?? $g.PrincipalId); GrantsRole=$g.RoleName
+                    OwnerGuest=$false; OwnerDisabled=$false; OwnerAlreadyPrivileged=$false
+                }
+            }
+        }
+    }
+    if ($ownEscRows.Count -gt 0) {
+        $sev = if (@($ownEscRows | Where-Object { $_.OwnerGuest -or $_.OwnerDisabled }).Count -gt 0) { 'Critical' } else { 'High' }
+        $osrc = Write-Evidence -BaseName 'access_paths_ownership' -Rows $ownEscRows -Title 'Effective Access - Ownership-Based Escalation'
+        Add-EntraFinding -Severity $sev -CheckId 'accesspaths' -Category 'Privileged Access' `
+            -Title ("{0} ownership-based privilege-escalation path(s) via role-granting groups" -f $ownEscRows.Count) `
+            -Evidence ("Owners who can add themselves to a privileged group: {0}" -f (($ownEscRows | Select-Object -First 8 | ForEach-Object { "$($_.Owner)->$($_.Group)" }) -join '; ')) `
+            -WhyItMatters 'An owner of a group that is assigned a privileged role can add themselves (or anyone) to the group and inherit that role. A guest, disabled, or non-privileged owner is therefore an indirect privilege-escalation path - the cloud analog of a dangerous WriteOwner/AddMember ACL.' `
+            -RecommendedAction 'Remove non-administrative, guest and disabled owners from groups that are assigned privileged roles; manage membership through PIM for Groups with approval.' `
+            -SourceFile $osrc -ResultRows $ownEscRows
+    }
+
+    # Owners of groups EXCLUDED from Conditional Access policies (especially MFA-enforcing
+    # ones) can add themselves to the group and thereby exempt their own account.
+    $caExcl = @{}   # groupId -> pscustomobject{ Policies=List; EnforcesMfa }
+    try {
+        foreach ($p in @(Get-MgIdentityConditionalAccessPolicy -All -ErrorAction Stop | Where-Object { $_.State -eq 'enabled' })) {
+            $enforces = Test-CaPolicyRequiresMfaOrStrength $p
+            foreach ($gid in @($p.Conditions.Users.ExcludeGroups)) {
+                if (-not $gid -or $gid -match 'All|GuestsOrExternalUsers|None') { continue }
+                if (-not $caExcl.ContainsKey($gid)) { $caExcl[$gid] = [pscustomobject]@{ Policies=(New-Object System.Collections.Generic.List[string]); EnforcesMfa=$false } }
+                $caExcl[$gid].Policies.Add($p.DisplayName)
+                if ($enforces) { $caExcl[$gid].EnforcesMfa = $true }
+            }
+        }
+    } catch {}
+    $caOwnRows = @()
+    foreach ($gid in $caExcl.Keys) {
+        $info = $caExcl[$gid]
+        $gname = $gid
+        try { $gg = Get-MgGroup -GroupId $gid -Property 'id,displayName' -ErrorAction SilentlyContinue; if ($gg) { $gname = $gg.DisplayName } } catch {}
+        $owners = @(); try { $owners = @(Get-MgGroupOwner -GroupId $gid -All -ErrorAction SilentlyContinue) } catch {}
+        foreach ($o in $owners) {
+            $oupn = Get-Ap $o 'userPrincipalName'; $oname = Get-Ap $o 'displayName'
+            $label = if ($oupn) { $oupn } elseif ($oname) { $oname } else { $o.Id }
+            $caOwnRows += [pscustomobject]@{ Owner=$label; ExcludedGroup=$gname; EnforcesMfa=$info.EnforcesMfa; Policies=(($info.Policies | Select-Object -Unique) -join '; ') }
+        }
+    }
+    if ($caOwnRows.Count -gt 0) {
+        $csrc = Write-Evidence -BaseName 'access_paths_ca_exclusions' -Rows $caOwnRows -Title 'Effective Access - CA Exclusion Group Ownership'
+        $mfaExcl = @($caOwnRows | Where-Object { $_.EnforcesMfa })
+        $otherExcl = @($caOwnRows | Where-Object { -not $_.EnforcesMfa })
+        if ($mfaExcl.Count -gt 0) {
+            Add-EntraFinding -Severity 'Critical' -CheckId 'accesspaths' -Category 'Privileged Access' `
+                -Title ("{0} owner(s) of MFA-exclusion groups can self-add to bypass MFA" -f $mfaExcl.Count) `
+                -Evidence ("Owners of groups excluded from an MFA-enforcing CA policy: {0}" -f (($mfaExcl | Select-Object -First 8 | ForEach-Object { "$($_.Owner)->$($_.ExcludedGroup)" }) -join '; ')) `
+                -WhyItMatters 'An owner of a group excluded from an MFA Conditional Access policy can add themselves to that group and exempt their own account from MFA - a direct control bypass that needs no role at all.' `
+                -RecommendedAction 'Remove non-administrative/guest owners from CA-exclusion groups, keep exclusion membership minimal (ideally only the two break-glass accounts), and manage membership via PIM for Groups.' `
+                -SourceFile $csrc -ResultRows $mfaExcl
+        }
+        if ($otherExcl.Count -gt 0) {
+            Add-EntraFinding -Severity 'High' -CheckId 'accesspaths' -Category 'Privileged Access' `
+                -Title ("{0} owner(s) of Conditional Access exclusion groups can change their own policy exposure" -f $otherExcl.Count) `
+                -Evidence ("Owners of CA-exclusion groups (non-MFA policies): {0}" -f (($otherExcl | Select-Object -First 8 | ForEach-Object { "$($_.Owner)->$($_.ExcludedGroup)" }) -join '; ')) `
+                -WhyItMatters 'An owner of any CA-exclusion group can add themselves to change which Conditional Access controls apply to their account.' `
+                -RecommendedAction 'Tightly control membership and ownership of all Conditional Access exclusion groups.' `
+                -SourceFile $csrc -ResultRows $otherExcl
+        }
+    }
+
+    if ($hiddenGaps.Count -gt 0) {
+        Add-EntraFinding -Severity 'Low' -CheckId 'accesspaths' -Category 'Privileged Access' `
+            -Title ("{0} role-granting group(s) could not be fully expanded (coverage gap)" -f $hiddenGaps.Count) `
+            -Evidence ("Membership could not be read (hidden membership / permission): {0}" -f (($hiddenGaps | Select-Object -First 8) -join ', ')) `
+            -WhyItMatters 'Groups with hidden membership or insufficient read permission cannot be fully evaluated for privilege paths - the absence of a finding here is a coverage gap, not a clean result.' `
+            -RecommendedAction 'Grant Member.Read.Hidden (read-only) to evaluate hidden-membership groups, or review those groups manually.' -SourceFile $src
+    }
+
+    if ($dupRows.Count -eq 0 -and $ownEscRows.Count -eq 0 -and $caOwnRows.Count -eq 0 -and $hiddenGaps.Count -eq 0) {
+        Add-EntraFinding -Severity 'Information' -CheckId 'accesspaths' -Category 'Privileged Access' `
+            -Title 'No duplicate privilege paths or ownership-escalation paths detected' `
+            -Evidence 'Each privileged role is reached through a single reviewed path, and role-granting groups have no unsafe owners.' `
+            -WhyItMatters 'Single, reviewed privilege paths make de-provisioning reliable and reduce hidden standing access.' `
+            -RecommendedAction 'Maintain single-path privileged assignments and safe group ownership.' -SourceFile $src
+    }
+}
+
+# ===========================================================================
 # REPORT ENGINE  (HTML/CSS/JS reused verbatim from the AD audit for an
 # identical look: light/dark theme, severity badges, filterable finding
 # cards, executive risk report with score band matrix.)
@@ -1616,11 +2463,14 @@ function New-FindingAnchor([object]$f) {
     'finding-' + (New-Slug ('{0}-{1}' -f $f.Title, $f.CheckId))
 }
 
-function Get-EntraPrimaryNav([string]$Active) {
+function Get-EntraPrimaryNav([string]$Active, [string]$HrefPrefix = '') {
+    # $HrefPrefix lets pages OUTSIDE the 'HTML Reports' folder (the per-dataset raw
+    # pages live in 'Raw Data\Source') point back at the reports with '../../HTML Reports/'.
     $links = @(
         @{ Key='audit';   Href='EntraAudit-Results.html'; Label='Audit Results' }
         @{ Key='risk';    Href='Risk-Report.html';        Label='Risk Report' }
         @{ Key='posture'; Href='Posture-Summary.html';    Label='Posture Summary' }
+        @{ Key='raw';     Href='Raw-Data.html';           Label='Raw Data' }
     )
     $css = @'
 <style>
@@ -1635,7 +2485,7 @@ function Get-EntraPrimaryNav([string]$Active) {
     [void]$sb.Append("<nav class='primary-nav'>")
     foreach ($l in $links) {
         $cls = if ($l.Key -eq $Active) { 'primary-nav-link active' } else { 'primary-nav-link' }
-        [void]$sb.Append("<a class='$cls' href='$($l.Href)'>$($l.Label)</a>")
+        [void]$sb.Append("<a class='$cls' href='$(HtmlAttrEncode ($HrefPrefix + $l.Href))'>$($l.Label)</a>")
     }
     [void]$sb.Append('</nav>')
     $sb.ToString()
@@ -1662,8 +2512,75 @@ function New-EvidenceTableHtml($rows, [int]$maxRows = 200) {
         [void]$sb.Append('</tr>'); $shown++
     }
     [void]$sb.Append('</tbody></table></div>')
-    if ($arr.Count -gt $maxRows) { [void]$sb.Append("<div class='result-note'>Showing $maxRows of $($arr.Count) rows. Full data in the linked source file.</div>") }
+    if ($arr.Count -gt $maxRows) { [void]$sb.Append("<div class='result-note'>Showing $maxRows of $($arr.Count) rows. Full data in the linked CSV/TXT source file.</div>") }
     $sb.ToString()
+}
+
+# Theme toggle + live row filter for the standalone raw-data pages. Targets BODY
+# data-theme to match Get-EntraMainCss (the risk pages target the <html> element).
+function Get-EntraRawJs {
+@'
+<script>
+(function(){
+  function q(s){return document.querySelector(s);}
+  function cur(){var s=null;try{s=localStorage.getItem('entraaudit-theme');}catch(e){}if(s==='light'||s==='dark')return s;return (window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';}
+  function ap(t){document.body.setAttribute('data-theme',t);var b=q('#themeToggle');if(b)b.innerText=t==='dark'?'Light mode':'Dark mode';try{localStorage.setItem('entraaudit-theme',t);}catch(e){}}
+  ap(cur());
+  var b=q('#themeToggle');if(b)b.addEventListener('click',function(){ap(document.body.getAttribute('data-theme')==='dark'?'light':'dark');});
+  var inp=q('#rawSearch');if(inp){inp.addEventListener('input',function(){var v=(this.value||'').toLowerCase();Array.prototype.slice.call(document.querySelectorAll('.result-table tbody tr')).forEach(function(r){r.style.display=((r.innerText||'').toLowerCase().indexOf(v)>=0)?'':'none';});});}
+})();
+</script>
+'@
+}
+
+# Standalone, styled HTML view of one raw dataset (same design as the reports).
+function New-RawDataHtml {
+    param([string]$Path, [string]$Title, [object[]]$Rows, [string[]]$Notes, [string]$CsvName, [string]$TxtName)
+    $css = Get-EntraMainCss
+    $nav = Get-EntraPrimaryNav 'raw' '../../HTML Reports/'
+    $js  = Get-EntraRawJs
+    $count = @($Rows).Count
+    $table = New-EvidenceTableHtml $Rows 2000
+    $notesHtml = if ($Notes) { ($Notes | ForEach-Object { "<div class='meta'>$(HtmlEncode $_)</div>" }) -join "`n" } else { '' }
+    $gen = Get-Date -Format 'yyyy-MM-dd HH:mm:ss K'
+    $html = @"
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Entra Audit - $(HtmlEncode $Title)</title>
+$css
+</head>
+<body data-theme="light">
+<div class="container">
+$nav
+  <section class="hero">
+    <div class="hero-top">
+      <div>
+        <h1>$(HtmlEncode $Title)</h1>
+        <div class="meta">
+          Raw evidence &mdash; <b>$count</b> row(s)<br>
+          Generated: $(HtmlEncode $gen)<br>
+          Download full data: <a href="$(HtmlAttrEncode $CsvName)" download>CSV</a> &middot; <a href="$(HtmlAttrEncode $TxtName)" download>TXT</a> &middot; <a href="../../HTML Reports/EntraAudit-Results.html">Back to findings</a>
+        </div>
+        $notesHtml
+      </div>
+      <div class="hero-actions"><button type="button" class="theme-toggle" id="themeToggle">Dark mode</button></div>
+    </div>
+  </section>
+  <section class="toolbar">
+    <div class="toolbar-row">
+      <div class="filter"><label for="rawSearch">Filter rows</label><input id="rawSearch" type="text" placeholder="Type to filter the table..."></div>
+    </div>
+  </section>
+  <div style="margin-top:8px">$table</div>
+</div>
+$js
+</body>
+</html>
+"@
+    Set-Content -LiteralPath $Path -Value $html -Encoding UTF8
 }
 
 function Get-EntraMainCss {
@@ -2258,6 +3175,55 @@ $js
     Set-Content -LiteralPath $Path -Value $html -Encoding UTF8
 }
 
+function Write-RawDataIndexReport {
+    param([string]$Path, [string]$TenantName, [string]$GeneratedOn)
+    $css = Get-EntraMainCss
+    $nav = Get-EntraPrimaryNav 'raw'
+    $js  = Get-EntraRawJs
+    $rows = foreach ($d in $script:RawDatasets) {
+        "<tr><td>$(HtmlEncode $d.Title)</td><td class='mono'>$(HtmlEncode $d.BaseName)</td><td style='text-align:right'>$($d.Rows)</td><td><a href='$(HtmlAttrEncode $d.HtmlHref)'>HTML</a> &middot; <a href='$(HtmlAttrEncode $d.CsvHref)' download>CSV</a> &middot; <a href='$(HtmlAttrEncode $d.TxtHref)' download>TXT</a></td></tr>"
+    }
+    $total = @($script:RawDatasets).Count
+    $html = @"
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Entra Audit - Raw Data</title>
+$css
+</head>
+<body data-theme="light">
+<div class="container">
+$nav
+  <section class="hero">
+    <div class="hero-top">
+      <div>
+        <h1>Raw Data &mdash; Evidence Index</h1>
+        <div class="meta">
+          Tenant: <span class="mono">$(HtmlEncode $TenantName)</span><br>
+          Generated: $(HtmlEncode $GeneratedOn)<br>
+          Every check writes its full evidence as CSV (data), TXT (plain) and a styled HTML table. $total dataset(s) below.
+        </div>
+      </div>
+      <div class="hero-actions"><button type="button" class="theme-toggle" id="themeToggle">Dark mode</button></div>
+    </div>
+  </section>
+  <section class="toolbar"><div class="toolbar-row"><div class="filter"><label for="rawSearch">Filter datasets</label><input id="rawSearch" type="text" placeholder="Type to filter..."></div></div></section>
+  <table class="status-table result-table">
+    <thead><tr><th>Dataset</th><th>File</th><th style="text-align:right">Rows</th><th>Open / download</th></tr></thead>
+    <tbody>
+      $($rows -join "`n")
+    </tbody>
+  </table>
+</div>
+$js
+</body>
+</html>
+"@
+    Set-Content -LiteralPath $Path -Value $html -Encoding UTF8
+}
+
 # Posture page needs only the theme toggle (no findings table) - reuse a trimmed JS.
 function Get-EntraRiskJs2 {
 @'
@@ -2278,13 +3244,13 @@ function Get-EntraRiskJs2 {
 # ===========================================================================
 $script:Registry = [ordered]@{
     'tenant-info'      = @{ Func='Invoke-Check-TenantInfo';     Title='Tenant / Organization Overview';        Scopes=@('Organization.Read.All') }
-    'privileged-roles' = @{ Func='Invoke-Check-PrivRoles';      Title='Privileged Roles - Permanent vs Eligible'; Scopes=@('RoleManagement.Read.Directory'); P2=$true }
+    'privileged-roles' = @{ Func='Invoke-Check-PrivRoles';      Title='Privileged Roles - Permanent vs Eligible'; Scopes=@('RoleManagement.Read.Directory') }
     'directory-roles'  = @{ Func='Invoke-Check-DirectoryRoles'; Title='Privileged Assignment Volume';           Scopes=@('RoleManagement.Read.Directory') }
     'accounts'         = @{ Func='Invoke-Check-Accounts';       Title='Account Hygiene';                        Scopes=@('User.Read.All') }
-    'staleusers'       = @{ Func='Invoke-Check-StaleUsers';     Title='Stale / Inactive Users';                 Scopes=@('User.Read.All','AuditLog.Read.All') }
+    'staleusers'       = @{ Func='Invoke-Check-StaleUsers';     Title='Stale / Inactive Users';                 Scopes=@('User.Read.All','AuditLog.Read.All'); P1=$true }
     'guests'           = @{ Func='Invoke-Check-Guests';         Title='Guest / External Governance';            Scopes=@('User.Read.All') }
     'mfa'              = @{ Func='Invoke-Check-Mfa';            Title='MFA Capability & Method Strength';       Scopes=@('AuditLog.Read.All') }
-    'legacyauth'       = @{ Func='Invoke-Check-LegacyAuth';     Title='Legacy Authentication Usage';            Scopes=@('AuditLog.Read.All') }
+    'legacyauth'       = @{ Func='Invoke-Check-LegacyAuth';     Title='Legacy Authentication Usage';            Scopes=@('AuditLog.Read.All'); P1=$true }
     'tenantposture'    = @{ Func='Invoke-Check-TenantPosture';  Title='Security Defaults & Consent Settings';   Scopes=@('Policy.Read.All') }
     'capolicies'       = @{ Func='Invoke-Check-CAPolicies';     Title='Conditional Access Posture';             Scopes=@('Policy.Read.All') }
     'riskyusers'       = @{ Func='Invoke-Check-RiskyUsers';     Title='Identity Protection (Risky Users)';      Scopes=@('IdentityRiskyUser.Read.All'); P2=$true }
@@ -2294,6 +3260,10 @@ $script:Registry = [ordered]@{
     'trusts'           = @{ Func='Invoke-Check-Trusts';         Title='Cross-Tenant Access & B2B Trust';        Scopes=@('Policy.Read.All') }
     'recentchanges'    = @{ Func='Invoke-Check-RecentChanges';  Title='Recently Created Users / Groups';        Scopes=@('User.Read.All','AuditLog.Read.All') }
     'tenanthealth'     = @{ Func='Invoke-Check-TenantHealth';   Title='Directory-Sync / PHS Health';            Scopes=@('Organization.Read.All') }
+    'pimpolicies'      = @{ Func='Invoke-Check-PimPolicies';    Title='PIM Role-Management Policy Quality';     Scopes=@('RoleManagementPolicy.Read.Directory'); P2=$true }
+    'breakglass'       = @{ Func='Invoke-Check-BreakGlass';     Title='Emergency-Access (Break-Glass) Health';  Scopes=@('User.Read.All','RoleManagement.Read.Directory') }
+    'authmethodpolicy' = @{ Func='Invoke-Check-AuthMethodPolicy'; Title='Authentication Methods Policy';        Scopes=@('Policy.Read.All') }
+    'accesspaths'      = @{ Func='Invoke-Check-AccessPaths';    Title='Effective Access / Attack Paths';        Scopes=@('RoleManagement.Read.Directory','Group.Read.All') }
 }
 
 $script:AppCount = '-'
@@ -2309,7 +3279,8 @@ function Invoke-EntraAudit {
         'accounts'=$accounts; 'staleusers'=$staleusers; 'guests'=$guests; 'mfa'=$mfa; 'legacyauth'=$legacyauth;
         'tenantposture'=$tenantposture; 'capolicies'=$capolicies; 'riskyusers'=$riskyusers; 'apps'=$apps;
         'consentgrants'=$consentgrants; 'devices'=$devices; 'trusts'=$trusts; 'recentchanges'=$recentchanges;
-        'tenanthealth'=$tenanthealth
+        'tenanthealth'=$tenanthealth; 'pimpolicies'=$pimpolicies; 'breakglass'=$breakglass;
+        'authmethodpolicy'=$authmethodpolicy; 'accesspaths'=$accesspaths
     }
     $anySelected = $all -or ($select -and $select.Count) -or (@($individual.Values | Where-Object { $_ }).Count -gt 0)
 
@@ -2320,13 +3291,15 @@ function Invoke-EntraAudit {
 
     Import-EntraModules
 
-    # Decide which checks to run
+    # Decide which checks to run. -select/-exclude accept both registry ids
+    # (privileged-roles) and switch-style aliases (privroles, the form the GUI emits),
+    # comma- or semicolon-separated.
     if ($select -and $select.Count) {
-        $toRun = @($script:Registry.Keys | Where-Object { $select -contains $_ })
-        $badSel = @($select | Where-Object { $_ -notin $script:Registry.Keys })
-        if ($badSel.Count) { Write-Warn2 "Unknown check id(s) ignored: $($badSel -join ', ')" }
+        $sel = Resolve-CheckIds -Values $select
+        $toRun = @($script:Registry.Keys | Where-Object { $sel -contains $_ })
     } elseif ($all -or -not $anySelected) {
-        $toRun = @($script:Registry.Keys | Where-Object { $exclude -notcontains $_ })
+        $exc = if ($exclude) { Resolve-CheckIds -Values $exclude } else { @() }
+        $toRun = @($script:Registry.Keys | Where-Object { $exc -notcontains $_ })
     } else {
         $toRun = @($script:Registry.Keys | Where-Object { $individual[$_] })
     }
@@ -2337,11 +3310,14 @@ function Invoke-EntraAudit {
 
     # Tenant + license detection
     try { $script:Tenant = Get-MgOrganization -ErrorAction SilentlyContinue | Select-Object -First 1 } catch {}
+    # License detection from enabled SERVICE PLANS (not just SKU part number) - many
+    # tenants get Entra P1/P2 bundled inside other SKUs (e.g. EMS, M365 E3/E5).
     try {
-        foreach ($s in @(Get-MgSubscribedSku -All -ErrorAction SilentlyContinue)) {
-            if ($s.SkuPartNumber -match 'AAD_PREMIUM_P2') { $script:HasP2 = $true }
-            if ($s.SkuPartNumber -match 'AAD_PREMIUM')    { $script:HasP1 = $true }
-            if (@($s.ServicePlans.ServicePlanName) -match 'WorkloadIdentity') { $script:WorkloadIdP = $true }
+        foreach ($sku in @(Get-MgSubscribedSku -All -ErrorAction SilentlyContinue)) {
+            $enabledPlans = @($sku.ServicePlans | Where-Object { $_.ProvisioningStatus -eq 'Success' } | ForEach-Object { $_.ServicePlanName })
+            if ($sku.SkuPartNumber -eq 'AAD_PREMIUM_P2' -or $enabledPlans -contains 'AAD_PREMIUM_P2') { $script:HasP2 = $true }
+            if ($sku.SkuPartNumber -eq 'AAD_PREMIUM'    -or $enabledPlans -contains 'AAD_PREMIUM')    { $script:HasP1 = $true }
+            if ($enabledPlans -match 'WorkloadIdentit') { $script:WorkloadIdP = $true }
         }
         if ($script:HasP2) { $script:HasP1 = $true }
     } catch {}
@@ -2365,8 +3341,7 @@ function Invoke-EntraAudit {
     Write-Info ("Running {0} check(s)..." -f $toRun.Count)
     foreach ($id in $toRun) {
         $c = $script:Registry[$id]
-        $needP2 = [bool]($c.P2)
-        Invoke-AuditCheck -CheckId $id -Title $c.Title -Scopes $c.Scopes -NeedP2:$needP2 -Action ([scriptblock]::Create($c.Func))
+        Invoke-AuditCheck -CheckId $id -Title $c.Title -Scopes $c.Scopes -NeedP1:([bool]$c.P1) -NeedP2:([bool]$c.P2) -Action ([scriptblock]::Create($c.Func))
     }
 
     # Build reports
@@ -2391,6 +3366,28 @@ function Invoke-EntraAudit {
     Write-EntraResultsReport -Path $resultsPath -Items $script:Findings.ToArray() -Counts $counts -TenantName $tenantName -GeneratedOn $now -Subtitle $subtitle
     Write-EntraRiskReport    -Path $riskPath    -Items $script:Findings.ToArray() -Counts $counts -TenantName $tenantName -GeneratedOn $now -Score $score -Stats $stats
     Write-PostureSummaryReport -Path $posturePath -TenantName $tenantName -GeneratedOn $now -Stats $stats
+    Write-RawDataIndexReport -Path (Join-Path $script:HtmlDir 'Raw-Data.html') -TenantName $tenantName -GeneratedOn $now
+
+    # Machine-readable exports (automation / trend comparison) with a stable finding id.
+    $tenantId = [string]$ctx.TenantId
+    $exportRows = foreach ($f in $script:Findings) {
+        [pscustomobject]@{
+            FindingId         = (New-FindingKey -TenantId $tenantId -CheckId $f.CheckId -Title $f.Title -AffectedPrincipal $f.AffectedPrincipal)
+            Severity          = $f.Severity
+            Category          = $f.Category
+            CheckId           = $f.CheckId
+            Title             = $f.Title
+            AffectedPrincipal = $f.AffectedPrincipal
+            Evidence          = $f.Evidence
+            WhyItMatters      = $f.WhyItMatters
+            RecommendedAction = $f.RecommendedAction
+            SourceFile        = $f.SourceFile
+        }
+    }
+    try {
+        @($exportRows) | Export-Csv -LiteralPath (Join-Path $script:RunRoot 'Findings.csv') -NoTypeInformation -Encoding UTF8
+        @($exportRows) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $script:RunRoot 'Findings.json') -Encoding UTF8
+    } catch { Write-Warn2 "Could not write Findings.json/csv: $($_.Exception.Message)" }
 
     # Summary
     Write-Host ""
