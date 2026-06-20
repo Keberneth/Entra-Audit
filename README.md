@@ -4,8 +4,10 @@ A PowerShell 7 + Microsoft Graph audit tool that mirrors the on-prem ADAudit-PS7
 
 Its flagship capability is auditing **privileged role assignments by activation model** — every privileged role is classified as **Permanent (standing)** vs **Eligible (PIM)** vs **Time-bound active**. A *permanent* Global Administrator is flagged as a risk; the same role held as *eligible* (activated just-in-time through PIM) is the desired posture and is **not** flagged.
 
-> ## 🔒 Read-only by design
-> This tool **only reads** from Microsoft Graph. It requests only `*.Read.*` scopes, issues only `GET` requests, and **aborts at startup if any write-capable scope is granted**. It never creates, modifies, activates, revokes, assigns or deletes anything. Every "Recommended action" in the reports is advisory guidance for a human operator — the tool performs no management.
+> ## 🔒 Read-only against Entra / Microsoft Graph
+> This tool is **read-only against Microsoft Entra / Graph**. It requests only `*.Read.*` scopes, issues only `GET` requests, and **aborts at startup if any write-capable scope is granted**. It never creates, modifies, activates, revokes, assigns or deletes anything in the tenant. Every "Recommended action" in the reports is advisory guidance for a human operator — the tool performs no management.
+>
+> It is **not** local-filesystem read-only: like any reporting tool it **writes** the HTML/CSV/TXT/JSON reports and evidence to the output folder, and with `-installdeps` it installs the Microsoft Graph modules. Those reports contain sensitive identity/security data — point `-OutputRoot` at a restricted directory and avoid sharing the raw CSV/JSON broadly.
 
 ---
 
@@ -56,7 +58,7 @@ Results are written to a tenant-named, timestamped folder (mirrors the AD audit 
 <TenantName>-EntraAudit-<yyyyMMdd-HHmm>\
    HTML Reports\
       EntraAudit-Results.html           # all findings, grouped by severity, filterable
-      Risk-Report.html                  # executive 0-100 score, band matrix, top risks
+      Risk-Report.html                  # executive additive risk score (unbounded, higher = worse), band matrix, top risks
       Posture-Summary.html              # per-check status grid + licensing/coverage
       Raw-Data.html                     # index of every raw dataset (HTML/CSV/TXT links)
    Raw Data\Source\
@@ -88,7 +90,8 @@ The four reports share a top navigation bar (Audit Results · Risk Report · Pos
 | `-legacyauth` | Legacy authentication usage (sign-in logs) | needs **P1** |
 | `-tenantposture` | Security Defaults, authorization policy & consent settings | |
 | `-capolicies` | Conditional Access policy posture | |
-| `-riskyusers` | Identity Protection: risky users / detections / risky SPs | needs **P2** |
+| `-riskyusers` | Identity Protection: risky users / detections | needs **P2** |
+| `-riskyserviceprincipals` | Identity Protection: risky service principals (workload identities) | needs **Workload ID Premium** |
 | `-apps` | App / service principal hygiene, over-privilege, credentials, shadow creds | |
 | `-consentgrants` | OAuth2 delegated consent grants (illicit consent risk) | |
 | `-devices` | Stale / unmanaged / non-compliant devices | |
@@ -205,7 +208,8 @@ The Risk-Report **accumulates** points per finding by severity and sums them, so
 ## Notes & limitations
 
 - **Read-only guarantee:** the script self-aborts if Graph returns any write scope. In **app-only** mode it goes further — it reads the app's *actual* granted app-role assignments (across all resource APIs) and **fails closed** unless **every** one is on the **exact documented audit allowlist**. *Read-only does not mean low-impact: broad read permissions (e.g. `Mail.Read`) can expose sensitive data, so the app-only startup check permits only the documented audit permissions, not arbitrary `*.Read.*` permissions* — anything else (write, send, create, delete, update, invite, manage, impersonate, full-control, **or any unknown/custom app role**) is refused. Remediation is always left to the operator.
-- **License gating:** P1-gated checks (`staleusers`, `legacyauth`) and P2-gated checks (`pimpolicies`, `riskyusers`) are reported as *Skipped-NoLicense* (not "clean") when the tier isn't detected; license detection reads enabled **service plans**, so P1/P2 bundled inside EMS/M365 SKUs is recognised. `privileged-roles` always runs (it falls back to classic role assignments without PIM).
+- **License gating:** P1-gated checks (`staleusers`, `legacyauth`) and P2-gated checks (`pimpolicies`, `riskyusers`) are reported as *Skipped-NoLicense* (not "clean") when the tier isn't detected; license detection reads enabled **service plans**, so P1/P2 bundled inside EMS/M365 SKUs is recognised. `riskyserviceprincipals` is a **separate** check gated on **Workload Identities Premium** (not P2), so a Workload-ID-Premium tenant without P2 still evaluates risky workload identities. `privileged-roles` always runs (it falls back to classic role assignments without PIM).
+- **Posture Summary status:** the per-check grid distinguishes `RiskFindings(n)` (an actual risk-level finding), `InfoOnly(n)` (only Information-level baselines were added — treated as clean), `Pass`, `Skipped-*` and `Error`, so informational baselines don't make a clean check look noisy.
 - **Stable finding ids:** `Findings.json`/`.csv` ids are count-independent (a finding's id doesn't change when "5 stale users" becomes "7"), so they're usable for run-over-run trend/diff. Every check also always writes its CSV (a `NoData` row when empty) so automation can rely on the file existing.
 - **Sign-in logs** are retained ~30 days; the legacy-auth check only sees that window.
 - A few signals (on-prem banned-password configuration, some Identity Protection detail) are not fully exposed by Graph read APIs and are reported with that caveat.

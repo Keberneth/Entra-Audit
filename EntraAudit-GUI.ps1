@@ -61,6 +61,7 @@ $AuditChecks = [ordered]@{
     tenantposture  = "Security Defaults, authorization policy and consent settings"
     capolicies     = "Conditional Access policy posture"
     riskyusers     = "Identity Protection: risky users / detections (needs P2)"
+    riskyserviceprincipals = "Identity Protection: risky service principals (needs Workload ID Premium)"
     apps           = "App / service principal hygiene, over-privilege, credentials"
     consentgrants  = "OAuth2 delegated consent grants (illicit consent risk)"
     devices        = "Stale / unmanaged / non-compliant devices"
@@ -247,12 +248,24 @@ Add-Label "Credential-expiry warning (days):" $y | Out-Null
 $txtExpiry = Add-TextBox $y -Width 120
 $txtExpiry.Text = "30"
 $y += $rowHeight
+Add-Label "Recent-change window (days):" $y | Out-Null
+$txtRecentDays = Add-TextBox $y -Width 120
+$txtRecentDays.Text = "30"
+$y += $rowHeight
+Add-Label "Stale-application window (days):" $y | Out-Null
+$txtStaleApp = Add-TextBox $y -Width 120
+$txtStaleApp.Text = "90"
+$y += $rowHeight
 Add-Label "Break-glass UPNs (semicolon-sep):" $y | Out-Null
 $txtBreakGlass = Add-TextBox $y
 $y += $rowHeight
 Add-Label "Output folder (optional):" $y | Out-Null
 $txtOutput = Add-TextBox $y -Width 560
 $btnBrowse = Add-Button "Browse..." $y 110 24 ($leftInput + 570)
+$y += $rowHeight
+Add-Label "Offline modules path (optional):" $y | Out-Null
+$txtModulesPath = Add-TextBox $y -Width 560
+$btnBrowseModules = Add-Button "Browse..." $y 110 24 ($leftInput + 570)
 $y += $rowHeight
 $chkNoLaunch = Add-Check "-NoLaunch (don't auto-open the report)" $y $false 320 $leftLabel
 $y += $rowHeight + 6
@@ -302,6 +315,20 @@ function ConvertTo-ArgLine([string[]]$InputArgs) {
     @($InputArgs | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"','""') + '"' } else { $_ } })
 }
 
+# Launch pwsh via .NET ProcessStartInfo.ArgumentList: each element is passed as a distinct
+# argument and the runtime handles all native quoting, so we never hand-roll quote escaping
+# for the actual launch (ConvertTo-ArgLine is only for the human-readable preview). pwsh is
+# resolved from PATH rather than hard-coding 'pwsh.exe'.
+function Start-PwshWithArgs {
+    param([string[]]$LaunchArgs)
+    $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $pwsh
+    $psi.UseShellExecute = $true   # open a new console window for the audit run
+    foreach ($arg in $LaunchArgs) { [void]$psi.ArgumentList.Add($arg) }
+    [System.Diagnostics.Process]::Start($psi) | Out-Null
+}
+
 function Build-LaunchArgs {
     param([switch]$InstallOnly)
     $a = @('-NoExit','-ExecutionPolicy','Bypass','-File', $script:AuditScriptPath)
@@ -324,6 +351,9 @@ function Build-LaunchArgs {
     if ($script:txtTenant.Text.Trim()) { $a += @('-TenantId', $script:txtTenant.Text.Trim()) }
     if ($script:txtInactive.Text.Trim() -and $script:txtInactive.Text.Trim() -ne '90') { $a += @('-InactiveDays', $script:txtInactive.Text.Trim()) }
     if ($script:txtExpiry.Text.Trim() -and $script:txtExpiry.Text.Trim() -ne '30')     { $a += @('-ExpiringCredentialDays', $script:txtExpiry.Text.Trim()) }
+    if ($script:txtRecentDays.Text.Trim() -and $script:txtRecentDays.Text.Trim() -ne '30') { $a += @('-RecentChangeDays', $script:txtRecentDays.Text.Trim()) }
+    if ($script:txtStaleApp.Text.Trim() -and $script:txtStaleApp.Text.Trim() -ne '90')     { $a += @('-StaleAppDays', $script:txtStaleApp.Text.Trim()) }
+    if ($script:txtModulesPath.Text.Trim()) { $a += @('-ModulesPath', $script:txtModulesPath.Text.Trim()) }
     if ($script:txtBreakGlass.Text.Trim()) {
         $bgList = (($script:txtBreakGlass.Text -split '[;,]') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ';'
         if ($bgList) { $a += @('-BreakGlassUpns', $bgList) }
@@ -369,18 +399,25 @@ $txtClientId.Add_TextChanged({ Update-Preview })
 $txtThumb.Add_TextChanged({ Update-Preview })
 $txtInactive.Add_TextChanged({ Update-Preview })
 $txtExpiry.Add_TextChanged({ Update-Preview })
+$txtRecentDays.Add_TextChanged({ Update-Preview })
+$txtStaleApp.Add_TextChanged({ Update-Preview })
 $txtBreakGlass.Add_TextChanged({ Update-Preview })
 $txtOutput.Add_TextChanged({ Update-Preview })
+$txtModulesPath.Add_TextChanged({ Update-Preview })
 $chkNoLaunch.Add_CheckedChanged({ Update-Preview })
 
 $btnBrowse.Add_Click({
     $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
     if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $script:txtOutput.Text = $dlg.SelectedPath }
 })
+$btnBrowseModules.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $script:txtModulesPath.Text = $dlg.SelectedPath }
+})
 
 $btnInstall.Add_Click({
     try {
-        Start-Process -FilePath 'pwsh.exe' -ArgumentList (ConvertTo-ArgLine (Build-LaunchArgs -InstallOnly))
+        Start-PwshWithArgs (Build-LaunchArgs -InstallOnly)
         Msg-Info "Module installation launched in a new PowerShell 7 window."
     } catch { Msg-Error "Failed to launch install: $($_.Exception.Message)" }
 })
@@ -402,15 +439,21 @@ $btnRun.Add_Click({
     if ($tenant -and -not ((Test-IsGuid $tenant) -or ($tenant -match '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'))) {
         Msg-Error "Tenant Id must be a GUID or a domain (e.g. contoso.onmicrosoft.com)."; return
     }
-    foreach ($pair in @(@{ n='Inactivity'; t=$script:txtInactive }, @{ n='Credential-expiry'; t=$script:txtExpiry })) {
+    foreach ($pair in @(
+        @{ n='Inactivity'; t=$script:txtInactive }, @{ n='Credential-expiry'; t=$script:txtExpiry },
+        @{ n='Recent-change window'; t=$script:txtRecentDays }, @{ n='Stale-application window'; t=$script:txtStaleApp }
+    )) {
         $v = $pair.t.Text.Trim()
         if ($v -and ($v -notmatch '^\d+$')) { Msg-Error ("{0} days must be a whole number." -f $pair.n); return }
     }
     if ($script:txtOutput.Text.Trim() -and -not (Test-Path -IsValid $script:txtOutput.Text.Trim())) {
         Msg-Error "Output folder path is not a valid path."; return
     }
+    if ($script:txtModulesPath.Text.Trim() -and -not (Test-Path $script:txtModulesPath.Text.Trim())) {
+        Msg-Error "Offline modules path does not exist."; return
+    }
     try {
-        Start-Process -FilePath 'pwsh.exe' -ArgumentList (ConvertTo-ArgLine (Build-LaunchArgs))
+        Start-PwshWithArgs (Build-LaunchArgs)
         $script:form.Close()
     } catch { Msg-Error "Failed to launch audit: $($_.Exception.Message)" }
 })

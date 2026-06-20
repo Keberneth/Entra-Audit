@@ -196,7 +196,7 @@ If you want to grant the absolute minimum for a subset of checks, this maps each
 |---|---|
 | `Directory.Read.All` | underpins most; tenant info, accounts, guests, posture, apps, devices, recent changes, health |
 | `Organization.Read.All` | tenant-info, tenanthealth |
-| `RoleManagement.Read.Directory` | privroles, directoryroles, guests (priv), mfa (admin x-ref), apps (group roles), riskyusers (priv x-ref) |
+| `RoleManagement.Read.Directory` | privroles, directoryroles, breakglass, guests (priv), mfa (admin x-ref), apps (group roles), riskyusers (priv x-ref) |
 | `RoleEligibilitySchedule.Read.Directory` + `RoleAssignmentSchedule.Read.Directory` | privroles, directoryroles (PIM instances) |
 | `User.Read.All` | accounts, staleusers, guests, recentchanges |
 | `AuditLog.Read.All` | staleusers, mfa (registration report), legacyauth, recentchanges, guests, staleapps (service-principal sign-in activity, beta report) |
@@ -205,7 +205,8 @@ If you want to grant the absolute minimum for a subset of checks, this maps each
 | `DelegatedPermissionGrant.Read.All` | consentgrants |
 | `Group.Read.All` | guests, apps (role-assignable groups), recentchanges |
 | `Device.Read.All` | devices |
-| `IdentityRiskyUser.Read.All` / `IdentityRiskEvent.Read.All` / `IdentityRiskyServicePrincipal.Read.All` | riskyusers |
+| `IdentityRiskyUser.Read.All` / `IdentityRiskEvent.Read.All` | riskyusers |
+| `IdentityRiskyServicePrincipal.Read.All` | riskyserviceprincipals (gated on Workload Identities Premium, not P2) |
 | `CrossTenantInformation.ReadBasic.All` | trusts (partner resolution) |
 | `OnPremDirectorySynchronization.Read.All` | tenanthealth |
 | `Reports.Read.All` | mfa (registration report alt), usage |

@@ -63,7 +63,8 @@ param(
     [switch]$legacyauth,        # Legacy authentication usage
     [switch]$tenantposture,     # Security Defaults, authorization & consent settings
     [switch]$capolicies,        # Conditional Access policy posture
-    [switch]$riskyusers,        # Identity Protection: risky users / detections / risky SPs
+    [switch]$riskyusers,        # Identity Protection: risky users / detections
+    [switch]$riskyserviceprincipals, # Identity Protection: risky service principals (Workload ID Premium)
     [switch]$apps,              # App / service principal hygiene & over-privilege
     [switch]$consentgrants,     # OAuth2 delegated consent grants (illicit consent)
     [switch]$devices,           # Stale / unmanaged / non-compliant devices
@@ -186,6 +187,7 @@ $script:HasP2       = $false
 $script:WorkloadIdP = $false
 $script:Tenant      = $null
 $script:UsersCache  = $null
+$script:UsersCacheHasSignIn = $false   # whether $UsersCache was fetched WITH signInActivity
 $script:UserById    = @{}
 $script:RegCache    = $null
 $script:MfaCapableById = @{}
@@ -372,6 +374,31 @@ function Add-EntraFinding {
     }) | Out-Null
 }
 
+# Defend exported CSVs against spreadsheet formula injection. Tenant/display/app/group
+# names and UPN-like fields are attacker-influencable; a value that begins with =, +, -, @
+# or a control character can be interpreted as a formula when the CSV is opened in Excel /
+# LibreOffice. Prefixing with a single quote neutralises it without changing the visible text.
+# (Raw JSON keeps the unmodified values - only the spreadsheet-bound CSVs are sanitised.)
+function ConvertTo-SafeCsvValue {
+    param([object]$Value)
+    if ($null -eq $Value) { return $null }
+    # Only STRING values are a formula-injection vector. Pass typed values (DateTime,
+    # numbers, bools) through unchanged so Export-Csv formats them exactly as before -
+    # casting a [datetime] to [string] here would silently change the date format.
+    if ($Value -isnot [string]) { return $Value }
+    if ($Value -match '^[=+\-@\t\r\n]') { return "'" + $Value }
+    return $Value
+}
+function ConvertTo-SafeCsvRows {
+    param([object[]]$Rows)
+    foreach ($row in @($Rows)) {
+        if ($null -eq $row) { continue }
+        $out = [ordered]@{}
+        foreach ($p in $row.PSObject.Properties) { $out[$p.Name] = ConvertTo-SafeCsvValue $p.Value }
+        [pscustomobject]$out
+    }
+}
+
 # Writes each raw dataset three ways - CSV (data), TXT (plain), and a styled HTML
 # table in the same design as the reports - and registers it for the Raw Data index.
 # Returns the relative href (from HTML Reports\) to the HTML version so findings link
@@ -395,7 +422,7 @@ function Write-Evidence {
         $header += ('Rows: {0}' -f $count); $header += ''
 
         if ($Rows -and $count -gt 0) {
-            @($Rows) | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+            ConvertTo-SafeCsvRows $Rows | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
             $table = @($Rows) | Format-Table -AutoSize | Out-String -Width 4096
             Set-Content -LiteralPath $txtPath -Value (($header -join "`r`n") + "`r`n" + $table) -Encoding UTF8
         } else {
@@ -425,14 +452,31 @@ function Write-Evidence {
 # ===========================================================================
 # Module install + Graph connection (read-only)
 # ===========================================================================
+# Microsoft.Graph sub-modules must share a single major version - mixing majors (e.g. a v1
+# and a v2 module side by side) is a known cause of obscure runtime failures in the SDK.
+function Assert-GraphModuleVersions {
+    $installed = foreach ($m in $script:RequiredModules) {
+        Get-Module -ListAvailable -Name $m | Sort-Object Version -Descending | Select-Object -First 1 Name, Version
+    }
+    $installed = @($installed | Where-Object { $_ })
+    if ($installed.Count -eq 0) { return }
+    $majors = @($installed | Group-Object { $_.Version.Major })
+    if ($majors.Count -gt 1) {
+        $detail = ($installed | ForEach-Object { "$($_.Name)=$($_.Version)" }) -join ', '
+        throw "Microsoft.Graph modules have mixed major versions: $detail. Align them to one major version (uninstall the older majors) before running the audit."
+    }
+}
+
 function Install-EntraModules {
     Write-Info "Installing Microsoft Graph SDK sub-modules (CurrentUser scope)..."
+    $prevPolicy = $null   # restore PSGallery trust afterwards - do not leave it permanently trusted
     try {
         if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
             Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
         }
         $repo = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
         if ($repo -and $repo.InstallationPolicy -ne 'Trusted') {
+            $prevPolicy = $repo.InstallationPolicy
             Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
         }
         foreach ($m in $script:RequiredModules) {
@@ -441,8 +485,13 @@ function Install-EntraModules {
             Install-Module -Name $m -Scope CurrentUser -Force -AllowClobber -Repository PSGallery -ErrorAction Stop
             Write-Good "$m installed."
         }
+        Assert-GraphModuleVersions
     } catch {
         throw "Module installation failed: $($_.Exception.Message)"
+    } finally {
+        # Restore the PSGallery installation policy we changed, so running the audit does not
+        # silently leave PSGallery trusted for the user's whole session/profile.
+        if ($prevPolicy) { try { Set-PSRepository -Name PSGallery -InstallationPolicy $prevPolicy } catch {} }
     }
 }
 
@@ -459,6 +508,9 @@ function Import-EntraModules {
     if ($missing.Count -gt 0) {
         throw "Required module(s) not available: $($missing -join ', '). Run with -installdeps (online) or see PREREQUISITE.md for offline install."
     }
+    # Warn (do not abort) on mixed Graph module majors - the audit may still work, but this is
+    # the most common cause of confusing downstream SDK errors.
+    try { Assert-GraphModuleVersions } catch { Write-Warn2 $_.Exception.Message }
 }
 
 function Connect-EntraAuditGraph {
@@ -594,9 +646,14 @@ function Invoke-AuditCheck {
 
     try {
         & $Action
-        $added = $script:Findings.Count - $before
-        $status = if ($added -gt 0) { "Findings($added)" } else { 'Pass' }
-        $script:CheckStatus[$CheckId] = [pscustomobject]@{ Title=$Title; Status=$status; Count=$added }
+        # Many checks intentionally add Information-level baselines (population overviews, MFA
+        # adoption, "desired posture" notes) even when nothing is wrong. Count only non-Information
+        # severities as risk findings so a clean check is not mislabelled as noisy.
+        $newFindings = @($script:Findings | Select-Object -Skip $before)
+        $riskAdded = @($newFindings | Where-Object { $_.Severity -ne 'Information' }).Count
+        $infoAdded = @($newFindings | Where-Object { $_.Severity -eq 'Information' }).Count
+        $status = if ($riskAdded -gt 0) { "RiskFindings($riskAdded)" } elseif ($infoAdded -gt 0) { "InfoOnly($infoAdded)" } else { 'Pass' }
+        $script:CheckStatus[$CheckId] = [pscustomobject]@{ Title=$Title; Status=$status; Count=$riskAdded; InfoCount=$infoAdded }
         Write-Good "  $Title -> $status"
     } catch {
         $code = $null
@@ -616,13 +673,30 @@ function Invoke-AuditCheck {
 # Cached data shared across checks
 # ===========================================================================
 function Get-EAUsers {
-    if ($null -ne $script:UsersCache) { return $script:UsersCache }
+    # signInActivity is opt-in: it requires AuditLog.Read.All AND Entra ID P1/P2, and
+    # requesting the property without the licence can fail the whole Get-MgUser call,
+    # breaking checks (accounts/guests/privroles) that do not even need sign-in data.
+    # Only the stale-users and break-glass checks pass -IncludeSignInActivity.
+    param([switch]$IncludeSignInActivity)
+
+    $wantSignIn = $IncludeSignInActivity -and $script:HasP1 -and (Test-MgScope @('AuditLog.Read.All') -Quiet)
+
+    # Serve from cache when the cached population already satisfies the request. The
+    # sign-in variant is a superset of properties, so a base caller can reuse it freely.
+    if ($wantSignIn) {
+        if ($script:UsersCacheHasSignIn) { return $script:UsersCache }
+    } elseif ($null -ne $script:UsersCache) {
+        return $script:UsersCache
+    }
+
     $props = @('Id','UserPrincipalName','DisplayName','AccountEnabled','UserType',
                'AssignedLicenses','LicenseAssignmentStates','PasswordPolicies',
                'OnPremisesSyncEnabled','CreatedDateTime',
                'ExternalUserState','ExternalUserStateChangeDateTime')
-    if (Test-MgScope @('AuditLog.Read.All') -Quiet) { $props += 'SignInActivity' }
+    if ($wantSignIn) { $props += 'SignInActivity' }
+
     $script:UsersCache = @(Get-MgUser -All -Property $props -ErrorAction Stop)
+    $script:UsersCacheHasSignIn = $wantSignIn
     $script:UserById = @{}
     foreach ($u in $script:UsersCache) { if ($u.Id) { $script:UserById[$u.Id] = $u } }
     return $script:UsersCache
@@ -823,7 +897,20 @@ function Invoke-Check-PrivRoles {
     # Per-assignment findings for permanent privileged roles
     foreach ($a in $permanentPriv) {
         $isBreakGlass = ($a.Principal -and ($a.Principal.ToLowerInvariant() -in $bg) -and -not $a.Synced -and $a.PrincipalType -eq 'user')
-        if ($isBreakGlass) { continue }   # designated break-glass: permanence is expected
+        if ($isBreakGlass -and $a.IsGA) { continue }   # permanent GA on a break-glass account is the expected posture
+        if ($isBreakGlass -and -not $a.IsGA) {
+            # A break-glass account should be permanent ONLY for Global Administrator. Any
+            # extra standing privileged role widens its blast radius beyond emergency recovery
+            # and is still worth reporting (just not at the full standing-privilege severity).
+            Add-EntraFinding -Severity 'Medium' -CheckId 'privileged-roles' -Category 'Privileged Access' `
+                -Title ("Break-glass account has an extra permanent privileged role: {0} -> {1}" -f $a.Principal, $a.Role) `
+                -Evidence ("Designated break-glass account {0} (object id {1}) holds permanent {2}, not only Global Administrator." -f $a.Principal, $a.PrincipalId, $a.Role) `
+                -WhyItMatters 'Emergency-access accounts should be minimal and predictable. Extra standing roles increase blast radius and make exception handling (CA exclusions, monitoring, credential storage) unclear.' `
+                -RecommendedAction 'Keep the break-glass account permanent only for Global Administrator unless there is a documented recovery requirement for the extra role.' `
+                -SourceFile $src -AffectedPrincipal $a.Principal -ObjectType $a.PrincipalType -ObjectId $a.PrincipalId `
+                -ResultRows @($rows | Where-Object { $_.PrincipalId -eq $a.PrincipalId })
+            continue
+        }
 
         $sev = if ($a.IsGA) { 'Critical' } else { 'High' }
         $reasons = @()
@@ -1022,7 +1109,7 @@ function Invoke-Check-StaleUsers {
             -RecommendedAction 'Grant AuditLog.Read.All and ensure Entra ID P1+ so sign-in activity is available.' -SourceFile $null
         return
     }
-    $users = Get-EAUsers
+    $users = Get-EAUsers -IncludeSignInActivity
 
     # Privileged principals get a tighter inactivity bar (escalated severity).
     $privIds = @{}
@@ -1343,8 +1430,8 @@ function Invoke-Check-TenantPosture {
 
     if ($sd -and -not $sd.IsEnabled -and $caCount -eq 0) {
         Add-EntraFinding -Severity 'High' -CheckId 'tenantposture' -Category 'Tenant Posture' `
-            -Title 'Security Defaults are OFF and no enabled Conditional Access policy enforces MFA' `
-            -Evidence 'IsEnabled=false on Security Defaults with zero enabled CA policies - the tenant can be password-only.' `
+            -Title 'Security Defaults are OFF and zero Conditional Access policies are enabled' `
+            -Evidence 'IsEnabled=false on Security Defaults with zero enabled Conditional Access policies - the tenant can be password-only.' `
             -WhyItMatters 'With neither Security Defaults nor Conditional Access, there is no baseline MFA enforcement at all - the most common cause of account takeover.' `
             -RecommendedAction 'Enable Conditional Access MFA policies (preferred on licensed tenants) or turn on Security Defaults as an interim baseline.' -SourceFile $src
     } elseif ($sd -and $sd.IsEnabled -and $caCount -gt 0) {
@@ -1512,7 +1599,7 @@ function Invoke-Check-CAPolicies {
 # ===========================================================================
 # CHECK 11 - riskyusers (Identity Protection)
 # ===========================================================================
-function Invoke-Check-RiskyUsers {
+function Invoke-Check-RiskyUsersOnly {
     $risky = @(Get-MgRiskyUser -All -ErrorAction Stop | Where-Object { $_.RiskState -in @('atRisk','confirmedCompromised') })
     $detections = @()
     try { $detections = @(Get-MgRiskDetection -All -ErrorAction SilentlyContinue) } catch {}
@@ -1558,7 +1645,15 @@ function Invoke-Check-RiskyUsers {
             -WhyItMatters 'Identity Protection surfaces compromised and risky identities in near real time.' `
             -RecommendedAction 'Ensure Entra ID P2 is licensed and risk-based Conditional Access policies are enabled.' -SourceFile $src
     }
+}
 
+# ===========================================================================
+# CHECK 11b - riskyserviceprincipals (Identity Protection - risky workload identities)
+#   Split from riskyusers: risky service principals are licensed under Microsoft Entra
+#   Workload ID Premium, NOT Entra ID P2, so a Workload-ID-Premium tenant without P2 must
+#   still be able to evaluate them. The check is gated internally on $script:WorkloadIdP.
+# ===========================================================================
+function Invoke-Check-RiskyServicePrincipals {
     # Risky service principals (beta, best-effort)
     $rspFound = $false
     try {
@@ -1573,7 +1668,7 @@ function Invoke-Check-RiskyUsers {
             $rspFound = $true
             $rsprows = $rsp | Select-Object @{n='DisplayName';e={ $_.DisplayName ?? $_.displayName }}, @{n='RiskState';e={ $_.RiskState ?? $_.riskState }}
             $rspsrc = Write-Evidence -BaseName 'risky_serviceprincipals' -Rows $rsprows -Title 'Identity Protection - Risky Service Principals'
-            Add-EntraFinding -Severity 'High' -CheckId 'riskyusers' -Category 'Threat Signals' `
+            Add-EntraFinding -Severity 'High' -CheckId 'riskyserviceprincipals' -Category 'Threat Signals' `
                 -Title ("{0} risky service principal(s) flagged" -f $rsp.Count) `
                 -Evidence 'A workload identity (app/service principal) is flagged as risky/compromised.' `
                 -WhyItMatters 'A compromised workload identity often holds application permissions exercised without any user interaction - a high-impact, stealthy foothold.' `
@@ -1581,15 +1676,23 @@ function Invoke-Check-RiskyUsers {
         }
     } catch {}
 
+    if ($rspFound) { return }
+
     # Risky service principals are licensed separately from P2 risky users (they need
-    # Microsoft Entra Workload ID Premium). Report that coverage explicitly so a P2 tenant
-    # without Workload ID Premium is not mistaken for "no risky workload identities".
-    if (-not $script:WorkloadIdP -and -not $rspFound) {
-        Add-EntraFinding -Severity 'Information' -CheckId 'riskyusers' -Category 'Threat Signals' `
+    # Microsoft Entra Workload ID Premium). Report coverage explicitly: a tenant without
+    # Workload ID Premium is license-gated (not clean), while one WITH it and no flags is clean.
+    if (-not $script:WorkloadIdP) {
+        Add-EntraFinding -Severity 'Information' -CheckId 'riskyserviceprincipals' -Category 'Threat Signals' `
             -Title 'Risky service principals not assessed (Workload Identities Premium required)' `
-            -Evidence 'Risky workload identities require Microsoft Entra Workload ID Premium, which was not detected - this sub-check is license-gated, not clean.' `
+            -Evidence 'Risky workload identities require Microsoft Entra Workload ID Premium, which was not detected - this check is license-gated, not clean.' `
             -WhyItMatters 'Risky service principals surface compromised workload identities; without Workload ID Premium they cannot be evaluated even when Entra ID P2 is present.' `
             -RecommendedAction 'License Microsoft Entra Workload ID Premium to enable risky service principal detection.' -SourceFile $null
+    } else {
+        Add-EntraFinding -Severity 'Information' -CheckId 'riskyserviceprincipals' -Category 'Threat Signals' `
+            -Title 'No risky service principals flagged by Identity Protection' `
+            -Evidence 'Workload Identities Premium is present and no workload identity is currently flagged at-risk/compromised.' `
+            -WhyItMatters 'Risky service principals surface compromised workload identities exercising application permissions without user interaction.' `
+            -RecommendedAction 'Maintain risk-based Conditional Access for workload identities and review flagged service principals promptly.' -SourceFile $null
     }
 }
 
@@ -2025,6 +2128,16 @@ function Invoke-Check-TenantHealth {
             -RecommendedAction 'No action.' -SourceFile $src
         return
     }
+    if ($org.OnPremisesSyncEnabled -and -not $sync) {
+        # Hybrid tenant, but the on-prem sync configuration could not be read - do NOT fall
+        # through to the "healthy" baseline, which would be a false sense of coverage.
+        Add-EntraFinding -Severity 'Medium' -CheckId 'tenanthealth' -Category 'Platform Health' `
+            -Title 'Directory synchronization details could not be assessed' `
+            -Evidence 'Tenant is hybrid (OnPremisesSyncEnabled=true), but Get-MgDirectoryOnPremiseSynchronization returned no data or failed.' `
+            -WhyItMatters 'Password Hash Sync, soft-match blocking and sync feature posture cannot be validated without this data, so an apparently healthy result would be misleading.' `
+            -RecommendedAction 'Grant OnPremDirectorySynchronization.Read.All and re-run the tenanthealth check.' -SourceFile $src
+        return
+    }
     if ($org.OnPremisesLastSyncDateTime -and $org.OnPremisesLastSyncDateTime -lt (Get-Date).ToUniversalTime().AddHours(-3)) {
         Add-EntraFinding -Severity 'Medium' -CheckId 'tenanthealth' -Category 'Platform Health' `
             -Title 'Directory synchronisation is stale (> 3 hours)' `
@@ -2074,9 +2187,25 @@ function Get-EAPrivAssignments {
         $pname = Get-Ap $p 'displayName'
         if (-not $upn -and $id -and $script:UserById.ContainsKey($id)) { $upn = $script:UserById[$id].UserPrincipalName }
         $ptype = if ($odt) { ($odt -replace '#microsoft.graph.','') } elseif ($upn) { 'user' } elseif ($id -and $script:UserById.ContainsKey($id)) { 'user' } else { 'group/sp' }
+
+        # 'State' stays the COARSE Active/Eligible distinction the access-path correlation
+        # relies on. 'ActivationModel' is the fine-grained classification needed to tell a
+        # PERMANENT standing assignment apart from a time-bound or JIT-activated one - the
+        # break-glass check needs "permanent active GA", not merely "currently active GA".
+        $assignmentType = $null
+        if ($a.PSObject.Properties['AssignmentType']) { $assignmentType = [string]$a.AssignmentType }
+        $endDateTime = $null
+        if ($a.PSObject.Properties['EndDateTime']) { $endDateTime = $a.EndDateTime }
+        $activationModel =
+            if ($state -eq 'Eligible')              { 'Eligible' }
+            elseif ($assignmentType -eq 'Activated') { 'TimeBound-Active-JIT' }
+            elseif ($null -eq $endDateTime)          { 'Permanent' }
+            else                                     { 'TimeBound-Assigned' }
+
         $list.Add([pscustomobject]@{
             PrincipalId=$id; PrincipalType=$ptype; PrincipalUpn=$upn; PrincipalName=$pname
             RoleTemplateId=$tmpl; RoleName=$name; State=$state
+            ActivationModel=$activationModel; AssignmentType=$assignmentType; EndDateTime=$endDateTime
             IsPrivileged=$script:PrivilegedRoleTemplates.ContainsKey($tmpl); IsGA=($tmpl -eq $script:GlobalAdminTemplateId)
         }) | Out-Null
     }
@@ -2218,16 +2347,18 @@ function Invoke-Check-PimPolicies {
 # CHECK 19 - breakglass (emergency-access account health)
 # ===========================================================================
 function Invoke-Check-BreakGlass {
-    $users = Get-EAUsers
+    $users = Get-EAUsers -IncludeSignInActivity
     $byUpn = @{}; foreach ($u in $users) { if ($u.UserPrincipalName) { $byUpn[$u.UserPrincipalName.ToLowerInvariant()] = $u } }
 
-    # current Global Administrators, and every user's privileged role-template ids (active AND
+    # PERMANENT Global Administrators, and every user's privileged role-template ids (active AND
     # eligible) - eligible roles must feed the CA-applicability check because an eligible-only
-    # role does not appear in transitiveMemberOf.
+    # role does not appear in transitiveMemberOf. A break-glass account must hold GA as a
+    # PERMANENT standing assignment (not a time-bound / JIT-activated one), so $gaIds is keyed
+    # on ActivationModel -eq 'Permanent', not merely "currently active".
     $gaIds = @{}
     $privRolesByUser = @{}
     foreach ($a in (Get-EAPrivAssignments)) {
-        if ($a.IsGA -and $a.State -eq 'Active' -and $a.PrincipalId) { $gaIds[$a.PrincipalId] = $true }
+        if ($a.IsGA -and $a.ActivationModel -eq 'Permanent' -and $a.PrincipalId) { $gaIds[$a.PrincipalId] = $true }
         if ($a.PrincipalId -and $a.PrincipalType -eq 'user' -and $a.RoleTemplateId) {
             if (-not $privRolesByUser.ContainsKey($a.PrincipalId)) { $privRolesByUser[$a.PrincipalId] = New-Object System.Collections.Generic.HashSet[string] }
             [void]$privRolesByUser[$a.PrincipalId].Add($a.RoleTemplateId)
@@ -2236,7 +2367,10 @@ function Invoke-Check-BreakGlass {
 
     # Conditional Access lockout evaluation context.
     $enabledCa = @(); try { $enabledCa = @(Get-MgIdentityConditionalAccessPolicy -All -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'enabled' }) } catch {}
-    $signinKnown = (Test-MgScope @('AuditLog.Read.All') -Quiet)
+    # signInActivity is only populated when P1+ is licensed AND AuditLog.Read.All is granted -
+    # mirror Get-EAUsers' gate so an unlicensed tenant reports "could not validate" rather than
+    # a false "no successful sign-in in 90 days".
+    $signinKnown = ($script:HasP1 -and (Test-MgScope @('AuditLog.Read.All') -Quiet))
 
     # (CA applicability uses the shared Get-EAUserScopeIds / Test-CaPolicyAppliesToUser helpers.)
     $bg = Normalize-StringList -Values $BreakGlassUpns
@@ -2340,7 +2474,7 @@ function Invoke-Check-BreakGlass {
         if (-not $isGA) {
             Add-EntraFinding -Severity 'Critical' -CheckId 'breakglass' -Category 'Privileged Access' `
                 -Title ("Break-glass account is not a permanent Global Administrator: {0}" -f $u.UserPrincipalName) `
-                -Evidence 'The emergency-access account does not currently hold an active Global Administrator role.' `
+                -Evidence 'The emergency-access account does not hold Global Administrator as a PERMANENT (standing) assignment - an eligible/time-bound or JIT-activated GA does not count, because PIM activation may itself be unavailable during the emergency.' `
                 -WhyItMatters 'A break-glass account must have standing Global Admin so it can recover the tenant when all other access fails.' `
                 -RecommendedAction 'Assign permanent Global Administrator to the break-glass account.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
         }
@@ -3095,6 +3229,11 @@ h1{font-size:22px;margin:0 0 6px;letter-spacing:.2px}
 .card .s{margin-top:4px;color:var(--muted);font-size:12px}
 .span-3{grid-column:span 3}.span-4{grid-column:span 4}
 .pill{display:inline-flex;align-items:center;justify-content:center;padding:4px 10px;border-radius:999px;font-weight:800;font-size:12px;border:1px solid var(--line);min-width:86px;}
+.pill.ok{background:var(--low-bg);color:var(--low-text)}
+.pill.info{background:var(--info-bg);color:var(--info-text)}
+.pill.find{background:var(--high-bg);color:var(--high-text)}
+.pill.skip{background:var(--info-bg);color:var(--info-text)}
+.pill.err{background:var(--critical-bg);color:var(--critical-text)}
 .sev-Critical{background:var(--critical-bg);color:var(--critical-text)}
 .sev-High{background:var(--high-bg);color:var(--high-text)}
 .sev-Medium{background:var(--medium-bg);color:var(--medium-text)}
@@ -3451,11 +3590,13 @@ function Write-PostureSummaryReport {
 
     $statusRows = foreach ($k in $script:CheckStatus.Keys) {
         $s = $script:CheckStatus[$k]
-        $cls = switch -Regex ($s.Status) { '^Pass' {'ok'} '^Findings' {'find'} '^Skipped' {'skip'} '^Error' {'err'} default {'skip'} }
+        $cls = switch -Regex ($s.Status) { '^Pass' {'ok'} '^InfoOnly' {'info'} '^RiskFindings' {'find'} '^Skipped' {'skip'} '^Error' {'err'} default {'skip'} }
         "<tr><td class='mono'>$(HtmlEncode $k)</td><td>$(HtmlEncode $s.Title)</td><td><span class='pill $cls'>$(HtmlEncode $s.Status)</span></td></tr>"
     }
-    $pass = @($script:CheckStatus.Values | Where-Object { $_.Status -eq 'Pass' }).Count
-    $withFindings = @($script:CheckStatus.Values | Where-Object { $_.Status -like 'Findings*' }).Count
+    # "Clean" = checks that found no risk (Pass + Information-only baselines); "With findings"
+    # counts only checks that surfaced an actual risk-level finding.
+    $pass = @($script:CheckStatus.Values | Where-Object { $_.Status -eq 'Pass' -or $_.Status -like 'InfoOnly*' }).Count
+    $withFindings = @($script:CheckStatus.Values | Where-Object { $_.Status -like 'RiskFindings*' }).Count
     $skipped = @($script:CheckStatus.Values | Where-Object { $_.Status -like 'Skipped*' }).Count
     $errored = @($script:CheckStatus.Values | Where-Object { $_.Status -eq 'Error' }).Count
 
@@ -3490,8 +3631,8 @@ $nav
       <button id="themeToggle" type="button" class="theme-toggle">Toggle theme</button>
     </div>
     <div class="grid">
-      <div class="card span-3"><div class="k">Checks passed</div><div class="v">$pass</div><div class="s">No findings</div></div>
-      <div class="card span-3"><div class="k">With findings</div><div class="v">$withFindings</div><div class="s">Action needed</div></div>
+      <div class="card span-3"><div class="k">Checks clean</div><div class="v">$pass</div><div class="s">No risk findings (incl. info-only)</div></div>
+      <div class="card span-3"><div class="k">With risk findings</div><div class="v">$withFindings</div><div class="s">Action needed</div></div>
       <div class="card span-3"><div class="k">Skipped</div><div class="v">$skipped</div><div class="s">No scope / license</div></div>
       <div class="card span-3"><div class="k">Errored</div><div class="v">$errored</div><div class="s">See console</div></div>
       <div class="card span-4"><div class="k">Users</div><div class="v">$($Stats.Users)</div><div class="s">Members + guests</div></div>
@@ -3599,13 +3740,14 @@ $script:Registry = [ordered]@{
     'legacyauth'       = @{ Func='Invoke-Check-LegacyAuth';     Title='Legacy Authentication Usage';            Scopes=@('AuditLog.Read.All'); P1=$true }
     'tenantposture'    = @{ Func='Invoke-Check-TenantPosture';  Title='Security Defaults & Consent Settings';   Scopes=@('Policy.Read.All') }
     'capolicies'       = @{ Func='Invoke-Check-CAPolicies';     Title='Conditional Access Posture';             Scopes=@('Policy.Read.All') }
-    'riskyusers'       = @{ Func='Invoke-Check-RiskyUsers';     Title='Identity Protection (Risky Users)';      Scopes=@('IdentityRiskyUser.Read.All'); P2=$true }
+    'riskyusers'       = @{ Func='Invoke-Check-RiskyUsersOnly'; Title='Identity Protection (Risky Users)';      Scopes=@('IdentityRiskyUser.Read.All'); P2=$true }
+    'riskyserviceprincipals' = @{ Func='Invoke-Check-RiskyServicePrincipals'; Title='Identity Protection (Risky Service Principals)'; Scopes=@('IdentityRiskyServicePrincipal.Read.All') }
     'apps'             = @{ Func='Invoke-Check-Apps';           Title='App / Service Principal Hygiene';        Scopes=@('Application.Read.All') }
     'consentgrants'    = @{ Func='Invoke-Check-ConsentGrants';  Title='OAuth2 Consent Grants';                  Scopes=@('DelegatedPermissionGrant.Read.All') }
     'devices'          = @{ Func='Invoke-Check-Devices';        Title='Stale / Unmanaged Devices';              Scopes=@('Device.Read.All') }
     'trusts'           = @{ Func='Invoke-Check-Trusts';         Title='Cross-Tenant Access & B2B Trust';        Scopes=@('Policy.Read.All') }
     'recentchanges'    = @{ Func='Invoke-Check-RecentChanges';  Title='Recently Created Users / Groups';        Scopes=@('User.Read.All','AuditLog.Read.All') }
-    'tenanthealth'     = @{ Func='Invoke-Check-TenantHealth';   Title='Directory-Sync / PHS Health';            Scopes=@('Organization.Read.All') }
+    'tenanthealth'     = @{ Func='Invoke-Check-TenantHealth';   Title='Directory-Sync / PHS Health';            Scopes=@('Organization.Read.All','OnPremDirectorySynchronization.Read.All') }
     'pimpolicies'      = @{ Func='Invoke-Check-PimPolicies';    Title='PIM Role-Management Policy Quality';     Scopes=@('RoleManagementPolicy.Read.Directory'); P2=$true }
     'breakglass'       = @{ Func='Invoke-Check-BreakGlass';     Title='Emergency-Access (Break-Glass) Health';  Scopes=@('User.Read.All','RoleManagement.Read.Directory') }
     'authmethodpolicy' = @{ Func='Invoke-Check-AuthMethodPolicy'; Title='Authentication Methods Policy';        Scopes=@('Policy.Read.All') }
@@ -3624,7 +3766,8 @@ function Invoke-EntraAudit {
     $individual = [ordered]@{
         'tenant-info'=$tenantinfo; 'privileged-roles'=$privroles; 'directory-roles'=$directoryroles;
         'accounts'=$accounts; 'staleusers'=$staleusers; 'guests'=$guests; 'mfa'=$mfa; 'legacyauth'=$legacyauth;
-        'tenantposture'=$tenantposture; 'capolicies'=$capolicies; 'riskyusers'=$riskyusers; 'apps'=$apps;
+        'tenantposture'=$tenantposture; 'capolicies'=$capolicies; 'riskyusers'=$riskyusers;
+        'riskyserviceprincipals'=$riskyserviceprincipals; 'apps'=$apps;
         'consentgrants'=$consentgrants; 'devices'=$devices; 'trusts'=$trusts; 'recentchanges'=$recentchanges;
         'tenanthealth'=$tenanthealth; 'pimpolicies'=$pimpolicies; 'breakglass'=$breakglass;
         'authmethodpolicy'=$authmethodpolicy; 'accesspaths'=$accesspaths; 'staleapps'=$staleapps
@@ -3735,7 +3878,7 @@ function Invoke-EntraAudit {
         }
     }
     try {
-        @($exportRows) | Export-Csv -LiteralPath (Join-Path $script:RunRoot 'Findings.csv') -NoTypeInformation -Encoding UTF8
+        ConvertTo-SafeCsvRows $exportRows | Export-Csv -LiteralPath (Join-Path $script:RunRoot 'Findings.csv') -NoTypeInformation -Encoding UTF8
         @($exportRows) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $script:RunRoot 'Findings.json') -Encoding UTF8
     } catch { Write-Warn2 "Could not write Findings.json/csv: $($_.Exception.Message)" }
 
@@ -3746,6 +3889,7 @@ function Invoke-EntraAudit {
     Write-Host ("  Findings     : Critical={0} High={1} Medium={2} Low={3} Info={4}" -f $counts.Critical,$counts.High,$counts.Medium,$counts.Low,$counts.Information)
     Write-Host ("  Reports      : {0}" -f $script:HtmlDir)
     Write-Host ("  Raw evidence : {0}" -f $script:RawDir)
+    Write-Warn2 "Reports contain sensitive identity/security data (users, admins, apps, sign-in & risk signals). Store the output in a restricted folder and avoid sharing the raw CSV/JSON broadly."
 
     if (-not $NoLaunch) {
         try { Invoke-Item $resultsPath -ErrorAction SilentlyContinue } catch {}
