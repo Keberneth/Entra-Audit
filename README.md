@@ -70,7 +70,7 @@ Results are written to a tenant-named, timestamped folder (mirrors the AD audit 
 
 The four reports share a top navigation bar (Audit Results · Risk Report · Posture Summary · Raw Data) and a light/dark theme toggle, exactly like the AD reports.
 
-**Every check writes its full evidence three ways** — a styled, searchable **HTML** table (same design as the reports), a **CSV** (data), and a **TXT** (plain) — even when the check passes, so you always have the underlying data in a readable form. Each finding links to its dataset's HTML page, and the **Raw Data** tab indexes them all. `Findings.json` / `Findings.csv` give every finding a stable id (`TenantId|CheckId|object`) for automation and trend comparison.
+**Every check writes its full evidence three ways** — a styled, searchable **HTML** table (same design as the reports), a **CSV** (data), and a **TXT** (plain) — even when the check passes, so you always have the underlying data in a readable form. Each finding links to its dataset's HTML page, and the **Raw Data** tab indexes them all. `Findings.json` / `Findings.csv` give every finding a stable id of the form `TenantId|CheckId|Rule|ObjectType|ObjectId|PathHash` for automation and trend comparison. `Rule` is an explicit `RuleId` where one is set on the finding, otherwise a digit-stripped title slug (so a changing count — "5 stale users" → "7" — does not change the id); explicit `RuleId`s are being applied to checks incrementally.
 
 ---
 
@@ -99,6 +99,7 @@ The four reports share a top navigation bar (Audit Results · Risk Report · Pos
 | `-breakglass` | **Emergency-access (break-glass) health** — count, cloud-only, GA, .onmicrosoft.com, recent test, licensing | pass `-BreakGlassUpns` |
 | `-authmethodpolicy` | Authentication-methods policy — weak (SMS/voice) vs phishing-resistant (FIDO2/WHfB), TAP reuse | |
 | `-accesspaths` | **Effective-access / attack-path graph** — duplicate privilege paths (classified **active** vs **eligible-only**), ownership-based escalation (group-, app- and SP-owners), and **CA-exclusion-group owners who can self-add to bypass MFA** | needs `Group.Read.All` (+ `Member.Read.Hidden` for hidden groups) |
+| `-staleapps` | **Stale / unused applications** — flags app service principals with no sign-in in `-StaleAppDays` (default 90); stale-with-live-credentials → Medium, stale-no-credentials → Low. Excludes Microsoft first-party SPs | needs **P1** (uses service-principal sign-in activity) |
 
 ### How the AD audit maps to the Entra audit
 
@@ -144,6 +145,7 @@ The four reports share a top navigation bar (Audit Results · Risk Report · Pos
 | `-InactiveDays <n>` | Inactivity threshold for stale users/devices (default 90) |
 | `-ExpiringCredentialDays <n>` | Warn on app credentials expiring within N days (default 30) |
 | `-RecentChangeDays <n>` | Window for recently-created principals (default 30) |
+| `-StaleAppDays <n>` | Days with no service-principal sign-in before an application is flagged stale (default 90) |
 | `-BreakGlassUpns <upns>` | Cloud-only emergency-access Global Admins to treat as expected-permanent |
 | `-OutputRoot <path>` | Where to write the report folder (default: script folder) |
 | `-ModulesPath <path>` | Offline: folder containing `Save-Module` output |
@@ -194,7 +196,7 @@ The Risk-Report starts at **100** and deducts per finding by severity (with caps
 
 ## Notes & limitations
 
-- **Read-only guarantee:** the script self-aborts if Graph returns any write scope. In **app-only** mode it goes further — it reads the app's *actual* granted app-role assignments (across all resource APIs) and **fails closed** unless **every** one is clearly read-only (an allowlist: write/send/create/delete/update/invite/manage/impersonate/full-control **and any unknown or custom app role** are all treated as unsafe). Remediation is always left to the operator.
+- **Read-only guarantee:** the script self-aborts if Graph returns any write scope. In **app-only** mode it goes further — it reads the app's *actual* granted app-role assignments (across all resource APIs) and **fails closed** unless **every** one is on the **exact documented audit allowlist**. *Read-only does not mean low-impact: broad read permissions (e.g. `Mail.Read`) can expose sensitive data, so the app-only startup check permits only the documented audit permissions, not arbitrary `*.Read.*` permissions* — anything else (write, send, create, delete, update, invite, manage, impersonate, full-control, **or any unknown/custom app role**) is refused. Remediation is always left to the operator.
 - **License gating:** P1-gated checks (`staleusers`, `legacyauth`) and P2-gated checks (`pimpolicies`, `riskyusers`) are reported as *Skipped-NoLicense* (not "clean") when the tier isn't detected; license detection reads enabled **service plans**, so P1/P2 bundled inside EMS/M365 SKUs is recognised. `privileged-roles` always runs (it falls back to classic role assignments without PIM).
 - **Stable finding ids:** `Findings.json`/`.csv` ids are count-independent (a finding's id doesn't change when "5 stale users" becomes "7"), so they're usable for run-over-run trend/diff. Every check also always writes its CSV (a `NoData` row when empty) so automation can rely on the file existing.
 - **Sign-in logs** are retained ~30 days; the legacy-auth check only sees that window.

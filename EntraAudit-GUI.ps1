@@ -71,6 +71,7 @@ $AuditChecks = [ordered]@{
     breakglass     = "Emergency-access (break-glass) account health - pass -BreakGlassUpns"
     authmethodpolicy = "Tenant authentication-methods policy (weak vs phishing-resistant)"
     accesspaths    = "Effective-access / attack-path graph (duplicate & ownership privilege paths)"
+    staleapps      = "Stale / unused applications by service-principal sign-in activity - needs P1"
 }
 
 # -------------------------

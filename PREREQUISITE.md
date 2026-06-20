@@ -199,7 +199,7 @@ If you want to grant the absolute minimum for a subset of checks, this maps each
 | `RoleManagement.Read.Directory` | privroles, directoryroles, guests (priv), mfa (admin x-ref), apps (group roles), riskyusers (priv x-ref) |
 | `RoleEligibilitySchedule.Read.Directory` + `RoleAssignmentSchedule.Read.Directory` | privroles, directoryroles (PIM instances) |
 | `User.Read.All` | accounts, staleusers, guests, recentchanges |
-| `AuditLog.Read.All` | staleusers, mfa (registration report), legacyauth, recentchanges, guests |
+| `AuditLog.Read.All` | staleusers, mfa (registration report), legacyauth, recentchanges, guests, staleapps (service-principal sign-in activity, beta report) |
 | `Policy.Read.All` | tenantposture, capolicies, trusts, guests (guest policy) |
 | `Application.Read.All` | apps |
 | `DelegatedPermissionGrant.Read.All` | consentgrants |
