@@ -281,36 +281,55 @@ $panel.AutoScrollMinSize = New-Object System.Drawing.Size(0, ($y + 20))
 # -------------------------
 # Command builder
 # -------------------------
+# The preview is generated from the SAME argument array that is actually launched, so what
+# the user sees matches what runs (pwsh.exe -ExecutionPolicy Bypass -File <script> <args>).
 function Update-Preview {
-    $cmd = 'Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; & "' + $script:AuditScriptPath + '"'
+    $script:txtPreview.Text = 'pwsh.exe ' + ((ConvertTo-ArgLine (Build-LaunchArgs)) -join ' ')
+}
+
+# -------------------------
+# Launch via an ARGUMENT ARRAY (not a single command string) so paths, UPN lists,
+# tenant ids and output folders with spaces/quotes/special characters are passed safely.
+# -------------------------
+function Test-IsGuid([string]$s) { $g = [guid]::Empty; return [guid]::TryParse(($s).Trim(), [ref]$g) }
+function Test-IsThumbprint([string]$s) { return ((($s -replace '\s','')) -match '^[0-9A-Fa-f]{40}$') }
+
+# Start-Process -ArgumentList joins array elements with spaces WITHOUT quoting, so any value
+# containing whitespace (e.g. the script path "C:\Users\Niclas Skarnes\..." or an -OutputRoot
+# with spaces) MUST be pre-quoted or it is split into separate tokens.
+function ConvertTo-ArgLine([string[]]$InputArgs) {
+    @($InputArgs | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"','""') + '"' } else { $_ } })
+}
+
+function Build-LaunchArgs {
+    param([switch]$InstallOnly)
+    $a = @('-NoExit','-ExecutionPolicy','Bypass','-File', $script:AuditScriptPath)
+    if ($InstallOnly) { $a += '-installdeps'; return $a }
 
     if ($script:chkAll.Checked) {
-        $cmd += " -all"
+        $a += '-all'
         $excludes = @()
         foreach ($key in $script:excludeCheckboxes.Keys) { if ($script:excludeCheckboxes[$key].Checked) { $excludes += $key } }
-        if ($excludes.Count -gt 0) { $cmd += " -exclude " + ($excludes -join ',') }
+        if ($excludes.Count -gt 0) { $a += @('-exclude', ($excludes -join ',')) }
     } else {
-        foreach ($key in $script:checkboxes.Keys) { if ($script:checkboxes[$key].Checked) { $cmd += " -$key" } }
+        foreach ($key in $script:checkboxes.Keys) { if ($script:checkboxes[$key].Checked) { $a += "-$key" } }
     }
-
     if ($script:rdoAppOnly.Checked) {
-        if ($script:txtClientId.Text.Trim()) { $cmd += ' -ClientId "' + $script:txtClientId.Text.Trim() + '"' }
-        if ($script:txtThumb.Text.Trim())    { $cmd += ' -CertificateThumbprint "' + $script:txtThumb.Text.Trim() + '"' }
-    } else {
-        if ($script:chkDeviceCode.Checked) { $cmd += " -UseDeviceCode" }
+        if ($script:txtClientId.Text.Trim()) { $a += @('-ClientId', $script:txtClientId.Text.Trim()) }
+        if ($script:txtThumb.Text.Trim())    { $a += @('-CertificateThumbprint', ($script:txtThumb.Text -replace '\s','')) }
+    } elseif ($script:chkDeviceCode.Checked) {
+        $a += '-UseDeviceCode'
     }
-    if ($script:txtTenant.Text.Trim()) { $cmd += ' -TenantId "' + $script:txtTenant.Text.Trim() + '"' }
-
-    if ($script:txtInactive.Text.Trim() -and $script:txtInactive.Text.Trim() -ne "90") { $cmd += " -InactiveDays " + $script:txtInactive.Text.Trim() }
-    if ($script:txtExpiry.Text.Trim() -and $script:txtExpiry.Text.Trim() -ne "30")     { $cmd += " -ExpiringCredentialDays " + $script:txtExpiry.Text.Trim() }
+    if ($script:txtTenant.Text.Trim()) { $a += @('-TenantId', $script:txtTenant.Text.Trim()) }
+    if ($script:txtInactive.Text.Trim() -and $script:txtInactive.Text.Trim() -ne '90') { $a += @('-InactiveDays', $script:txtInactive.Text.Trim()) }
+    if ($script:txtExpiry.Text.Trim() -and $script:txtExpiry.Text.Trim() -ne '30')     { $a += @('-ExpiringCredentialDays', $script:txtExpiry.Text.Trim()) }
     if ($script:txtBreakGlass.Text.Trim()) {
-        $bg = ($script:txtBreakGlass.Text -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join '","'
-        if ($bg) { $cmd += ' -BreakGlassUpns "' + $bg + '"' }
+        $bgList = (($script:txtBreakGlass.Text -split '[;,]') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ';'
+        if ($bgList) { $a += @('-BreakGlassUpns', $bgList) }
     }
-    if ($script:txtOutput.Text.Trim()) { $cmd += ' -OutputRoot "' + $script:txtOutput.Text.Trim() + '"' }
-    if ($script:chkNoLaunch.Checked)   { $cmd += " -NoLaunch" }
-
-    $script:txtPreview.Text = $cmd
+    if ($script:txtOutput.Text.Trim()) { $a += @('-OutputRoot', $script:txtOutput.Text.Trim()) }
+    if ($script:chkNoLaunch.Checked)   { $a += '-NoLaunch' }
+    return $a
 }
 
 # -------------------------
@@ -359,9 +378,8 @@ $btnBrowse.Add_Click({
 })
 
 $btnInstall.Add_Click({
-    $cmd = 'Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; & "' + $script:AuditScriptPath + '" -installdeps'
     try {
-        Start-Process pwsh.exe -ArgumentList "-NoExit", "-Command", $cmd
+        Start-Process -FilePath 'pwsh.exe' -ArgumentList (ConvertTo-ArgLine (Build-LaunchArgs -InstallOnly))
         Msg-Info "Module installation launched in a new PowerShell 7 window."
     } catch { Msg-Error "Failed to launch install: $($_.Exception.Message)" }
 })
@@ -372,12 +390,26 @@ $btnRun.Add_Click({
         foreach ($key in $script:checkboxes.Keys) { if ($script:checkboxes[$key].Checked) { $any = $true; break } }
         if (-not $any) { Msg-Error "No checks selected. Enable 'Run All Checks' or select at least one."; return }
     }
-    if ($script:rdoAppOnly.Checked -and (-not $script:txtClientId.Text.Trim() -or -not $script:txtThumb.Text.Trim())) {
-        Msg-Error "App-only sign-in requires both Client Id and Certificate Thumbprint."; return
+    # App-only mode: require a valid Client Id, certificate thumbprint AND tenant (so
+    # unattended/scheduled GUI-generated commands are deterministic).
+    if ($script:rdoAppOnly.Checked) {
+        if (-not (Test-IsGuid $script:txtClientId.Text))     { Msg-Error "App-only sign-in requires a valid Client (Application) Id - a GUID."; return }
+        if (-not (Test-IsThumbprint $script:txtThumb.Text))  { Msg-Error "Certificate Thumbprint must be 40 hexadecimal characters (SHA-1)."; return }
+        if (-not $script:txtTenant.Text.Trim())              { Msg-Error "App-only sign-in requires a Tenant Id (GUID or verified domain)."; return }
     }
-    $cmd = $script:txtPreview.Text
+    $tenant = $script:txtTenant.Text.Trim()
+    if ($tenant -and -not ((Test-IsGuid $tenant) -or ($tenant -match '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'))) {
+        Msg-Error "Tenant Id must be a GUID or a domain (e.g. contoso.onmicrosoft.com)."; return
+    }
+    foreach ($pair in @(@{ n='Inactivity'; t=$script:txtInactive }, @{ n='Credential-expiry'; t=$script:txtExpiry })) {
+        $v = $pair.t.Text.Trim()
+        if ($v -and ($v -notmatch '^\d+$')) { Msg-Error ("{0} days must be a whole number." -f $pair.n); return }
+    }
+    if ($script:txtOutput.Text.Trim() -and -not (Test-Path -IsValid $script:txtOutput.Text.Trim())) {
+        Msg-Error "Output folder path is not a valid path."; return
+    }
     try {
-        Start-Process pwsh.exe -ArgumentList "-NoExit", "-Command", $cmd
+        Start-Process -FilePath 'pwsh.exe' -ArgumentList (ConvertTo-ArgLine (Build-LaunchArgs))
         $script:form.Close()
     } catch { Msg-Error "Failed to launch audit: $($_.Exception.Message)" }
 })

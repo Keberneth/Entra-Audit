@@ -130,7 +130,7 @@ For scheduled runs with no human present. You create one dedicated, read-only ap
    User.Read.All
    Group.Read.All
    Organization.Read.All
-      DelegatedPermissionGrant.Read.All
+   DelegatedPermissionGrant.Read.All
    Device.Read.All
    IdentityRiskyUser.Read.All
    IdentityRiskEvent.Read.All
@@ -142,7 +142,7 @@ For scheduled runs with no human present. You create one dedicated, read-only ap
    Member.Read.Hidden
    ```
 
-   > **App-only read-only enforcement:** on every app-only run the script reads this app's *actual* granted app-role assignments (across all resource APIs) and **refuses to run** if any is write-capable — so an accidentally over-permissioned app registration fails closed at startup rather than running with write access.
+   > **App-only read-only enforcement (allowlist, fail-closed):** on every app-only run the script reads this app's *actual* granted app-role assignments (across all resource APIs) and **refuses to run** unless **every** one is clearly read-only. It is an allowlist, not a denylist: anything that writes/sends/creates/deletes/updates/invites/manages/impersonates or grants full control — **and any unknown or custom app role it cannot resolve** — is treated as unsafe. So an accidentally over-permissioned app registration fails closed at startup rather than running with write access.
 3. Click **Grant admin consent**.
 4. *(Optional, belt-and-suspenders)* also assign the **Global Reader** directory role to this app's service principal.
 

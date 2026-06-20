@@ -194,7 +194,7 @@ The Risk-Report starts at **100** and deducts per finding by severity (with caps
 
 ## Notes & limitations
 
-- **Read-only guarantee:** the script self-aborts if Graph returns any write scope. In **app-only** mode it goes further — it reads the app's *actual* granted app-role assignments (across all resource APIs) and **fails closed** at startup if any is write-capable. Remediation is always left to the operator.
+- **Read-only guarantee:** the script self-aborts if Graph returns any write scope. In **app-only** mode it goes further — it reads the app's *actual* granted app-role assignments (across all resource APIs) and **fails closed** unless **every** one is clearly read-only (an allowlist: write/send/create/delete/update/invite/manage/impersonate/full-control **and any unknown or custom app role** are all treated as unsafe). Remediation is always left to the operator.
 - **License gating:** P1-gated checks (`staleusers`, `legacyauth`) and P2-gated checks (`pimpolicies`, `riskyusers`) are reported as *Skipped-NoLicense* (not "clean") when the tier isn't detected; license detection reads enabled **service plans**, so P1/P2 bundled inside EMS/M365 SKUs is recognised. `privileged-roles` always runs (it falls back to classic role assignments without PIM).
 - **Stable finding ids:** `Findings.json`/`.csv` ids are count-independent (a finding's id doesn't change when "5 stale users" becomes "7"), so they're usable for run-over-run trend/diff. Every check also always writes its CSV (a `NoData` row when empty) so automation can rely on the file existing.
 - **Sign-in logs** are retained ~30 days; the legacy-auth check only sees that window.

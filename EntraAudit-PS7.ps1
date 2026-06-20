@@ -444,33 +444,53 @@ function Connect-EntraAuditGraph {
     return $ctx
 }
 
+# Allowlist classifier: a granted app-role is read-only ONLY if it clearly matches a read
+# pattern AND matches no action/write pattern. Anything that does not clearly read (write,
+# send, create, delete, update, invite, manage, impersonate, full-control, or an unknown
+# custom role) is treated as unsafe - fail closed.
+function Test-AppRoleLooksReadOnly {
+    param([Parameter(Mandatory)][string]$Value)
+    $denyPattern = '(?i)(ReadWrite|\.Write\b|FullControl|full_access|ManageAsApp|\.Manage\b|Manage\.|\.Send\b|Send\.|\.Create\b|Create\.|\.Delete\b|Delete\.|\.Update\b|Update\.|\.Invite\b|Invite\.|AccessAsUser|Impersonation)'
+    if ($Value -match $denyPattern) { return $false }
+    return ($Value -match '(?i)(^|\.)(Read|ReadBasic)')
+}
+
 # Fail-closed read-only enforcement for app-only runs: resolve the running service
 # principal's granted application permissions (across every resource SP, not just Graph)
-# and refuse to run if any is write-capable.
+# and refuse to run unless EVERY one is a clear read-only permission.
 function Assert-AppOnlyReadOnly {
     param([Parameter(Mandatory)][string]$ClientId)
-    $allSps = @(Get-MgServicePrincipal -All -Property 'id,appId,displayName,appRoles' -ErrorAction Stop)
-    $self = $allSps | Where-Object { $_.AppId -eq $ClientId } | Select-Object -First 1
+    $self = Get-MgServicePrincipal -Filter "appId eq '$ClientId'" -ConsistencyLevel eventual -CountVariable c -Property 'id,appId,displayName' -ErrorAction Stop | Select-Object -First 1
     if (-not $self) { throw "Cannot verify app-only read-only posture: no service principal found for ClientId $ClientId." }
-
-    $roleMapByResourceId = @{}
-    foreach ($sp in $allSps) {
-        $m = @{}
-        foreach ($role in @($sp.AppRoles)) { if ($role.Id) { $m[[string]$role.Id] = $role.Value } }
-        $roleMapByResourceId[$sp.Id] = $m
-    }
     $assignments = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $self.Id -All -ErrorAction Stop)
-    $writePattern = '(?i)(ReadWrite|\.Write\b|FullControl|full_access|ManageAsApp|AccessAsUser)'
-    $bad = @()
+
+    # Resolve only the resource service principals actually referenced by the assignments.
+    $roleMapByResourceId = @{}
+    foreach ($rid in (@($assignments | ForEach-Object { $_.ResourceId }) | Where-Object { $_ } | Select-Object -Unique)) {
+        try {
+            $rsp = Get-MgServicePrincipal -ServicePrincipalId $rid -Property 'id,appRoles' -ErrorAction Stop
+            $m = @{}; foreach ($role in @($rsp.AppRoles)) { if ($role.Id) { $m[[string]$role.Id] = $role.Value } }
+            $roleMapByResourceId[$rid] = $m
+        } catch { $roleMapByResourceId[$rid] = @{} }
+    }
+
+    $write = @(); $unresolved = @()
     foreach ($a in $assignments) {
         $value = $null
         if ($roleMapByResourceId.ContainsKey($a.ResourceId)) { $value = $roleMapByResourceId[$a.ResourceId][[string]$a.AppRoleId] }
-        if ($value -and $value -match $writePattern) { $bad += ("{0}:{1}" -f $a.ResourceDisplayName, $value) }
+        if (-not $value) { $unresolved += ("{0}:appRole {1}" -f $a.ResourceDisplayName, $a.AppRoleId); continue }   # cannot verify -> unsafe
+        if (-not (Test-AppRoleLooksReadOnly -Value $value)) { $write += ("{0}:{1}" -f $a.ResourceDisplayName, $value) }
     }
-    if ($bad.Count -gt 0) {
-        throw "Refusing app-only run: write-capable application permission(s) granted to this app -> $($bad -join ', '). This tool is read-only; remove these permissions or use a dedicated read-only app registration."
+    if ($write.Count -gt 0 -or $unresolved.Count -gt 0) {
+        # Distinguish "actually write-capable" from "could not read the resource app-role"
+        # so the operator of a legitimately read-only app knows which it is.
+        $msg = "Refusing app-only run (this tool is read-only and fails closed)."
+        if ($write.Count -gt 0)      { $msg += " Write-capable permission(s): $($write -join ', ')." }
+        if ($unresolved.Count -gt 0) { $msg += " Could NOT verify (resource app-role not readable) - treated as unsafe: $($unresolved -join ', ')." }
+        $msg += " Grant only *.Read.* permissions, or use a dedicated read-only app registration."
+        throw $msg
     }
-    Write-Good ("App-only read-only verified: {0} application permission(s) granted, none write-capable." -f $assignments.Count)
+    Write-Good ("App-only read-only verified: {0} application permission(s) granted, all read-only." -f $assignments.Count)
 }
 
 # Delegated-only scope gate. Directory.Read.All implicitly covers narrower reads.
@@ -1486,6 +1506,7 @@ function Invoke-Check-RiskyUsers {
     }
 
     # Risky service principals (beta, best-effort)
+    $rspFound = $false
     try {
         $rsp = @()
         if (Get-Command Get-MgRiskyServicePrincipal -ErrorAction SilentlyContinue) {
@@ -1495,6 +1516,7 @@ function Invoke-Check-RiskyUsers {
             if ($resp.value) { $rsp = @($resp.value | Where-Object { $_.riskState -in @('atRisk','confirmedCompromised') }) }
         }
         if ($rsp.Count -gt 0) {
+            $rspFound = $true
             $rsprows = $rsp | Select-Object @{n='DisplayName';e={ $_.DisplayName ?? $_.displayName }}, @{n='RiskState';e={ $_.RiskState ?? $_.riskState }}
             $rspsrc = Write-Evidence -BaseName 'risky_serviceprincipals' -Rows $rsprows -Title 'Identity Protection - Risky Service Principals'
             Add-EntraFinding -Severity 'High' -CheckId 'riskyusers' -Category 'Threat Signals' `
@@ -1504,6 +1526,17 @@ function Invoke-Check-RiskyUsers {
                 -RecommendedAction 'Investigate the flagged service principals, rotate their credentials, and review their granted application permissions.' -SourceFile $rspsrc -ResultRows $rsprows
         }
     } catch {}
+
+    # Risky service principals are licensed separately from P2 risky users (they need
+    # Microsoft Entra Workload ID Premium). Report that coverage explicitly so a P2 tenant
+    # without Workload ID Premium is not mistaken for "no risky workload identities".
+    if (-not $script:WorkloadIdP -and -not $rspFound) {
+        Add-EntraFinding -Severity 'Information' -CheckId 'riskyusers' -Category 'Threat Signals' `
+            -Title 'Risky service principals not assessed (Workload Identities Premium required)' `
+            -Evidence 'Risky workload identities require Microsoft Entra Workload ID Premium, which was not detected - this sub-check is license-gated, not clean.' `
+            -WhyItMatters 'Risky service principals surface compromised workload identities; without Workload ID Premium they cannot be evaluated even when Entra ID P2 is present.' `
+            -RecommendedAction 'License Microsoft Entra Workload ID Premium to enable risky service principal detection.' -SourceFile $null
+    }
 }
 
 # ===========================================================================
@@ -2122,9 +2155,47 @@ function Invoke-Check-BreakGlass {
     $users = Get-EAUsers
     $byUpn = @{}; foreach ($u in $users) { if ($u.UserPrincipalName) { $byUpn[$u.UserPrincipalName.ToLowerInvariant()] = $u } }
 
-    # current Global Administrators
+    # current Global Administrators, and every user's privileged role-template ids (active AND
+    # eligible) - eligible roles must feed the CA-applicability check because an eligible-only
+    # role does not appear in transitiveMemberOf.
     $gaIds = @{}
-    foreach ($a in (Get-EAPrivAssignments)) { if ($a.IsGA -and $a.State -eq 'Active' -and $a.PrincipalId) { $gaIds[$a.PrincipalId] = $true } }
+    $privRolesByUser = @{}
+    foreach ($a in (Get-EAPrivAssignments)) {
+        if ($a.IsGA -and $a.State -eq 'Active' -and $a.PrincipalId) { $gaIds[$a.PrincipalId] = $true }
+        if ($a.PrincipalId -and $a.PrincipalType -eq 'user' -and $a.RoleTemplateId) {
+            if (-not $privRolesByUser.ContainsKey($a.PrincipalId)) { $privRolesByUser[$a.PrincipalId] = New-Object System.Collections.Generic.HashSet[string] }
+            [void]$privRolesByUser[$a.PrincipalId].Add($a.RoleTemplateId)
+        }
+    }
+
+    # Conditional Access lockout evaluation context.
+    $enabledCa = @(); try { $enabledCa = @(Get-MgIdentityConditionalAccessPolicy -All -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'enabled' }) } catch {}
+    $signinKnown = (Test-MgScope @('AuditLog.Read.All') -Quiet)
+
+    function _BgScopeIds([string]$userId) {
+        $gids = New-Object System.Collections.Generic.HashSet[string]
+        $rtids = New-Object System.Collections.Generic.HashSet[string]
+        try {
+            foreach ($m in @(Get-MgUserTransitiveMemberOf -UserId $userId -All -ErrorAction SilentlyContinue)) {
+                $t = [string](Get-Ap $m '@odata.type')
+                if ($t -eq '#microsoft.graph.group') { [void]$gids.Add($m.Id) }
+                elseif ($t -eq '#microsoft.graph.directoryRole') { $rt = Get-Ap $m 'roleTemplateId'; if ($rt) { [void]$rtids.Add([string]$rt) } }
+            }
+        } catch {}
+        return [pscustomobject]@{ Groups=$gids; Roles=$rtids }
+    }
+    # Does an enabled CA policy actually apply to this user (in scope AND not excluded)?
+    function _BgCaApplies($p, [string]$userId, $groups, $roles) {
+        $cu = $p.Conditions.Users
+        $inc = (@($cu.IncludeUsers) -contains 'All') -or (@($cu.IncludeUsers) -contains $userId)
+        if (-not $inc) { foreach ($gid in @($cu.IncludeGroups)) { if ($gid -and $groups.Contains($gid)) { $inc = $true; break } } }
+        if (-not $inc) { foreach ($rid in @($cu.IncludeRoles)) { if ($rid -and $roles.Contains($rid)) { $inc = $true; break } } }
+        if (-not $inc) { return $false }
+        if (@($cu.ExcludeUsers) -contains $userId) { return $false }
+        foreach ($gid in @($cu.ExcludeGroups)) { if ($gid -and $groups.Contains($gid)) { return $false } }
+        foreach ($rid in @($cu.ExcludeRoles)) { if ($rid -and $roles.Contains($rid)) { return $false } }
+        return $true
+    }
 
     $bg = Normalize-StringList -Values $BreakGlassUpns
 
@@ -2155,13 +2226,47 @@ function Invoke-Check-BreakGlass {
                 -RecommendedAction 'Verify the break-glass UPN is correct and the account exists.' -SourceFile $null
             continue
         }
+        $enabled   = [bool]$u.AccountEnabled
         $isGA      = [bool]($u.Id -and $gaIds.ContainsKey($u.Id))
         $cloudOnly = -not [bool]$u.OnPremisesSyncEnabled
         $onmsft    = ($u.UserPrincipalName -like '*.onmicrosoft.com')
         $licensed  = (@($u.AssignedLicenses).Count -gt 0)
         $lastSucc  = $null
         if ($u.SignInActivity -and $u.SignInActivity.LastSuccessfulSignInDateTime) { $lastSucc = [datetime]$u.SignInActivity.LastSuccessfulSignInDateTime }
-        $rows += [pscustomobject]@{ Account=$u.UserPrincipalName; GlobalAdmin=$isGA; CloudOnly=$cloudOnly; OnMicrosoftDomain=$onmsft; Licensed=$licensed; LastSuccessfulSignIn=$lastSucc }
+
+        # Does any enabled blocking / MFA-requiring CA policy actually apply to this account?
+        $scope = _BgScopeIds $u.Id
+        if ($u.Id -and $privRolesByUser.ContainsKey($u.Id)) { foreach ($rt in $privRolesByUser[$u.Id]) { [void]$scope.Roles.Add($rt) } }
+        $blockers = @(); $mfaReq = @()
+        foreach ($p in $enabledCa) {
+            if (-not (_BgCaApplies $p $u.Id $scope.Groups $scope.Roles)) { continue }
+            if (@($p.GrantControls.BuiltInControls) -contains 'block') { $blockers += $p.DisplayName }
+            elseif (Test-CaPolicyRequiresMfaOrStrength $p) { $mfaReq += $p.DisplayName }
+        }
+
+        $rows += [pscustomobject]@{ Account=$u.UserPrincipalName; Enabled=$enabled; GlobalAdmin=$isGA; CloudOnly=$cloudOnly; OnMicrosoftDomain=$onmsft; Licensed=$licensed; LastSuccessfulSignIn=$lastSucc; BlockingCaPolicies=($blockers -join '; '); MfaRequiringCaPolicies=($mfaReq -join '; ') }
+
+        if (-not $enabled) {
+            Add-EntraFinding -Severity 'Critical' -CheckId 'breakglass' -Category 'Privileged Access' `
+                -Title ("Break-glass account is disabled: {0}" -f $u.UserPrincipalName) `
+                -Evidence 'accountEnabled = false on the emergency-access account.' `
+                -WhyItMatters 'A disabled emergency-access account cannot be used to recover the tenant - the control is non-functional exactly when it is needed.' `
+                -RecommendedAction 'Enable the break-glass account and verify it can sign in.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+        }
+        if ($blockers.Count -gt 0) {
+            Add-EntraFinding -Severity 'Critical' -CheckId 'breakglass' -Category 'Privileged Access' `
+                -Title ("Break-glass account is caught by a blocking Conditional Access policy: {0}" -f $u.UserPrincipalName) `
+                -Evidence ("Applies (in scope and not excluded) to blocking CA policy/policies: {0}" -f ($blockers -join '; ')) `
+                -WhyItMatters 'If a blocking CA policy applies to the emergency-access account, it can be locked out during the very incident it exists to resolve.' `
+                -RecommendedAction 'Exclude the break-glass accounts (directly, or via a dedicated exclusion group) from all blocking Conditional Access policies.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+        }
+        if ($mfaReq.Count -gt 0) {
+            Add-EntraFinding -Severity 'High' -CheckId 'breakglass' -Category 'Privileged Access' `
+                -Title ("Break-glass account is subject to an MFA-requiring Conditional Access policy: {0}" -f $u.UserPrincipalName) `
+                -Evidence ("Applies (in scope and not excluded) to MFA/auth-strength CA policy/policies: {0}" -f ($mfaReq -join '; ')) `
+                -WhyItMatters 'If the emergency-access account must satisfy MFA / an authentication strength it may be unable to meet during an outage, it can be locked out. Microsoft recommends excluding break-glass accounts from such policies, with compensating sign-in monitoring.' `
+                -RecommendedAction 'Exclude break-glass accounts from MFA-requiring CA policies (or ensure they hold a resilient phishing-resistant method), and monitor their sign-ins closely.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+        }
 
         if (-not $isGA) {
             Add-EntraFinding -Severity 'Critical' -CheckId 'breakglass' -Category 'Privileged Access' `
@@ -2184,10 +2289,17 @@ function Invoke-Check-BreakGlass {
                 -WhyItMatters 'A custom or federated domain can become unavailable; the .onmicrosoft.com domain is always present and cloud-resolved.' `
                 -RecommendedAction 'Use a UPN on the tenant .onmicrosoft.com domain for break-glass accounts.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
         }
-        if ($null -eq $lastSucc -or $lastSucc -lt (Get-Date).ToUniversalTime().AddDays(-90)) {
+        if (-not $signinKnown) {
+            Add-EntraFinding -Severity 'Medium' -CheckId 'breakglass' -Category 'Privileged Access' `
+                -Title ("Break-glass sign-in test could not be validated (no sign-in activity data): {0}" -f $u.UserPrincipalName) `
+                -Evidence 'signInActivity is unavailable (AuditLog.Read.All / Entra ID P1 required) - test status is Unknown, not "never tested".' `
+                -WhyItMatters 'Emergency-access accounts must be periodically tested, but without sign-in data the test status cannot be confirmed either way - reporting it as a coverage gap avoids a false "never tested" conclusion.' `
+                -RecommendedAction 'Grant AuditLog.Read.All and ensure Entra ID P1+, then re-run to validate the documented break-glass test.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+        }
+        elseif ($null -eq $lastSucc -or $lastSucc -lt (Get-Date).ToUniversalTime().AddDays(-90)) {
             Add-EntraFinding -Severity 'Medium' -CheckId 'breakglass' -Category 'Privileged Access' `
                 -Title ("Break-glass account has no successful sign-in in 90 days: {0}" -f $u.UserPrincipalName) `
-                -Evidence ("Last successful sign-in: {0}" -f ($lastSucc ?? 'never / unknown')) `
+                -Evidence ("Last successful sign-in: {0}" -f ($lastSucc ?? 'none on record')) `
                 -WhyItMatters 'Emergency-access accounts must be periodically tested so you know they work and that alerting fires before a real emergency.' `
                 -RecommendedAction "Perform a documented emergency-access test: verify sign-in succeeds, verify alerting fires, and record the test date and owner." -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
         }
@@ -2335,16 +2447,18 @@ function Invoke-Check-AccessPaths {
             -SourceFile $src -ResultRows $dupElig
     }
 
-    # "Already privileged" = the full effective set: direct privileged users PLUS every
-    # user reachable to a privileged role via a group. An owner who is already privileged
-    # this way is not gaining anything new, so we don't flag them as an escalation path.
-    $allPrivUserIds = New-Object System.Collections.Generic.HashSet[string]
-    foreach ($k in $directKey.Keys) { [void]$allPrivUserIds.Add((($k -split '\|', 2)[0])) }
-    foreach ($key in $pathByUserRole.Keys) { [void]$allPrivUserIds.Add((($key -split '\|', 2)[0])) }
+    # Effective holders of each EXACT role (direct + group-reachable), keyed "userId|roleTemplateId".
+    # We only suppress an owner-escalation path when the owner already holds the SAME role the
+    # group grants - an Exchange Admin who owns a Global-Admin-granting group is a real escalation,
+    # so "privileged via some OTHER role" must NOT suppress it.
+    $sameRoleKey = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($k in $directKey.Keys) { [void]$sameRoleKey.Add($k) }
+    foreach ($key in $pathByUserRole.Keys) { [void]$sameRoleKey.Add($key) }
 
     # Ownership-based escalation: owners of groups assigned a privileged role.
     $ownEscRows = @()
     foreach ($g in $groupAssign) {
+        $grantsGAorPRA = ($g.RoleTemplateId -eq $script:GlobalAdminTemplateId -or ($script:PrivilegedRoleTemplates[$g.RoleTemplateId] -match 'Privileged Role Administrator|Privileged Authentication'))
         $owners = @(); try { $owners = @(Get-MgGroupOwner -GroupId $g.PrincipalId -All -ErrorAction SilentlyContinue) } catch {}
         foreach ($o in $owners) {
             $oid   = $o.Id
@@ -2355,37 +2469,43 @@ function Invoke-Check-AccessPaths {
             $isUser = (($otype -eq '#microsoft.graph.user') -or [bool]$oupn)
             $ownerType = if ($otype) { ($otype -replace '#microsoft.graph.','') } elseif ($isUser) { 'user' } else { 'unknown' }
 
+            $isGuest = $false; $disabled = $false; $hasSameRole = $false
             if ($isUser) {
                 $isGuest = ($oupn -like '*#EXT#*')
-                $alreadyPriv = ($oid -and $allPrivUserIds.Contains($oid))
-                $disabled = $false
                 if ($oid -and $script:UserById.ContainsKey($oid)) { $disabled = -not [bool]$script:UserById[$oid].AccountEnabled }
-                # A non-privileged, guest, or disabled owner can add themselves to the group
-                # and inherit the privileged role. An already-privileged owner gains nothing.
-                if ($alreadyPriv -and -not $isGuest -and -not $disabled) { continue }
-                $ownEscRows += [pscustomobject]@{
-                    Owner=$label; OwnerType=$ownerType; Group=($g.PrincipalName ?? $g.PrincipalId); GrantsRole=$g.RoleName
-                    OwnerGuest=$isGuest; OwnerDisabled=$disabled; OwnerAlreadyPrivileged=$alreadyPriv
-                }
-            } else {
-                # Non-human owner (service principal / nested group) that can add members to a
-                # role-granting group - a real but distinct path; label it rather than mis-report as a user.
-                $ownEscRows += [pscustomobject]@{
-                    Owner=$label; OwnerType=$ownerType; Group=($g.PrincipalName ?? $g.PrincipalId); GrantsRole=$g.RoleName
-                    OwnerGuest=$false; OwnerDisabled=$false; OwnerAlreadyPrivileged=$false
-                }
+                $hasSameRole = ($oid -and $sameRoleKey.Contains(('{0}|{1}' -f $oid, $g.RoleTemplateId)))
+                # Suppress ONLY when the owner already holds this exact role and is a normal
+                # (non-guest, enabled) account - then ownership grants nothing new.
+                if ($hasSameRole -and -not $isGuest -and -not $disabled) { continue }
+            }
+            # Gaining GA/PRA, or any guest/disabled owner, is Critical; gaining another role is High.
+            $rowSev = if ($isGuest -or $disabled -or $grantsGAorPRA) { 'Critical' } else { 'High' }
+            $ownEscRows += [pscustomobject]@{
+                Owner=$label; OwnerType=$ownerType; Group=($g.PrincipalName ?? $g.PrincipalId); GrantsRole=$g.RoleName
+                Severity=$rowSev; OwnerGuest=$isGuest; OwnerDisabled=$disabled; OwnerAlreadyHasSameRole=$hasSameRole
             }
         }
     }
     if ($ownEscRows.Count -gt 0) {
-        $sev = if (@($ownEscRows | Where-Object { $_.OwnerGuest -or $_.OwnerDisabled }).Count -gt 0) { 'Critical' } else { 'High' }
         $osrc = Write-Evidence -BaseName 'access_paths_ownership' -Rows $ownEscRows -Title 'Effective Access - Ownership-Based Escalation'
-        Add-EntraFinding -Severity $sev -CheckId 'accesspaths' -Category 'Privileged Access' `
-            -Title ("{0} ownership-based privilege-escalation path(s) via role-granting groups" -f $ownEscRows.Count) `
-            -Evidence ("Owners who can add themselves to a privileged group: {0}" -f (($ownEscRows | Select-Object -First 8 | ForEach-Object { "$($_.Owner)->$($_.Group)" }) -join '; ')) `
-            -WhyItMatters 'An owner of a group that is assigned a privileged role can add themselves (or anyone) to the group and inherit that role. A guest, disabled, or non-privileged owner is therefore an indirect privilege-escalation path - the cloud analog of a dangerous WriteOwner/AddMember ACL.' `
-            -RecommendedAction 'Remove non-administrative, guest and disabled owners from groups that are assigned privileged roles; manage membership through PIM for Groups with approval.' `
-            -SourceFile $osrc -ResultRows $ownEscRows
+        $critEsc = @($ownEscRows | Where-Object { $_.Severity -eq 'Critical' })
+        $highEsc = @($ownEscRows | Where-Object { $_.Severity -eq 'High' })
+        if ($critEsc.Count -gt 0) {
+            Add-EntraFinding -Severity 'Critical' -CheckId 'accesspaths' -Category 'Privileged Access' `
+                -Title ("{0} critical ownership-based privilege-escalation path(s)" -f $critEsc.Count) `
+                -Evidence ("Owners who can self-add to gain a top-tier role, or guest/disabled owners of privileged groups: {0}" -f (($critEsc | Select-Object -First 8 | ForEach-Object { "$($_.Owner)->$($_.GrantsRole)" }) -join '; ')) `
+                -WhyItMatters 'An owner of a group assigned a privileged role can add themselves and inherit that role. Gaining Global Admin / Privileged Role Admin this way - or a guest/disabled owner of any privileged group - is a direct tenant-takeover-class escalation. Note: holding a DIFFERENT privileged role does not make this safe.' `
+                -RecommendedAction 'Remove guest, disabled and non-administrative owners from groups assigned privileged roles; for GA/PRA-granting groups restrict ownership to the most trusted admins and manage membership via PIM for Groups with approval.' `
+                -SourceFile $osrc -ResultRows $critEsc
+        }
+        if ($highEsc.Count -gt 0) {
+            Add-EntraFinding -Severity 'High' -CheckId 'accesspaths' -Category 'Privileged Access' `
+                -Title ("{0} ownership-based privilege-escalation path(s) to a privileged role" -f $highEsc.Count) `
+                -Evidence ("Owners who can self-add to gain a privileged role they do not already hold: {0}" -f (($highEsc | Select-Object -First 8 | ForEach-Object { "$($_.Owner)->$($_.GrantsRole)" }) -join '; ')) `
+                -WhyItMatters 'An owner of a group assigned a privileged role can add themselves and inherit a role they do not currently hold - an indirect escalation that bypasses the role-assignment model (the cloud analog of a dangerous WriteOwner/AddMember ACL).' `
+                -RecommendedAction 'Remove non-administrative owners from groups assigned privileged roles; manage membership via PIM for Groups with approval.' `
+                -SourceFile $osrc -ResultRows $highEsc
+        }
     }
 
     # Owners of groups EXCLUDED from Conditional Access policies (especially MFA-enforcing
