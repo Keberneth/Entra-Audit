@@ -182,15 +182,23 @@ Unattended (app-only, certificate), don't open a browser window:
 
 ## How the risk score works
 
-The Risk-Report starts at **100** and deducts per finding by severity (with caps so a few criticals dominate but volume still matters). **Any Critical finding caps the score at 49** — you cannot be "green" with an active tenant-takeover-class risk.
+The Risk-Report **accumulates** points per finding by severity and sums them, so **a higher score is worse** and **volume increases it** — 28 permanent Global Admins (28 Critical findings) score far higher than 8. The score is **unbounded**, so the magnitude is visible (e.g. 200 vs 700).
+
+| Severity | Points each |
+|---|---|
+| Critical | 25 |
+| High | 10 |
+| Medium | 4 |
+| Low | 1 |
+| Information | 0 |
 
 | Score | Band |
 |---|---|
-| 90–100 | Excellent |
-| 75–89 | Good |
-| 50–74 | Fair |
-| 25–49 | Poor |
-| 0–24 | Critical |
+| 0 | Clean |
+| 1–24 | Low |
+| 25–74 | Moderate |
+| 75–199 | High |
+| 200+ | Critical |
 
 ---
 

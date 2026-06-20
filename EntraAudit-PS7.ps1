@@ -3153,23 +3153,24 @@ function Get-EntraRiskJs {
 '@
 }
 
+$script:RiskPoints = @{ Critical = 25; High = 10; Medium = 4; Low = 1; Information = 0 }
+
 function Get-EntraRiskScore($findings) {
     $c = @($findings | Where-Object { (Normalize-Severity $_.Severity) -eq 'Critical' }).Count
     $h = @($findings | Where-Object { (Normalize-Severity $_.Severity) -eq 'High' }).Count
     $m = @($findings | Where-Object { (Normalize-Severity $_.Severity) -eq 'Medium' }).Count
     $l = @($findings | Where-Object { (Normalize-Severity $_.Severity) -eq 'Low' }).Count
-    $cd = if ($c -ge 1) { [Math]::Min(60, 25 + 10 * ($c - 1)) } else { 0 }
-    $hd = if ($h -ge 1) { [Math]::Min(40, 12 + 5 * ($h - 1)) } else { 0 }
-    $md = if ($m -ge 1) { [Math]::Min(25, 5 + 2 * ($m - 1)) } else { 0 }
-    $ld = if ($l -ge 1) { [Math]::Min(10, 1 + 0.5 * ($l - 1)) } else { 0 }
-    $score = [int][Math]::Max(0, [Math]::Round(100 - $cd - $hd - $md - $ld))
-    if ($c -ge 1 -and $score -gt 49) { $score = 49 }
-    $band = if ($score -ge 90) { 'Excellent' } elseif ($score -ge 75) { 'Good' } elseif ($score -ge 50) { 'Fair' } elseif ($score -ge 25) { 'Poor' } else { 'Critical' }
+    # ACCUMULATING risk: HIGHER = WORSE. Each finding adds points by severity, so VOLUME
+    # raises the score - 28 permanent Global Admins (28 Critical findings) scores far higher
+    # than 8. Unbounded on purpose, so magnitude is visible (200 vs 700).
+    $score = [int](($c * $script:RiskPoints.Critical) + ($h * $script:RiskPoints.High) + ($m * $script:RiskPoints.Medium) + ($l * $script:RiskPoints.Low))
+    $band = if ($score -ge 200) { 'Critical' } elseif ($score -ge 75) { 'High' } elseif ($score -ge 25) { 'Moderate' } elseif ($score -ge 1) { 'Low' } else { 'Clean' }
     [pscustomobject]@{ Score = $score; Band = $band; Critical = $c; High = $h; Medium = $m; Low = $l }
 }
 
+# Higher score = worse, so map the risk band to the matching severity colour.
 function Get-BandBadgeClass([string]$band) {
-    switch ($band) { 'Excellent' { 'Low' } 'Good' { 'Low' } 'Fair' { 'Medium' } 'Poor' { 'High' } 'Critical' { 'Critical' } default { 'Information' } }
+    switch ($band) { 'Clean' { 'Low' } 'Low' { 'Low' } 'Moderate' { 'Medium' } 'High' { 'High' } 'Critical' { 'Critical' } default { 'Information' } }
 }
 
 function Resolve-SourceHref([string]$src) {
@@ -3326,12 +3327,13 @@ function Write-EntraRiskReport {
     param([string]$Path, [object[]]$Items, [hashtable]$Counts, [string]$TenantName, [string]$GeneratedOn, [pscustomobject]$Score, [hashtable]$Stats)
 
     $bandClass = Get-BandBadgeClass $Score.Band
+    # Higher score = worse. Ordered worst-first so the dangerous bands lead.
     $bands = @(
-        [pscustomobject]@{ Level='Excellent'; Range='90 - 100'; Meaning='Best-practice posture; no Critical or High findings. Maintain and monitor.' }
-        [pscustomobject]@{ Level='Good';      Range='75 - 89';  Meaning='Minor gaps, mostly Low/Medium. Address during routine maintenance.' }
-        [pscustomobject]@{ Level='Fair';      Range='50 - 74';  Meaning='Material High findings to remediate in the next hardening cycle.' }
-        [pscustomobject]@{ Level='Poor';      Range='25 - 49';  Meaning='High/Critical exposure; prompt action with assigned owners.' }
-        [pscustomobject]@{ Level='Critical';  Range='0 - 24';   Meaning='Multiple Critical findings; likely active risk. Treat as a priority workstream.' }
+        [pscustomobject]@{ Level='Critical'; Range='200+';     Meaning='Severe and/or high-volume exposure (e.g. many permanent privileged admins). Treat as a priority workstream with owners and timelines.' }
+        [pscustomobject]@{ Level='High';     Range='75 - 199'; Meaning='Significant exposure; prompt remediation with assigned owners.' }
+        [pscustomobject]@{ Level='Moderate'; Range='25 - 74';  Meaning='Material findings to remediate in the next hardening cycle.' }
+        [pscustomobject]@{ Level='Low';      Range='1 - 24';   Meaning='Minor issues; address during routine maintenance.' }
+        [pscustomobject]@{ Level='Clean';    Range='0';        Meaning='No risk-bearing findings (Information items only). Maintain and monitor.' }
     )
     $matrixRows = foreach ($b in $bands) {
         $cls = if ($b.Level -eq $Score.Band) { "matrix-row active sev-$(Get-BandBadgeClass $b.Level)" } else { "matrix-row sev-$(Get-BandBadgeClass $b.Level)" }
@@ -3388,7 +3390,7 @@ $nav
         <div class="badge $bandClass">
           <div><div class="grade">Overall Risk</div><div class="value">$($Score.Band)</div></div>
           <div style="width:1px;height:28px;background:var(--line)"></div>
-          <div><div class="grade">Score</div><div class="value">$($Score.Score) / 100</div></div>
+          <div><div class="grade">Risk score (higher = worse)</div><div class="value">$($Score.Score)</div></div>
         </div>
       </div>
     </div>
@@ -3411,7 +3413,7 @@ $nav
   <div class="section">
     <h2>Interpretation</h2>
     <div class="callout">
-      <p><b>Score:</b> the report starts at 100 and deducts per finding by severity (with caps); any Critical finding caps the score at 49. The current score is <b>$($Score.Score)/100</b> (<b>$($Score.Band)</b>).</p>
+      <p><b>Score:</b> the report ADDS points per finding by severity (Critical 25, High 10, Medium 4, Low 1; Information 0) and sums them, so <b>a higher score is worse</b> and <b>volume increases it</b> - 28 permanent Global Admins score far higher than 8. The score is unbounded. The current score is <b>$($Score.Score)</b> (<b>$($Score.Band)</b>).</p>
       <div class="matrix-wrap"><br>
         <table class="matrix"><thead><tr><th>Band</th><th>Score range</th><th>Interpretation</th></tr></thead><tbody>$($matrixRows -join "`n")</tbody></table>
       </div>
@@ -3702,7 +3704,7 @@ function Invoke-EntraAudit {
         Guests = if ($script:UsersCache) { @($script:UsersCache | Where-Object { $_.UserType -eq 'Guest' }).Count } else { '-' }
         Apps   = $script:AppCount
     }
-    $subtitle = ("Read-only Microsoft Graph audit &mdash; {0} check(s) | overall risk: {1} ({2}/100)" -f $toRun.Count, $score.Band, $score.Score)
+    $subtitle = ("Read-only Microsoft Graph audit &mdash; {0} check(s) | overall risk: {1} (score {2}, higher = worse)" -f $toRun.Count, $score.Band, $score.Score)
 
     $resultsPath = Join-Path $script:HtmlDir 'EntraAudit-Results.html'
     $riskPath    = Join-Path $script:HtmlDir 'Risk-Report.html'
@@ -3740,7 +3742,7 @@ function Invoke-EntraAudit {
     # Summary
     Write-Host ""
     Write-Good "Audit complete."
-    Write-Host ("  Overall risk : {0} ({1}/100)" -f $score.Band, $score.Score) -ForegroundColor White
+    Write-Host ("  Overall risk : {0} (score {1}, higher = worse)" -f $score.Band, $score.Score) -ForegroundColor White
     Write-Host ("  Findings     : Critical={0} High={1} Medium={2} Low={3} Info={4}" -f $counts.Critical,$counts.High,$counts.Medium,$counts.Low,$counts.Information)
     Write-Host ("  Reports      : {0}" -f $script:HtmlDir)
     Write-Host ("  Raw evidence : {0}" -f $script:RawDir)
