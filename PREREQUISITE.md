@@ -201,7 +201,7 @@ If you want to grant the absolute minimum for a subset of checks, this maps each
 | `User.Read.All` | accounts, staleusers, guests, recentchanges |
 | `AuditLog.Read.All` | staleusers, mfa (registration report), legacyauth, recentchanges, guests, staleapps (service-principal sign-in activity, beta report) |
 | `Policy.Read.All` | tenantposture, capolicies, trusts, guests (guest policy) |
-| `Application.Read.All` | apps |
+| `Application.Read.All` | apps, appcredentials |
 | `DelegatedPermissionGrant.Read.All` | consentgrants |
 | `Group.Read.All` | guests, apps (role-assignable groups), recentchanges |
 | `Device.Read.All` | devices |

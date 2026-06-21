@@ -92,7 +92,8 @@ The four reports share a top navigation bar (Audit Results · Risk Report · Pos
 | `-capolicies` | Conditional Access policy posture | |
 | `-riskyusers` | Identity Protection: risky users / detections | needs **P2** |
 | `-riskyserviceprincipals` | Identity Protection: risky service principals (workload identities) | needs **Workload ID Premium** |
-| `-apps` | App / service principal hygiene, over-privilege, credentials, shadow creds | |
+| `-apps` | App / service principal hygiene, over-privilege, shadow creds | |
+| `-appcredentials` | **App registration secret/certificate expiry** — expired credentials → **Medium**, expiring within `-ExpiringCredentialDays` (default 30) → Low | |
 | `-consentgrants` | OAuth2 delegated consent grants (illicit consent risk) | |
 | `-devices` | Stale / unmanaged / non-compliant devices | |
 | `-trusts` | Cross-tenant access & B2B trust | |

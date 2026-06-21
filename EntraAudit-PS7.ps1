@@ -66,6 +66,7 @@ param(
     [switch]$riskyusers,        # Identity Protection: risky users / detections
     [switch]$riskyserviceprincipals, # Identity Protection: risky service principals (Workload ID Premium)
     [switch]$apps,              # App / service principal hygiene & over-privilege
+    [switch]$appcredentials,    # App registration secret/certificate expiry (expired -> Medium)
     [switch]$consentgrants,     # OAuth2 delegated consent grants (illicit consent)
     [switch]$devices,           # Stale / unmanaged / non-compliant devices
     [switch]$trusts,            # Cross-tenant access & B2B trust
@@ -190,6 +191,7 @@ $script:UsersCache  = $null
 $script:UsersCacheHasSignIn = $false   # whether $UsersCache was fetched WITH signInActivity
 $script:UserById    = @{}
 $script:RegCache    = $null
+$script:AppsCache   = $null
 $script:MfaCapableById = @{}
 $script:RoleDefById = @{}
 $script:RawDatasets = New-Object System.Collections.Generic.List[object]
@@ -716,6 +718,16 @@ function Get-EARoleDefMap {
         $script:RoleDefById[$rd.Id] = $rd
     }
     return $script:RoleDefById
+}
+
+# Application objects with credential metadata, cached so the apps and app-credential
+# checks share a single Get-MgApplication call. keyCredentials/passwordCredentials require
+# an explicit $select.
+function Get-EAApplications {
+    if ($null -ne $script:AppsCache) { return $script:AppsCache }
+    $appProps = 'id,appId,displayName,passwordCredentials,keyCredentials,signInAudience,verifiedPublisher,createdDateTime'
+    $script:AppsCache = @(Get-MgApplication -All -Property $appProps -ErrorAction Stop)
+    return $script:AppsCache
 }
 
 # ===========================================================================
@@ -1700,43 +1712,11 @@ function Invoke-Check-RiskyServicePrincipals {
 # CHECK 12 - apps (app / service principal hygiene & over-privilege)
 # ===========================================================================
 function Invoke-Check-Apps {
-    # keyCredentials/passwordCredentials require an explicit $select on Get-MgApplication.
-    $appProps = 'id,appId,displayName,passwordCredentials,keyCredentials,signInAudience,verifiedPublisher,createdDateTime'
-    $apps = @(Get-MgApplication -All -Property $appProps -ErrorAction Stop)
+    $apps = Get-EAApplications
     $sps  = @(Get-MgServicePrincipal -All -Property 'id,appId,displayName,appRoles,servicePrincipalType,accountEnabled' -ErrorAction Stop)
     $script:AppCount = $apps.Count
-    $now = (Get-Date).ToUniversalTime()
-    $soon = $now.AddDays($ExpiringCredentialDays)
-
-    # --- credentials ---
-    $credRows = @()
-    foreach ($a in $apps) {
-        foreach ($c in @($a.PasswordCredentials)) {
-            $credRows += [pscustomobject]@{ App=$a.DisplayName; AppId=$a.AppId; Type='Secret'; KeyId=$c.KeyId; End=$c.EndDateTime; Expired=($c.EndDateTime -lt $now); ExpiringSoon=($c.EndDateTime -ge $now -and $c.EndDateTime -lt $soon) }
-        }
-        foreach ($c in @($a.KeyCredentials)) {
-            $credRows += [pscustomobject]@{ App=$a.DisplayName; AppId=$a.AppId; Type=('Cert/' + $c.Usage); KeyId=$c.KeyId; End=$c.EndDateTime; Expired=($c.EndDateTime -lt $now); ExpiringSoon=($c.EndDateTime -ge $now -and $c.EndDateTime -lt $soon) }
-        }
-    }
-    $credSrc = Write-Evidence -BaseName 'app_credentials' -Rows $credRows -Title 'Application Credentials'
-
-    $expired  = @($credRows | Where-Object { $_.Expired })
-    $expiring = @($credRows | Where-Object { $_.ExpiringSoon })
-    if ($expiring.Count -gt 0) {
-        Add-EntraFinding -Severity 'Medium' -CheckId 'apps' -Category 'Applications' `
-            -Title ("{0} application credential(s) expire within {1} days" -f $expiring.Count, $ExpiringCredentialDays) `
-            -Evidence ("Apps with expiring credentials: {0}" -f (($expiring.App | Select-Object -Unique | Select-Object -First 10) -join ', ')) `
-            -WhyItMatters 'Expiring credentials cause integration outages when they lapse; tracking them avoids surprise failures and credential sprawl.' `
-            -RecommendedAction 'Rotate to certificates with short (<=180 day) lifetimes and remove unused credentials.' `
-            -SourceFile $credSrc -ResultRows @($expiring | Select-Object App,Type,End)
-    }
-    if ($expired.Count -gt 0) {
-        Add-EntraFinding -Severity 'Low' -CheckId 'apps' -Category 'Applications' `
-            -Title ("{0} expired application credential(s) still present" -f $expired.Count) `
-            -Evidence ("Expired credentials linger on {0} entries." -f $expired.Count) `
-            -WhyItMatters 'Expired credentials are clutter and can mask which credential an app actually uses.' `
-            -RecommendedAction 'Remove expired credentials from the application objects.' -SourceFile $credSrc -ResultRows @($expired | Select-Object App,Type,End)
-    }
+    # NB: secret/certificate credential EXPIRY is reported by the dedicated 'appcredentials'
+    # check (Invoke-Check-AppCredentials), which shares the cached Get-EAApplications call.
 
     # --- application permissions across ALL resource APIs (not just Microsoft Graph) ---
     # Build appRoleId -> value map per RESOURCE service principal so dangerous permissions
@@ -1912,6 +1892,103 @@ function Invoke-Check-Apps {
                 -SourceFile $gsrc -ResultRows $owned
         }
     } catch {}
+}
+
+# ===========================================================================
+# CHECK 12b - appcredentials (App Registration secret / certificate expiry)
+#   Models the Zabbix "App Registrations by Graph" credential-expiry monitor: every
+#   passwordCredential (secret) and keyCredential (certificate) is classified Expired /
+#   ExpiringSoon / Valid. Expired -> Medium (the integration has likely already failed, or a
+#   stale credential was never cleaned up); expiring within -ExpiringCredentialDays -> Low.
+# ===========================================================================
+function Invoke-Check-AppCredentials {
+    $apps = Get-EAApplications
+    $now  = (Get-Date).ToUniversalTime()
+    $warnDays = $ExpiringCredentialDays
+    $soon = $now.AddDays($warnDays)
+
+    $rows = @()
+    foreach ($a in $apps) {
+        $creds = @()
+        foreach ($c in @($a.PasswordCredentials)) { $creds += [pscustomobject]@{ C=$c; T='Secret' } }
+        foreach ($c in @($a.KeyCredentials)) {
+            $t = if ($c.Usage) { 'Certificate/' + $c.Usage } else { 'Certificate' }
+            $creds += [pscustomobject]@{ C=$c; T=$t }
+        }
+        foreach ($cc in $creds) {
+            $c = $cc.C
+            if (-not $c.EndDateTime) { continue }            # skip credentials with no expiry (e.g. some FIC)
+            $end = [datetime]$c.EndDateTime
+            $daysLeft = [int][math]::Round(($end - $now).TotalDays)
+            $state = if ($end -lt $now) { 'Expired' } elseif ($end -lt $soon) { 'ExpiringSoon' } else { 'Valid' }
+            $rows += [pscustomobject]@{
+                App         = $a.DisplayName
+                AppId       = $a.AppId
+                AppObjectId = $a.Id
+                CredType    = $cc.T
+                CredName    = (@($c.DisplayName, [string]$c.KeyId) | Where-Object { $_ } | Select-Object -First 1)
+                KeyId       = $c.KeyId
+                End         = $c.EndDateTime
+                DaysLeft    = $daysLeft
+                State       = $state
+            }
+        }
+    }
+    $src = Write-Evidence -BaseName 'app_credentials' -Rows $rows `
+        -Title 'App Registration Credentials - Secret & Certificate Expiry' `
+        -Notes @(("Expiry warning window: {0} days (-ExpiringCredentialDays)" -f $warnDays), 'DaysLeft below 0 means the credential has already expired.')
+
+    if ($rows.Count -eq 0) {
+        Add-EntraFinding -Severity 'Information' -CheckId 'appcredentials' -Category 'Applications' `
+            -Title 'No application registration credentials with an expiry date found' `
+            -Evidence 'No app registration carries a password (secret) or certificate credential that has an endDateTime.' `
+            -WhyItMatters 'Apps may instead use federated/workload-identity credentials, or none are provisioned yet - there is simply nothing to expire.' `
+            -RecommendedAction 'No action; revisit if integrations are expected to authenticate with secrets or certificates.' -SourceFile $src
+        return
+    }
+
+    $expired  = @($rows | Where-Object { $_.State -eq 'Expired' })
+    $expiring = @($rows | Where-Object { $_.State -eq 'ExpiringSoon' })
+
+    # Apps whose EVERY dated credential is expired (no valid one left) - the strongest
+    # "integration is broken / nobody cleaned it up" signal.
+    $deadApps = @($rows | Group-Object AppId | Where-Object {
+        @($_.Group | Where-Object { $_.State -eq 'Expired' }).Count -gt 0 -and
+        @($_.Group | Where-Object { $_.State -ne 'Expired' }).Count -eq 0
+    })
+
+    if ($expired.Count -gt 0) {
+        $expApps = @($expired.App | Select-Object -Unique)
+        $worst = @($expired | Sort-Object DaysLeft | Select-Object -First 10 |
+            ForEach-Object { "{0} [{1}] expired {2}d ago" -f $_.App, $_.CredType, [math]::Abs($_.DaysLeft) })
+        $deadNote = if ($deadApps.Count -gt 0) { " {0} app(s) have NO remaining valid credential (integration is likely broken)." -f $deadApps.Count } else { '' }
+        Add-EntraFinding -Severity 'Medium' -CheckId 'appcredentials' -Category 'Applications' `
+            -Title ("{0} app registration credential(s) have EXPIRED across {1} app(s)" -f $expired.Count, $expApps.Count) `
+            -Evidence ("Expired credentials (oldest first): {0}.{1}" -f ($worst -join '; '), $deadNote) `
+            -WhyItMatters 'An expired secret/certificate means the integration using it has very likely already failed - or, if the integration is gone, that nobody removed the stale credential. Either way it is an operational and lifecycle gap: dead credentials accumulate, obscure which credential an app really uses, and indicate app registrations are not being actively managed.' `
+            -RecommendedAction 'For each app: confirm whether the integration is still required. If yes, roll a fresh credential (prefer a certificate with a short, tracked lifetime) and update the consumer. If no, delete the expired credential and decommission the unused app.' `
+            -SourceFile $src -RuleId 'app-credential-expired' -ObjectType 'application' `
+            -ResultRows @($expired | Select-Object App,AppId,CredType,CredName,End,DaysLeft | Sort-Object DaysLeft)
+    }
+    if ($expiring.Count -gt 0) {
+        $expApps = @($expiring.App | Select-Object -Unique)
+        $next = @($expiring | Sort-Object DaysLeft | Select-Object -First 10 |
+            ForEach-Object { "{0} [{1}] {2}d left" -f $_.App, $_.CredType, $_.DaysLeft })
+        Add-EntraFinding -Severity 'Low' -CheckId 'appcredentials' -Category 'Applications' `
+            -Title ("{0} app registration credential(s) expire within {1} days across {2} app(s)" -f $expiring.Count, $warnDays, $expApps.Count) `
+            -Evidence ("Credentials expiring soon (soonest first): {0}." -f ($next -join '; ')) `
+            -WhyItMatters 'A credential that lapses without a planned rotation causes a surprise integration outage. Catching it inside the warning window lets operations roll it before anything breaks.' `
+            -RecommendedAction 'Schedule rotation for each expiring credential before its end date; prefer certificates with a defined rotation process and remove credentials that are no longer used.' `
+            -SourceFile $src -RuleId 'app-credential-expiring' -ObjectType 'application' `
+            -ResultRows @($expiring | Select-Object App,AppId,CredType,CredName,End,DaysLeft | Sort-Object DaysLeft)
+    }
+    if ($expired.Count -eq 0 -and $expiring.Count -eq 0) {
+        Add-EntraFinding -Severity 'Information' -CheckId 'appcredentials' -Category 'Applications' `
+            -Title ("All {0} application credential(s) are valid beyond the {1}-day window" -f $rows.Count, $warnDays) `
+            -Evidence 'No expired credentials, and none expiring within the warning window.' `
+            -WhyItMatters 'Current secrets/certificates are within their validity period; continued rotation tracking keeps integrations healthy.' `
+            -RecommendedAction 'Maintain a rotation calendar and re-run periodically to catch upcoming expiries.' -SourceFile $src -ResultRows $rows
+    }
 }
 
 # ===========================================================================
@@ -3743,6 +3820,7 @@ $script:Registry = [ordered]@{
     'riskyusers'       = @{ Func='Invoke-Check-RiskyUsersOnly'; Title='Identity Protection (Risky Users)';      Scopes=@('IdentityRiskyUser.Read.All'); P2=$true }
     'riskyserviceprincipals' = @{ Func='Invoke-Check-RiskyServicePrincipals'; Title='Identity Protection (Risky Service Principals)'; Scopes=@('IdentityRiskyServicePrincipal.Read.All') }
     'apps'             = @{ Func='Invoke-Check-Apps';           Title='App / Service Principal Hygiene';        Scopes=@('Application.Read.All') }
+    'appcredentials'   = @{ Func='Invoke-Check-AppCredentials'; Title='App Registration Credential Expiry';     Scopes=@('Application.Read.All') }
     'consentgrants'    = @{ Func='Invoke-Check-ConsentGrants';  Title='OAuth2 Consent Grants';                  Scopes=@('DelegatedPermissionGrant.Read.All') }
     'devices'          = @{ Func='Invoke-Check-Devices';        Title='Stale / Unmanaged Devices';              Scopes=@('Device.Read.All') }
     'trusts'           = @{ Func='Invoke-Check-Trusts';         Title='Cross-Tenant Access & B2B Trust';        Scopes=@('Policy.Read.All') }
@@ -3767,7 +3845,7 @@ function Invoke-EntraAudit {
         'tenant-info'=$tenantinfo; 'privileged-roles'=$privroles; 'directory-roles'=$directoryroles;
         'accounts'=$accounts; 'staleusers'=$staleusers; 'guests'=$guests; 'mfa'=$mfa; 'legacyauth'=$legacyauth;
         'tenantposture'=$tenantposture; 'capolicies'=$capolicies; 'riskyusers'=$riskyusers;
-        'riskyserviceprincipals'=$riskyserviceprincipals; 'apps'=$apps;
+        'riskyserviceprincipals'=$riskyserviceprincipals; 'apps'=$apps; 'appcredentials'=$appcredentials;
         'consentgrants'=$consentgrants; 'devices'=$devices; 'trusts'=$trusts; 'recentchanges'=$recentchanges;
         'tenanthealth'=$tenanthealth; 'pimpolicies'=$pimpolicies; 'breakglass'=$breakglass;
         'authmethodpolicy'=$authmethodpolicy; 'accesspaths'=$accesspaths; 'staleapps'=$staleapps
