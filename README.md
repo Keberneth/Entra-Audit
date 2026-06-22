@@ -1,5 +1,15 @@
 # EntraAudit-PS7 — Microsoft Entra ID (Azure AD) Read-Only Security Audit
 
+## In short
+
+1. Run the GUI: `.\EntraAudit-GUI.ps1`
+2. Click **Install Graph Modules** (one-time).
+3. Click **Run Audit** and **sign in** on the page that opens with an account that has enough permissions.
+
+That's it — the HTML reports open when it finishes. Because the audit is **read-only**, a **Global Reader + Security Reader** account is all you need (no admin write rights, no app registration). Everything below is detail.
+
+---
+
 A PowerShell 7 + Microsoft Graph audit tool that mirrors the on-prem ADAudit-PS7 audit and produces the **same style of HTML reports**. It is the cloud counterpart to the Active Directory audit: same severity model (Critical / High / Medium / Low / Information), same filterable finding cards with *Why it matters* / *Recommended action* / source-evidence links, the same executive **Risk-Report**, and a **Posture-Summary** that plays the role of the AD Health report.
 
 Its flagship capability is auditing **privileged role assignments by activation model** — every privileged role is classified as **Permanent (standing)** vs **Eligible (PIM)** vs **Time-bound active**. A *permanent* Global Administrator is flagged as a risk; the same role held as *eligible* (activated just-in-time through PIM) is the desired posture and is **not** flagged.
