@@ -336,7 +336,11 @@ $script:ApprovedAppOnlyPermissions = @(
     'Application.Read.All','User.Read.All','Group.Read.All','Organization.Read.All',
     'DelegatedPermissionGrant.Read.All','Device.Read.All','IdentityRiskyUser.Read.All',
     'IdentityRiskEvent.Read.All','IdentityRiskyServicePrincipal.Read.All','CrossTenantInformation.ReadBasic.All',
-    'OnPremDirectorySynchronization.Read.All','Reports.Read.All','RoleManagementPolicy.Read.Directory','Member.Read.Hidden'
+    'OnPremDirectorySynchronization.Read.All','Reports.Read.All','RoleManagementPolicy.Read.Directory','Member.Read.Hidden',
+    # Read-only PIM schedule scopes. Not required (RoleManagement.Read.Directory already covers
+    # PIM reads), but accepted so an app provisioned from the delegated list (PREREQUISITE A.2)
+    # does not fail closed. Both are *.Read.Directory - the read-only guarantee is unchanged.
+    'RoleEligibilitySchedule.Read.Directory','RoleAssignmentSchedule.Read.Directory'
 )
 function Test-AppRoleIsApprovedForAudit {
     param([Parameter(Mandatory)][string]$Value)
