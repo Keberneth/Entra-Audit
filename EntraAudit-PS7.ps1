@@ -142,8 +142,18 @@ $script:RequiredModules = @(
 )
 
 # High-value (write-capable) directory roles, by role template id.
-# GA is the only Critical-tier role; the rest are Tier-0 High.
 $script:GlobalAdminTemplateId = '62e90394-69f5-4237-9190-012177145e10'
+# Tier-0 roles: a standing assignment to one of these is Critical regardless of the
+# principal - GA plus the two roles that can take over GA (grant any role / reset any
+# admin's credentials). Every other privileged role caps at High, with the escalation
+# reasons (SP/group principal, not MFA-capable, synced) noted on the finding instead
+# of inflating its severity - otherwise one systemic gap (e.g. group-assigned workload
+# admin roles) floods the report with Criticals and dominates the risk score.
+$script:Tier0RoleTemplateIds = @(
+    '62e90394-69f5-4237-9190-012177145e10'   # Global Administrator
+    'e8611ab8-c189-46e8-94e1-60213ab1f814'   # Privileged Role Administrator
+    '7be44c8a-adaf-4e2a-84d6-ab2649e08a13'   # Privileged Authentication Administrator
+)
 $script:PrivilegedRoleTemplates = @{
     '62e90394-69f5-4237-9190-012177145e10' = 'Global Administrator'
     'e8611ab8-c189-46e8-94e1-60213ab1f814' = 'Privileged Role Administrator'
@@ -172,11 +182,6 @@ $script:DangerousAppPermissions = @(
     'PrivilegedAccess.ReadWrite.AzureAD','RoleManagementPolicy.ReadWrite.Directory'
 )
 
-# ---------------------------------------------------------------------------
-# Severity model (mirrors the AD audit). Score is used for within-band sort.
-# ---------------------------------------------------------------------------
-$script:SeverityScore = @{ Critical = 12; High = 8; Medium = 5; Low = 2; Information = 0 }
-
 # ===========================================================================
 # Shared state
 # ===========================================================================
@@ -196,6 +201,8 @@ $script:MfaCapableById = @{}
 $script:RoleDefById = @{}
 $script:RawDatasets = New-Object System.Collections.Generic.List[object]
 $script:PrivAssignments = $null
+$script:PrivAssignmentsFailed = $false   # true when the assignment fetch itself failed (unknown, not empty)
+$script:CaPoliciesCache = $null
 
 # ===========================================================================
 # Small helpers
@@ -376,7 +383,6 @@ function Add-EntraFinding {
         ObjectType        = $ObjectType
         ObjectId          = $ObjectId
         PathHash          = $PathHash
-        Score             = [int]$script:SeverityScore[$Severity]
     }) | Out-Null
 }
 
@@ -734,6 +740,16 @@ function Get-EAApplications {
     return $script:AppsCache
 }
 
+# Conditional Access policies, cached - four checks (tenantposture, capolicies,
+# breakglass, accesspaths) otherwise each download the full policy set. Throws on
+# failure so callers keep their own error semantics; only a successful fetch is
+# cached, so a transient failure in one check does not blind the later ones.
+function Get-EACaPolicies {
+    if ($null -ne $script:CaPoliciesCache) { return $script:CaPoliciesCache }
+    $script:CaPoliciesCache = @(Get-MgIdentityConditionalAccessPolicy -All -ErrorAction Stop)
+    return $script:CaPoliciesCache
+}
+
 # ===========================================================================
 # CHECK 1 - tenant-info
 # ===========================================================================
@@ -928,11 +944,17 @@ function Invoke-Check-PrivRoles {
             continue
         }
 
-        $sev = if ($a.IsGA) { 'Critical' } else { 'High' }
+        # Severity follows the role TIER, not the principal type: tier-0 roles are
+        # Critical, every other privileged role caps at High. The risk factors are
+        # recorded as reasons on the finding instead of escalating its severity - a
+        # guest (external) holder is the one exception, because a foreign-tenant
+        # credential with standing admin rights is a takeover path regardless of role.
+        $isTier0 = ($a.RoleTemplateId -in $script:Tier0RoleTemplateIds)
+        $sev = if ($isTier0) { 'Critical' } else { 'High' }
         $reasons = @()
-        if ($a.MfaCapable -eq $false) { $sev = 'Critical'; $reasons += 'not MFA-capable' }
-        if ($a.Synced)                { if ($sev -ne 'Critical') { $sev = 'High' }; $reasons += 'on-prem synced admin' }
-        if ($a.PrincipalType -in @('servicePrincipal','group')) { $sev = 'Critical'; $reasons += "$($a.PrincipalType) principal" }
+        if ($a.MfaCapable -eq $false) { $reasons += 'not MFA-capable' }
+        if ($a.Synced)                { $reasons += 'on-prem synced admin' }
+        if ($a.PrincipalType -in @('servicePrincipal','group')) { $reasons += "$($a.PrincipalType) principal" }
         if ($a.Principal -like '*#EXT#*') { $sev = 'Critical'; $reasons += 'guest/external' }
 
         $extra = if ($reasons.Count) { ' (' + ($reasons -join ', ') + ')' } else { '' }
@@ -1386,7 +1408,9 @@ function Invoke-Check-Mfa {
 # CHECK 8 - legacyauth
 # ===========================================================================
 function Invoke-Check-LegacyAuth {
-    $since = (Get-Date).ToUniversalTime().AddDays(-30).ToString('yyyy-MM-ddTHH:mm:ssZ')
+    # InvariantCulture: ':' in a format string is the CULTURE time separator, so e.g.
+    # fi-FI/da-DK render '14.35.12' - an invalid OData timestamp that 400s the query.
+    $since = (Get-Date).ToUniversalTime().AddDays(-30).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
     $legacyClients = 'Exchange ActiveSync|Authenticated SMTP|IMAP4|POP3|MAPI Over HTTP|Other clients|AutoDiscover|Exchange Online PowerShell|Exchange Web Services|Outlook Anywhere'
     $signins = @(Get-MgAuditLogSignIn -All -Filter "createdDateTime ge $since" -ErrorAction Stop |
         Where-Object { $_.ClientAppUsed -and $_.ClientAppUsed -match $legacyClients })
@@ -1428,7 +1452,7 @@ function Invoke-Check-LegacyAuth {
 function Invoke-Check-TenantPosture {
     $sd = $null; try { $sd = Get-MgPolicyIdentitySecurityDefaultEnforcementPolicy -ErrorAction Stop } catch {}
     $authz = $null; try { $authz = Get-MgPolicyAuthorizationPolicy -ErrorAction SilentlyContinue } catch {}
-    $caCount = 0; try { $caCount = @(Get-MgIdentityConditionalAccessPolicy -All -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'enabled' }).Count } catch {}
+    $caCount = 0; try { $caCount = @(Get-EACaPolicies | Where-Object { $_.State -eq 'enabled' }).Count } catch {}
 
     $rows = @()
     if ($sd)    { $rows += [pscustomobject]@{ Setting='Security Defaults enabled'; Value=$sd.IsEnabled } }
@@ -1494,7 +1518,7 @@ function Invoke-Check-TenantPosture {
 # CHECK 10 - capolicies (Conditional Access posture)
 # ===========================================================================
 function Invoke-Check-CAPolicies {
-    $pols = @(Get-MgIdentityConditionalAccessPolicy -All -ErrorAction Stop)
+    $pols = @(Get-EACaPolicies)
     $named = @(); try { $named = @(Get-MgIdentityConditionalAccessNamedLocation -All -ErrorAction SilentlyContinue) } catch {}
 
     $rows = $pols | Select-Object DisplayName, State,
@@ -1576,6 +1600,13 @@ function Invoke-Check-CAPolicies {
     $bg = Normalize-StringList -Values $BreakGlassUpns
     $privUserIds = @{}
     foreach ($a in (Get-EAPrivAssignments)) { if ($a.PrincipalType -eq 'user' -and $a.PrincipalId) { $privUserIds[$a.PrincipalId] = $true } }
+    if ($script:PrivAssignmentsFailed -and $privUserIds.Count -eq 0) {
+        Add-EntraFinding -Severity 'Medium' -CheckId 'capolicies' -Category 'Tenant Posture' `
+            -Title 'Effective admin MFA coverage could not be evaluated' `
+            -Evidence 'The privileged-role assignment list could not be fetched, so per-admin CA applicability was not assessed - coverage is unknown, not confirmed.' `
+            -WhyItMatters 'Without the admin population the report cannot tell whether every privileged account is effectively covered by an MFA policy; silence here must not read as a pass.' `
+            -RecommendedAction 'Grant RoleManagement.Read.Directory (or retry on transient failure) and re-run the capolicies check.' -SourceFile $src
+    }
     $uncovered = @(); $evaluated = 0
     foreach ($uid in $privUserIds.Keys) {
         $upn = if ($script:UserById.ContainsKey($uid)) { $script:UserById[$uid].UserPrincipalName } else { $uid }
@@ -1799,6 +1830,8 @@ function Invoke-Check-Apps {
     # is an escalation path (that owner can add a credential and act as the app).
     $privUserIds = @{}
     try { foreach ($a in (Get-EAPrivAssignments)) { if ($a.PrincipalId -and $a.PrincipalType -eq 'user') { $privUserIds[$a.PrincipalId] = $true } } } catch {}
+    # When the privileged set is unknown, "owner is not an admin" cannot be concluded.
+    $privKnown = -not $script:PrivAssignmentsFailed
     $hardenRows = @()
     foreach ($spId in $privSpIds) {
         $sp = $spById[$spId]; if (-not $sp) { continue }
@@ -1811,7 +1844,7 @@ function Invoke-Check-Apps {
             if (-not $oupn -or $oupn -like '*#EXT#*') { continue }   # user owners only; guests counted separately
             $disabled = ($oid -and $script:UserById.ContainsKey($oid) -and -not [bool]$script:UserById[$oid].AccountEnabled)
             $isPriv   = ($oid -and $privUserIds.ContainsKey($oid))
-            if ($disabled -or -not $isPriv) { $nonAdminOwner = $true }
+            if ($disabled -or ($privKnown -and -not $isPriv)) { $nonAdminOwner = $true }
         }
         $app = $appById[$sp.AppId]
         $multiTenant = [bool]($app -and $app.SignInAudience -match 'AzureADMultipleOrgs')
@@ -2115,10 +2148,13 @@ function Invoke-Check-Trusts {
     }
     $src = Write-Evidence -BaseName 'cross_tenant_access' -Rows $rows -Title 'Cross-Tenant Access & B2B Trust'
 
-    if ($def -and $def.InboundTrust.IsMfaAccepted -and $partners.Count -eq 0) {
+    # Partner configs override the default only for the NAMED tenants - the default
+    # policy still applies to every other tenant, so partner entries must not suppress
+    # this finding.
+    if ($def -and $def.InboundTrust.IsMfaAccepted) {
         Add-EntraFinding -Severity 'Medium' -CheckId 'trusts' -Category 'External Access' `
             -Title 'Default cross-tenant policy trusts external MFA claims for all tenants' `
-            -Evidence 'InboundTrust.IsMfaAccepted = true on the default (all tenants) policy with no per-partner overrides.' `
+            -Evidence ("InboundTrust.IsMfaAccepted = true on the default (all tenants) policy. {0} partner-specific configuration(s) exist, but the default still applies to every tenant without one." -f $partners.Count) `
             -WhyItMatters 'Trusting MFA claims from arbitrary external tenants lets their posture decisions satisfy your MFA requirement, weakening Conditional Access for guests.' `
             -RecommendedAction 'Scope inbound MFA/compliance trust to named partner tenants rather than trusting all tenants by default.' -SourceFile $src
     }
@@ -2129,10 +2165,13 @@ function Invoke-Check-Trusts {
             -WhyItMatters 'Auto-redemption removes the consent step for external users, broadening cross-tenant access without explicit approval.' `
             -RecommendedAction 'Restrict automatic redemption to specific trusted partner tenants.' -SourceFile $src
     }
-    if (-not $def -and $partners.Count -eq 0) {
+    # A failed/empty DEFAULT-policy read means the trust posture was NOT evaluated -
+    # never fall through to 'reviewed, nothing flagged', even when partner configs
+    # were readable.
+    if (-not $def) {
         Add-EntraFinding -Severity 'Information' -CheckId 'trusts' -Category 'External Access' `
             -Title 'Cross-tenant access policy not assessed' `
-            -Evidence 'No cross-tenant access policy returned (may be default configuration or missing scope).' `
+            -Evidence 'The default cross-tenant access policy could not be read (default configuration or missing scope) - external-trust posture was not evaluated.' `
             -WhyItMatters 'Cross-tenant access governs B2B trust with other tenants.' `
             -RecommendedAction 'Review cross-tenant access settings in the Entra portal.' -SourceFile $src
     } elseif ($script:Findings.Where({$_.CheckId -eq 'trusts'}).Count -eq 0) {
@@ -2148,7 +2187,8 @@ function Invoke-Check-Trusts {
 # ===========================================================================
 function Invoke-Check-RecentChanges {
     $since = (Get-Date).ToUniversalTime().AddDays(-$RecentChangeDays)
-    $sinceStr = $since.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    # InvariantCulture: see Invoke-Check-LegacyAuth - culture time separators break OData.
+    $sinceStr = $since.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
     $newUsers = @(Get-MgUser -Filter "createdDateTime ge $sinceStr" -All -ConsistencyLevel eventual -CountVariable c -Property Id,UserPrincipalName,CreatedDateTime,UserType,AccountEnabled -ErrorAction Stop)
     $newGroups = @(); try { $newGroups = @(Get-MgGroup -Filter "createdDateTime ge $sinceStr" -All -ConsistencyLevel eventual -CountVariable c2 -Property Id,DisplayName,CreatedDateTime -ErrorAction SilentlyContinue) } catch {}
 
@@ -2291,12 +2331,24 @@ function Get-EAPrivAssignments {
         }) | Out-Null
     }
 
-    $active = @()
-    try { $active += @(Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -All -ExpandProperty Principal -ErrorAction Stop) } catch {}
-    if ($active.Count -eq 0) { try { $active += @(Get-MgRoleManagementDirectoryRoleAssignment -All -ExpandProperty Principal -ErrorAction SilentlyContinue) } catch {} }
+    $active = @(); $fetchErr = $null
+    try { $active += @(Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -All -ExpandProperty Principal -ErrorAction Stop) } catch { $fetchErr = $_ }
+    if ($active.Count -eq 0) {
+        try { $active += @(Get-MgRoleManagementDirectoryRoleAssignment -All -ExpandProperty Principal -ErrorAction Stop); $fetchErr = $null } catch { if (-not $fetchErr) { $fetchErr = $_ } }
+    }
     foreach ($a in $active) { _Add $a 'Active' }
+    # Eligibility is P2-gated; its absence is expected on P1 tenants and stays silent.
     try { foreach ($a in @(Get-MgRoleManagementDirectoryRoleEligibilityScheduleInstance -All -ExpandProperty Principal -ErrorAction SilentlyContinue)) { _Add $a 'Eligible' } } catch {}
 
+    if ($list.Count -eq 0 -and $fetchErr) {
+        # Both active-assignment fetches FAILED - this is "unknown", not "no admins".
+        # Do not cache (a later check may retry successfully) and flag the failure so
+        # consumers report "could not validate" instead of findings built on blindness.
+        $script:PrivAssignmentsFailed = $true
+        Write-Warn2 "  Privileged-assignment fetch failed: $($fetchErr.Exception.Message)"
+        return $list
+    }
+    $script:PrivAssignmentsFailed = $false
     $script:PrivAssignments = $list
     return $list
 }
@@ -2333,23 +2385,37 @@ function Invoke-Check-PimPolicies {
 
         $rules = @()
         if ($pa['policy'] -and $pa['policy']['rules']) { $rules = @($pa['policy']['rules']) }
-        $mfa = $null; $just = $null; $appr = $null; $maxH = $null; $permA = $null; $permE = $null
+        $mfa = $null; $just = $null; $appr = $null; $maxH = $null; $permA = $null; $permE = $null; $authCtx = $false
         foreach ($r in $rules) {
             $rid = [string]$r['id']
             switch -Regex ($rid) {
                 'Enablement_EndUser_Assignment' { $en = @($r['enabledRules']); $mfa = ($en -contains 'MultiFactorAuthentication'); $just = ($en -contains 'Justification') }
+                # Requiring a Conditional Access AUTHENTICATION CONTEXT on activation is
+                # mutually exclusive with the MultiFactorAuthentication enablement value
+                # (the portal removes MFA from the enablement rule when auth context is
+                # selected) and is typically the STRONGER control - it must not be
+                # reported as "can be activated without MFA".
+                'AuthenticationContext_EndUser_Assignment' { $authCtx = [bool]$r['isEnabled'] }
                 'Approval_EndUser_Assignment'   { if ($r['setting']) { $appr = [bool]$r['setting']['isApprovalRequired'] } }
                 'Expiration_EndUser_Assignment' {
+                    # ISO-8601 durations also come in day form (P1D) and mixed form
+                    # (P1DT2H / PT8H30M) - XmlConvert parses them all; the regex stays
+                    # as a fallback only.
                     $d = [string]$r['maximumDuration']
-                    if ($d -match 'PT(\d+)H') { $maxH = [int]$matches[1] } elseif ($d -match 'PT(\d+)M') { $maxH = [math]::Round(([int]$matches[1]/60),1) }
+                    if ($d) {
+                        try { $maxH = [math]::Round(([System.Xml.XmlConvert]::ToTimeSpan($d)).TotalHours, 1) }
+                        catch {
+                            if ($d -match 'PT(\d+)H') { $maxH = [int]$matches[1] } elseif ($d -match 'PT(\d+)M') { $maxH = [math]::Round(([int]$matches[1]/60),1) }
+                        }
+                    }
                 }
                 'Expiration_Admin_Assignment'   { if ($r.ContainsKey('isExpirationRequired')) { $permA = (-not [bool]$r['isExpirationRequired']) } }
                 'Expiration_Admin_Eligibility'  { if ($r.ContainsKey('isExpirationRequired')) { $permE = (-not [bool]$r['isExpirationRequired']) } }
             }
         }
-        $rows += [pscustomobject]@{ Role=$roleName; MfaOnActivation=$mfa; JustificationRequired=$just; ApprovalRequired=$appr; MaxActivationHours=$maxH; PermanentActiveAllowed=$permA; PermanentEligibleAllowed=$permE }
+        $rows += [pscustomobject]@{ Role=$roleName; MfaOnActivation=$mfa; AuthContextOnActivation=$authCtx; JustificationRequired=$just; ApprovalRequired=$appr; MaxActivationHours=$maxH; PermanentActiveAllowed=$permA; PermanentEligibleAllowed=$permE }
 
-        if ($mfa -eq $false) { if ($isGAorPRA) { $noMfaCrit += $roleName } else { $noMfaHigh += $roleName } }
+        if ($mfa -eq $false -and -not $authCtx) { if ($isGAorPRA) { $noMfaCrit += $roleName } else { $noMfaHigh += $roleName } }
         if ($isGAorPRA -and $just -eq $false) { $noJust += $roleName }
         if ($isGAorPRA -and $appr -eq $false) { $noApproval += $roleName }
         if ($maxH -and $maxH -gt 8) { $longDur += ("{0} ({1}h)" -f $roleName, $maxH) }
@@ -2439,15 +2505,28 @@ function Invoke-Check-BreakGlass {
     $gaIds = @{}
     $privRolesByUser = @{}
     foreach ($a in (Get-EAPrivAssignments)) {
-        if ($a.IsGA -and $a.ActivationModel -eq 'Permanent' -and $a.PrincipalId) { $gaIds[$a.PrincipalId] = $true }
+        if ($a.IsGA -and $a.ActivationModel -eq 'Permanent' -and $a.PrincipalId) {
+            $gaIds[$a.PrincipalId] = $true
+            # GA held via a role-assignable GROUP is still permanent standing GA for
+            # every member - expand so a break-glass account whose GA comes through a
+            # group is not falsely reported as "not a permanent Global Administrator".
+            if ($a.PrincipalType -eq 'group') {
+                try { foreach ($m in @(Get-MgGroupTransitiveMember -GroupId $a.PrincipalId -All -ErrorAction Stop)) { if ($m.Id) { $gaIds[$m.Id] = $true } } } catch {}
+            }
+        }
         if ($a.PrincipalId -and $a.PrincipalType -eq 'user' -and $a.RoleTemplateId) {
             if (-not $privRolesByUser.ContainsKey($a.PrincipalId)) { $privRolesByUser[$a.PrincipalId] = New-Object System.Collections.Generic.HashSet[string] }
             [void]$privRolesByUser[$a.PrincipalId].Add($a.RoleTemplateId)
         }
     }
+    # When the assignment fetch itself failed, GA status is UNKNOWN - report that
+    # instead of a false "not a permanent Global Administrator" Critical.
+    $gaKnown = -not $script:PrivAssignmentsFailed
 
-    # Conditional Access lockout evaluation context.
-    $enabledCa = @(); try { $enabledCa = @(Get-MgIdentityConditionalAccessPolicy -All -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'enabled' }) } catch {}
+    # Conditional Access lockout evaluation context. A failed policy read means the CA
+    # exposure is UNKNOWN - it must not silently evaluate as "no policies apply".
+    $caKnown = $true
+    $enabledCa = @(); try { $enabledCa = @(Get-EACaPolicies | Where-Object { $_.State -eq 'enabled' }) } catch { $caKnown = $false }
     # signInActivity is only populated when P1+ is licensed AND AuditLog.Read.All is granted -
     # mirror Get-EAUsers' gate so an unlicensed tenant reports "could not validate" rather than
     # a false "no successful sign-in in 90 days".
@@ -2464,23 +2543,27 @@ function Invoke-Check-BreakGlass {
             -RecommendedAction 'Create two cloud-only break-glass Global Admin accounts on the .onmicrosoft.com domain, exclude them from CA lockout policies, store credentials offline, monitor their sign-ins, and re-run with -BreakGlassUpns.' -SourceFile $null
         return
     }
+    # Per-account findings are QUEUED and only emitted after Write-Evidence, so every
+    # one of them links to the break_glass evidence file (which can only be written
+    # once the loop has built the rows).
+    $pending = New-Object System.Collections.Generic.List[object]
     if ($bg.Count -lt 2) {
-        Add-EntraFinding -Severity 'Critical' -CheckId 'breakglass' -Category 'Privileged Access' `
-            -Title 'Fewer than two emergency-access accounts configured' `
-            -Evidence ("Only {0} break-glass account designated." -f $bg.Count) `
-            -WhyItMatters 'A single emergency-access account is a single point of failure; if it is lost or locked out, recovery from a tenant-wide lockout may be impossible.' `
-            -RecommendedAction 'Maintain at least two cloud-only break-glass Global Admin accounts.' -SourceFile $null
+        $pending.Add(@{ Severity='Critical'
+            Title='Fewer than two emergency-access accounts configured'
+            Evidence=("Only {0} break-glass account designated." -f $bg.Count)
+            WhyItMatters='A single emergency-access account is a single point of failure; if it is lost or locked out, recovery from a tenant-wide lockout may be impossible.'
+            RecommendedAction='Maintain at least two cloud-only break-glass Global Admin accounts.' }) | Out-Null
     }
 
     $rows = @()
     foreach ($upn in $bg) {
         $u = $byUpn[$upn.ToLowerInvariant()]
         if (-not $u) {
-            Add-EntraFinding -Severity 'High' -CheckId 'breakglass' -Category 'Privileged Access' `
-                -Title ("Designated break-glass account not found: {0}" -f $upn) `
-                -Evidence 'The UPN passed to -BreakGlassUpns does not resolve to a user.' `
-                -WhyItMatters 'A misconfigured emergency-access reference means the account you think protects you may not exist.' `
-                -RecommendedAction 'Verify the break-glass UPN is correct and the account exists.' -SourceFile $null
+            $pending.Add(@{ Severity='High'
+                Title=("Designated break-glass account not found: {0}" -f $upn)
+                Evidence='The UPN passed to -BreakGlassUpns does not resolve to a user.'
+                WhyItMatters='A misconfigured emergency-access reference means the account you think protects you may not exist.'
+                RecommendedAction='Verify the break-glass UPN is correct and the account exists.' }) | Out-Null
             continue
         }
         $enabled   = [bool]$u.AccountEnabled
@@ -2511,91 +2594,110 @@ function Invoke-Check-BreakGlass {
         }
 
         $rows += [pscustomobject]@{
-            Account=$u.UserPrincipalName; Enabled=$enabled; GlobalAdmin=$isGA; CloudOnly=$cloudOnly; OnMicrosoftDomain=$onmsft
+            Account=$u.UserPrincipalName; Enabled=$enabled; GlobalAdmin=$(if ($gaKnown) { $isGA } else { 'unknown' }); CloudOnly=$cloudOnly; OnMicrosoftDomain=$onmsft
             Licensed=$licensed; LastSuccessfulSignIn=$lastSucc
-            BlockAllApps=($blockAll -join '; '); BlockScoped=($blockScoped -join '; '); MfaAllApps=($mfaAll -join '; '); MfaScoped=($mfaScoped -join '; ')
+            BlockAllApps=$(if ($caKnown) { $blockAll -join '; ' } else { 'unknown' }); BlockScoped=$(if ($caKnown) { $blockScoped -join '; ' } else { 'unknown' })
+            MfaAllApps=$(if ($caKnown) { $mfaAll -join '; ' } else { 'unknown' }); MfaScoped=$(if ($caKnown) { $mfaScoped -join '; ' } else { 'unknown' })
         }
 
         if (-not $enabled) {
-            Add-EntraFinding -Severity 'Critical' -CheckId 'breakglass' -Category 'Privileged Access' `
-                -Title ("Break-glass account is disabled: {0}" -f $u.UserPrincipalName) `
-                -Evidence 'accountEnabled = false on the emergency-access account.' `
-                -WhyItMatters 'A disabled emergency-access account cannot be used to recover the tenant - the control is non-functional exactly when it is needed.' `
-                -RecommendedAction 'Enable the break-glass account and verify it can sign in.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+            $pending.Add(@{ Severity='Critical'; AffectedPrincipal=$u.UserPrincipalName
+                Title=("Break-glass account is disabled: {0}" -f $u.UserPrincipalName)
+                Evidence='accountEnabled = false on the emergency-access account.'
+                WhyItMatters='A disabled emergency-access account cannot be used to recover the tenant - the control is non-functional exactly when it is needed.'
+                RecommendedAction='Enable the break-glass account and verify it can sign in.' }) | Out-Null
         }
         if ($blockAll.Count -gt 0) {
-            Add-EntraFinding -Severity 'Critical' -CheckId 'breakglass' -Category 'Privileged Access' `
-                -Title ("Break-glass account is caught by a blocking CA policy covering ALL cloud apps: {0}" -f $u.UserPrincipalName) `
-                -Evidence ("Applies (in scope, not excluded) to all-cloud-apps blocking policy/policies: {0}" -f ($blockAll -join '; ')) `
-                -WhyItMatters 'A blocking policy that covers all cloud apps will block the emergency-access account from the admin portals, Graph and Azure management - locking it out during the very incident it exists to resolve.' `
-                -RecommendedAction 'Exclude the break-glass accounts (directly, or via a dedicated exclusion group) from all blocking Conditional Access policies.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+            $pending.Add(@{ Severity='Critical'; AffectedPrincipal=$u.UserPrincipalName
+                Title=("Break-glass account is caught by a blocking CA policy covering ALL cloud apps: {0}" -f $u.UserPrincipalName)
+                Evidence=("Applies (in scope, not excluded) to all-cloud-apps blocking policy/policies: {0}" -f ($blockAll -join '; '))
+                WhyItMatters='A blocking policy that covers all cloud apps will block the emergency-access account from the admin portals, Graph and Azure management - locking it out during the very incident it exists to resolve.'
+                RecommendedAction='Exclude the break-glass accounts (directly, or via a dedicated exclusion group) from all blocking Conditional Access policies.' }) | Out-Null
         }
         if ($blockScoped.Count -gt 0) {
-            Add-EntraFinding -Severity 'Medium' -CheckId 'breakglass' -Category 'Privileged Access' `
-                -Title ("Break-glass account is caught by an app-scoped blocking CA policy: {0}" -f $u.UserPrincipalName) `
-                -Evidence ("Applies to blocking policy/policies scoped to specific apps (not all cloud apps): {0}" -f ($blockScoped -join '; ')) `
-                -WhyItMatters 'A blocking policy scoped to a specific workload app is worth knowing but does not lock the account out of the admin portals / Graph the way an all-cloud-apps block does.' `
-                -RecommendedAction 'Review whether the break-glass account needs the blocked app; exclude it if it could impede recovery.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+            $pending.Add(@{ Severity='Medium'; AffectedPrincipal=$u.UserPrincipalName
+                Title=("Break-glass account is caught by an app-scoped blocking CA policy: {0}" -f $u.UserPrincipalName)
+                Evidence=("Applies to blocking policy/policies scoped to specific apps (not all cloud apps): {0}" -f ($blockScoped -join '; '))
+                WhyItMatters='A blocking policy scoped to a specific workload app is worth knowing but does not lock the account out of the admin portals / Graph the way an all-cloud-apps block does.'
+                RecommendedAction='Review whether the break-glass account needs the blocked app; exclude it if it could impede recovery.' }) | Out-Null
         }
         if ($mfaAll.Count -gt 0) {
-            Add-EntraFinding -Severity 'High' -CheckId 'breakglass' -Category 'Privileged Access' `
-                -Title ("Break-glass account is subject to an all-cloud-apps MFA Conditional Access policy: {0}" -f $u.UserPrincipalName) `
-                -Evidence ("Applies (in scope, not excluded) to all-cloud-apps MFA/auth-strength policy/policies: {0}" -f ($mfaAll -join '; ')) `
-                -WhyItMatters 'If the emergency-access account must satisfy MFA / an authentication strength (across all cloud apps) that it may be unable to meet during an outage, it can be locked out. Microsoft recommends excluding break-glass accounts from such policies, with compensating sign-in monitoring.' `
-                -RecommendedAction 'Exclude break-glass accounts from MFA-requiring CA policies (or ensure they hold a resilient phishing-resistant method), and monitor their sign-ins closely.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+            $pending.Add(@{ Severity='High'; AffectedPrincipal=$u.UserPrincipalName
+                Title=("Break-glass account is subject to an all-cloud-apps MFA Conditional Access policy: {0}" -f $u.UserPrincipalName)
+                Evidence=("Applies (in scope, not excluded) to all-cloud-apps MFA/auth-strength policy/policies: {0}" -f ($mfaAll -join '; '))
+                WhyItMatters='If the emergency-access account must satisfy MFA / an authentication strength (across all cloud apps) that it may be unable to meet during an outage, it can be locked out. Microsoft recommends excluding break-glass accounts from such policies, with compensating sign-in monitoring.'
+                RecommendedAction='Exclude break-glass accounts from MFA-requiring CA policies (or ensure they hold a resilient phishing-resistant method), and monitor their sign-ins closely.' }) | Out-Null
         }
         if ($mfaScoped.Count -gt 0) {
-            Add-EntraFinding -Severity 'Low' -CheckId 'breakglass' -Category 'Privileged Access' `
-                -Title ("Break-glass account is subject to an app-scoped MFA Conditional Access policy: {0}" -f $u.UserPrincipalName) `
-                -Evidence ("Applies to MFA/auth-strength policy/policies scoped to specific apps: {0}" -f ($mfaScoped -join '; ')) `
-                -WhyItMatters 'An MFA policy scoped to a specific app is a minor lockout consideration compared with one covering all cloud apps.' `
-                -RecommendedAction 'Confirm the break-glass account does not need the scoped app, or exclude it.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+            $pending.Add(@{ Severity='Low'; AffectedPrincipal=$u.UserPrincipalName
+                Title=("Break-glass account is subject to an app-scoped MFA Conditional Access policy: {0}" -f $u.UserPrincipalName)
+                Evidence=("Applies to MFA/auth-strength policy/policies scoped to specific apps: {0}" -f ($mfaScoped -join '; '))
+                WhyItMatters='An MFA policy scoped to a specific app is a minor lockout consideration compared with one covering all cloud apps.'
+                RecommendedAction='Confirm the break-glass account does not need the scoped app, or exclude it.' }) | Out-Null
         }
 
-        if (-not $isGA) {
-            Add-EntraFinding -Severity 'Critical' -CheckId 'breakglass' -Category 'Privileged Access' `
-                -Title ("Break-glass account is not a permanent Global Administrator: {0}" -f $u.UserPrincipalName) `
-                -Evidence 'The emergency-access account does not hold Global Administrator as a PERMANENT (standing) assignment - an eligible/time-bound or JIT-activated GA does not count, because PIM activation may itself be unavailable during the emergency.' `
-                -WhyItMatters 'A break-glass account must have standing Global Admin so it can recover the tenant when all other access fails.' `
-                -RecommendedAction 'Assign permanent Global Administrator to the break-glass account.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+        if ($gaKnown -and -not $isGA) {
+            $pending.Add(@{ Severity='Critical'; AffectedPrincipal=$u.UserPrincipalName
+                Title=("Break-glass account is not a permanent Global Administrator: {0}" -f $u.UserPrincipalName)
+                Evidence='The emergency-access account does not hold Global Administrator as a PERMANENT (standing) assignment - directly or via a role-assignable group. An eligible/time-bound or JIT-activated GA does not count, because PIM activation may itself be unavailable during the emergency.'
+                WhyItMatters='A break-glass account must have standing Global Admin so it can recover the tenant when all other access fails.'
+                RecommendedAction='Assign permanent Global Administrator to the break-glass account.' }) | Out-Null
         }
         if (-not $cloudOnly) {
-            Add-EntraFinding -Severity 'Critical' -CheckId 'breakglass' -Category 'Privileged Access' `
-                -Title ("Break-glass account is synced/federated, not cloud-only: {0}" -f $u.UserPrincipalName) `
-                -Evidence 'onPremisesSyncEnabled is true on the emergency-access account.' `
-                -WhyItMatters 'A synced/federated break-glass account depends on on-prem AD / federation - exactly the systems that may be down during an emergency.' `
-                -RecommendedAction 'Recreate the break-glass account as a cloud-only account.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+            $pending.Add(@{ Severity='Critical'; AffectedPrincipal=$u.UserPrincipalName
+                Title=("Break-glass account is synced/federated, not cloud-only: {0}" -f $u.UserPrincipalName)
+                Evidence='onPremisesSyncEnabled is true on the emergency-access account.'
+                WhyItMatters='A synced/federated break-glass account depends on on-prem AD / federation - exactly the systems that may be down during an emergency.'
+                RecommendedAction='Recreate the break-glass account as a cloud-only account.' }) | Out-Null
         }
         if (-not $onmsft) {
-            Add-EntraFinding -Severity 'High' -CheckId 'breakglass' -Category 'Privileged Access' `
-                -Title ("Break-glass account does not use the .onmicrosoft.com domain: {0}" -f $u.UserPrincipalName) `
-                -Evidence 'Emergency-access accounts should use the tenant .onmicrosoft.com domain to avoid dependency on custom/federated domains.' `
-                -WhyItMatters 'A custom or federated domain can become unavailable; the .onmicrosoft.com domain is always present and cloud-resolved.' `
-                -RecommendedAction 'Use a UPN on the tenant .onmicrosoft.com domain for break-glass accounts.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+            $pending.Add(@{ Severity='High'; AffectedPrincipal=$u.UserPrincipalName
+                Title=("Break-glass account does not use the .onmicrosoft.com domain: {0}" -f $u.UserPrincipalName)
+                Evidence='Emergency-access accounts should use the tenant .onmicrosoft.com domain to avoid dependency on custom/federated domains.'
+                WhyItMatters='A custom or federated domain can become unavailable; the .onmicrosoft.com domain is always present and cloud-resolved.'
+                RecommendedAction='Use a UPN on the tenant .onmicrosoft.com domain for break-glass accounts.' }) | Out-Null
         }
         if (-not $signinKnown) {
-            Add-EntraFinding -Severity 'Medium' -CheckId 'breakglass' -Category 'Privileged Access' `
-                -Title ("Break-glass sign-in test could not be validated (no sign-in activity data): {0}" -f $u.UserPrincipalName) `
-                -Evidence 'signInActivity is unavailable (AuditLog.Read.All / Entra ID P1 required) - test status is Unknown, not "never tested".' `
-                -WhyItMatters 'Emergency-access accounts must be periodically tested, but without sign-in data the test status cannot be confirmed either way - reporting it as a coverage gap avoids a false "never tested" conclusion.' `
-                -RecommendedAction 'Grant AuditLog.Read.All and ensure Entra ID P1+, then re-run to validate the documented break-glass test.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+            $pending.Add(@{ Severity='Medium'; AffectedPrincipal=$u.UserPrincipalName
+                Title=("Break-glass sign-in test could not be validated (no sign-in activity data): {0}" -f $u.UserPrincipalName)
+                Evidence='signInActivity is unavailable (AuditLog.Read.All / Entra ID P1 required) - test status is Unknown, not "never tested".'
+                WhyItMatters='Emergency-access accounts must be periodically tested, but without sign-in data the test status cannot be confirmed either way - reporting it as a coverage gap avoids a false "never tested" conclusion.'
+                RecommendedAction='Grant AuditLog.Read.All and ensure Entra ID P1+, then re-run to validate the documented break-glass test.' }) | Out-Null
         }
         elseif ($null -eq $lastSucc -or $lastSucc -lt (Get-Date).ToUniversalTime().AddDays(-90)) {
-            Add-EntraFinding -Severity 'Medium' -CheckId 'breakglass' -Category 'Privileged Access' `
-                -Title ("Break-glass account has no successful sign-in in 90 days: {0}" -f $u.UserPrincipalName) `
-                -Evidence ("Last successful sign-in: {0}" -f ($lastSucc ?? 'none on record')) `
-                -WhyItMatters 'Emergency-access accounts must be periodically tested so you know they work and that alerting fires before a real emergency.' `
-                -RecommendedAction "Perform a documented emergency-access test: verify sign-in succeeds, verify alerting fires, and record the test date and owner." -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+            $pending.Add(@{ Severity='Medium'; AffectedPrincipal=$u.UserPrincipalName
+                Title=("Break-glass account has no successful sign-in in 90 days: {0}" -f $u.UserPrincipalName)
+                Evidence=("Last successful sign-in: {0}" -f ($lastSucc ?? 'none on record'))
+                WhyItMatters='Emergency-access accounts must be periodically tested so you know they work and that alerting fires before a real emergency.'
+                RecommendedAction='Perform a documented emergency-access test: verify sign-in succeeds, verify alerting fires, and record the test date and owner.' }) | Out-Null
         }
         if ($licensed) {
-            Add-EntraFinding -Severity 'Low' -CheckId 'breakglass' -Category 'Privileged Access' `
-                -Title ("Break-glass account is licensed like a normal user: {0}" -f $u.UserPrincipalName) `
-                -Evidence 'Emergency-access accounts should carry minimal licensing.' `
-                -WhyItMatters 'Excess licensing on a break-glass account increases its footprint and exposure.' `
-                -RecommendedAction 'Keep break-glass licensing to the minimum required for sign-in and logging.' -SourceFile $null -AffectedPrincipal $u.UserPrincipalName
+            $pending.Add(@{ Severity='Low'; AffectedPrincipal=$u.UserPrincipalName
+                Title=("Break-glass account is licensed like a normal user: {0}" -f $u.UserPrincipalName)
+                Evidence='Emergency-access accounts should carry minimal licensing.'
+                WhyItMatters='Excess licensing on a break-glass account increases its footprint and exposure.'
+                RecommendedAction='Keep break-glass licensing to the minimum required for sign-in and logging.' }) | Out-Null
         }
     }
     $src = Write-Evidence -BaseName 'break_glass' -Rows $rows -Title 'Emergency-Access (Break-Glass) Account Health'
+
+    # Coverage gaps discovered before/during the loop are reported once, tenant-level.
+    if ($rows.Count -gt 0 -and -not $caKnown) {
+        $pending.Add(@{ Severity='Medium'
+            Title='Break-glass Conditional Access lockout exposure could not be validated'
+            Evidence='Conditional Access policies could not be read (Policy.Read.All missing or the request failed) - the CA lockout columns are reported as unknown, not clean.'
+            WhyItMatters='Whether a break-glass account is caught by a blocking or MFA-requiring CA policy is a core part of the emergency-access baseline; without the policy set this cannot be confirmed either way.'
+            RecommendedAction='Grant Policy.Read.All (or retry on transient failure) and re-run the breakglass check.' }) | Out-Null
+    }
+    if ($rows.Count -gt 0 -and -not $gaKnown) {
+        $pending.Add(@{ Severity='Medium'
+            Title='Break-glass Global Administrator status could not be validated'
+            Evidence='The privileged-role assignment list could not be fetched, so whether the designated accounts hold permanent Global Administrator is unknown.'
+            WhyItMatters='Standing GA is the defining property of an emergency-access account; without the assignment data the baseline cannot be confirmed.'
+            RecommendedAction='Grant RoleManagement.Read.Directory (or retry on transient failure) and re-run the breakglass check.' }) | Out-Null
+    }
+    foreach ($p in $pending) { Add-EntraFinding -CheckId 'breakglass' -Category 'Privileged Access' -SourceFile $src @p }
+
     if ($script:Findings.Where({$_.CheckId -eq 'breakglass'}).Count -eq 0 -and $rows.Count -gt 0) {
         Add-EntraFinding -Severity 'Information' -CheckId 'breakglass' -Category 'Privileged Access' `
             -Title 'Break-glass accounts meet the emergency-access baseline' `
@@ -2707,6 +2809,16 @@ function Invoke-Check-AuthMethodPolicy {
 # ===========================================================================
 function Invoke-Check-AccessPaths {
     $assignments = Get-EAPrivAssignments
+    if ($script:PrivAssignmentsFailed -and @($assignments).Count -eq 0) {
+        # An empty result caused by a FAILED fetch must not fall through as a silent
+        # "no duplicate paths / no escalation" pass.
+        Add-EntraFinding -Severity 'Medium' -CheckId 'accesspaths' -Category 'Privileged Access' `
+            -Title 'Effective-access / attack-path analysis could not be performed' `
+            -Evidence 'The privileged-role assignment list could not be fetched, so duplicate-path and ownership-escalation analysis was skipped - status is unknown, not clean.' `
+            -WhyItMatters 'Attack-path findings are only as good as the assignment data behind them; reporting nothing here would look like a pass.' `
+            -RecommendedAction 'Grant RoleManagement.Read.Directory (or retry on transient failure) and re-run the accesspaths check.'
+        return
+    }
     try { Get-EAUsers | Out-Null } catch {}
 
     # Direct (user) privileged assignments, tracking activation state (Active wins).
@@ -2734,7 +2846,9 @@ function Invoke-Check-AccessPaths {
             if (-not $upn -and $mtype -ne '#microsoft.graph.user') { continue }   # count only user members (incl. UPN-less user objects)
             $key = '{0}|{1}' -f $mid, $g.RoleTemplateId
             if (-not $pathByUserRole.ContainsKey($key)) { $pathByUserRole[$key] = New-Object System.Collections.Generic.List[object] }
-            $pathByUserRole[$key].Add([pscustomobject]@{ Group=($g.PrincipalName ?? 'group'); State=$g.State }) | Out-Null
+            # Carry the group ID: display names are not unique in Entra, so de-duplicating
+            # paths by name would collapse two distinct same-named groups into one path.
+            $pathByUserRole[$key].Add([pscustomobject]@{ Group=($g.PrincipalName ?? 'group'); GroupId=$g.PrincipalId; State=$g.State }) | Out-Null
         }
     }
 
@@ -2743,16 +2857,18 @@ function Invoke-Check-AccessPaths {
     $dupRows = @()
     foreach ($key in $pathByUserRole.Keys) {
         $paths = @($pathByUserRole[$key])
-        $groups = @($paths.Group | Select-Object -Unique)
+        # De-duplicate by group ID (a group can appear once per assignment state); the
+        # same display name appearing twice then correctly signals two DISTINCT groups.
+        $uniqPaths = @($paths | Group-Object GroupId | ForEach-Object { $_.Group[0] })
         $parts = $key -split '\|', 2; $uid = $parts[0]; $rtid = $parts[1]
         $directS = if ($directKey.ContainsKey($key)) { $directKey[$key] } else { $null }
-        $pathCount = $groups.Count + [int]([bool]$directS)
+        $pathCount = $uniqPaths.Count + [int]([bool]$directS)
         if ($pathCount -le 1) { continue }
         $involvesActive = ($directS -eq 'Active') -or (@($paths | Where-Object { $_.State -eq 'Active' }).Count -gt 0)
         $activationModel = if ($involvesActive) { 'Active path' } else { 'Eligible-only' }
         $upn = if ($script:UserById.ContainsKey($uid)) { $script:UserById[$uid].UserPrincipalName } else { $uid }
         $dupRows += [pscustomobject]@{
-            User=$upn; Role=$script:PrivilegedRoleTemplates[$rtid]; ViaGroups=($groups -join ', ')
+            User=$upn; Role=$script:PrivilegedRoleTemplates[$rtid]; ViaGroups=(@($uniqPaths | ForEach-Object { $_.Group }) -join ', ')
             AlsoDirect=[bool]$directS; DirectState=$directS; ActivationModel=$activationModel; PathCount=$pathCount
         }
     }
@@ -2843,7 +2959,7 @@ function Invoke-Check-AccessPaths {
     # ones) can add themselves to the group and thereby exempt their own account.
     $caExcl = @{}   # groupId -> pscustomobject{ Policies=List; EnforcesMfa }
     try {
-        foreach ($p in @(Get-MgIdentityConditionalAccessPolicy -All -ErrorAction Stop | Where-Object { $_.State -eq 'enabled' })) {
+        foreach ($p in @(Get-EACaPolicies | Where-Object { $_.State -eq 'enabled' })) {
             $enforces = Test-CaPolicyRequiresMfaOrStrength $p
             foreach ($gid in @($p.Conditions.Users.ExcludeGroups)) {
                 if (-not $gid -or $gid -match 'All|GuestsOrExternalUsers|None') { continue }
@@ -3333,7 +3449,7 @@ th,td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}
 th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.12em;background:var(--panel-soft)}
 th[data-sort]{cursor:pointer;user-select:none}
 tr:hover td{background:var(--panel-soft)}
-td.score{font-weight:800}td.title{font-weight:700}
+td.title{font-weight:700}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
 td.source .mono{font-size:12px;color:var(--link)}
 .footer{margin-top:16px;color:var(--muted);font-size:12px}
@@ -3375,17 +3491,38 @@ function Get-EntraRiskJs {
 
 $script:RiskPoints = @{ Critical = 25; High = 10; Medium = 4; Low = 1; Information = 0 }
 
+# Risk bands, worst-first. Defined ONCE and used for both the band computation and the
+# matrix rendered in the Risk Report, so code and report can never drift apart.
+$script:RiskBands = @(
+    [pscustomobject]@{ Level='Critical'; Min=150; Meaning='Severe and/or broad exposure across multiple checks. Treat as a priority workstream with owners and timelines.' }
+    [pscustomobject]@{ Level='High';     Min=60;  Meaning='Significant exposure; prompt remediation with assigned owners.' }
+    [pscustomobject]@{ Level='Moderate'; Min=20;  Meaning='Material findings to remediate in the next hardening cycle.' }
+    [pscustomobject]@{ Level='Low';      Min=1;   Meaning='Minor issues; address during routine maintenance.' }
+    [pscustomobject]@{ Level='Clean';    Min=0;   Meaning='No risk-bearing findings (Information items only). Maintain and monitor.' }
+)
+
 function Get-EntraRiskScore($findings) {
-    $c = @($findings | Where-Object { (Normalize-Severity $_.Severity) -eq 'Critical' }).Count
-    $h = @($findings | Where-Object { (Normalize-Severity $_.Severity) -eq 'High' }).Count
-    $m = @($findings | Where-Object { (Normalize-Severity $_.Severity) -eq 'Medium' }).Count
-    $l = @($findings | Where-Object { (Normalize-Severity $_.Severity) -eq 'Low' }).Count
-    # ACCUMULATING risk: HIGHER = WORSE. Each finding adds points by severity, so VOLUME
-    # raises the score - 28 permanent Global Admins (28 Critical findings) scores far higher
-    # than 8. Unbounded on purpose, so magnitude is visible (200 vs 700).
-    $score = [int](($c * $script:RiskPoints.Critical) + ($h * $script:RiskPoints.High) + ($m * $script:RiskPoints.Medium) + ($l * $script:RiskPoints.Low))
-    $band = if ($score -ge 200) { 'Critical' } elseif ($score -ge 75) { 'High' } elseif ($score -ge 25) { 'Moderate' } elseif ($score -ge 1) { 'Low' } else { 'Clean' }
-    [pscustomobject]@{ Score = $score; Band = $band; Critical = $c; High = $h; Medium = $m; Low = $l }
+    # ACCUMULATING risk with DIMINISHING RETURNS: higher = worse. Findings are grouped
+    # into (check, severity) buckets and each bucket contributes points * sqrt(count),
+    # so volume still raises the score - 28 permanent Global Admins score well above 8
+    # (sqrt 28 vs sqrt 8) - but ONE systemic issue repeated across many objects can no
+    # longer dominate the whole score the way a straight per-finding sum did.
+    # Unbounded on purpose, so magnitude stays visible.
+    $counts = @{ Critical = 0; High = 0; Medium = 0; Low = 0; Information = 0 }
+    $buckets = @{}
+    foreach ($f in $findings) {
+        $sev = Normalize-Severity $f.Severity
+        $counts[$sev]++
+        if ($sev -eq 'Information') { continue }
+        $k = '{0}|{1}' -f [string]$f.CheckId, $sev
+        if ($buckets.ContainsKey($k)) { $buckets[$k].Count++ } else { $buckets[$k] = @{ Severity = $sev; Count = 1 } }
+    }
+    $raw = 0.0
+    foreach ($b in $buckets.Values) { $raw += $script:RiskPoints[$b.Severity] * [math]::Sqrt($b.Count) }
+    $score = [int][math]::Round($raw)
+    $band = 'Clean'
+    foreach ($bd in $script:RiskBands) { if ($score -ge $bd.Min) { $band = $bd.Level; break } }
+    [pscustomobject]@{ Score = $score; Band = $band; Critical = $counts.Critical; High = $counts.High; Medium = $counts.Medium; Low = $counts.Low; Information = $counts.Information }
 }
 
 # Higher score = worse, so map the risk band to the matching severity colour.
@@ -3547,14 +3684,15 @@ function Write-EntraRiskReport {
     param([string]$Path, [object[]]$Items, [hashtable]$Counts, [string]$TenantName, [string]$GeneratedOn, [pscustomobject]$Score, [hashtable]$Stats)
 
     $bandClass = Get-BandBadgeClass $Score.Band
-    # Higher score = worse. Ordered worst-first so the dangerous bands lead.
-    $bands = @(
-        [pscustomobject]@{ Level='Critical'; Range='200+';     Meaning='Severe and/or high-volume exposure (e.g. many permanent privileged admins). Treat as a priority workstream with owners and timelines.' }
-        [pscustomobject]@{ Level='High';     Range='75 - 199'; Meaning='Significant exposure; prompt remediation with assigned owners.' }
-        [pscustomobject]@{ Level='Moderate'; Range='25 - 74';  Meaning='Material findings to remediate in the next hardening cycle.' }
-        [pscustomobject]@{ Level='Low';      Range='1 - 24';   Meaning='Minor issues; address during routine maintenance.' }
-        [pscustomobject]@{ Level='Clean';    Range='0';        Meaning='No risk-bearing findings (Information items only). Maintain and monitor.' }
-    )
+    # Higher score = worse. Ranges derive from the single $script:RiskBands definition
+    # (worst-first), so this matrix always matches the thresholds the code applied.
+    $bands = for ($i = 0; $i -lt $script:RiskBands.Count; $i++) {
+        $b = $script:RiskBands[$i]
+        $range = if ($i -eq 0) { "$($b.Min)+" }
+                 elseif ($b.Min -eq ($script:RiskBands[$i-1].Min - 1)) { "$($b.Min)" }
+                 else { "$($b.Min) - $($script:RiskBands[$i-1].Min - 1)" }
+        [pscustomobject]@{ Level=$b.Level; Range=$range; Meaning=$b.Meaning }
+    }
     $matrixRows = foreach ($b in $bands) {
         $cls = if ($b.Level -eq $Score.Band) { "matrix-row active sev-$(Get-BandBadgeClass $b.Level)" } else { "matrix-row sev-$(Get-BandBadgeClass $b.Level)" }
         "<tr class='$cls'><td><span class='pill sev-$(Get-BandBadgeClass $b.Level)'>$($b.Level)</span></td><td class='mono'>$($b.Range)</td><td>$(HtmlEncode $b.Meaning)</td></tr>"
@@ -3579,7 +3717,11 @@ function Write-EntraRiskReport {
     $catRows = foreach ($cg in $catGroups) {
         $cc=@($cg.Group|?{$_.Severity -eq 'Critical'}).Count; $ch=@($cg.Group|?{$_.Severity -eq 'High'}).Count
         $cm=@($cg.Group|?{$_.Severity -eq 'Medium'}).Count; $cl=@($cg.Group|?{$_.Severity -eq 'Low'}).Count
-        "<tr><td>$(HtmlEncode $cg.Name)</td><td style='text-align:center'>$(if($cc){"<span class='pill sev-Critical'>$cc</span>"}else{'-'})</td><td style='text-align:center'>$(if($ch){"<span class='pill sev-High'>$ch</span>"}else{'-'})</td><td style='text-align:center'>$(if($cm){"<span class='pill sev-Medium'>$cm</span>"}else{'-'})</td><td style='text-align:center'>$(if($cl){"<span class='pill sev-Low'>$cl</span>"}else{'-'})</td><td style='text-align:center;font-weight:700'>$($cg.Count)</td></tr>"
+        # Total counts only the four risk columns shown - Information findings have no
+        # column here, and including them made rows appear not to sum.
+        $ct = $cc + $ch + $cm + $cl
+        if ($ct -eq 0) { continue }   # Information-only category: nothing risk-scored to show
+        "<tr><td>$(HtmlEncode $cg.Name)</td><td style='text-align:center'>$(if($cc){"<span class='pill sev-Critical'>$cc</span>"}else{'-'})</td><td style='text-align:center'>$(if($ch){"<span class='pill sev-High'>$ch</span>"}else{'-'})</td><td style='text-align:center'>$(if($cm){"<span class='pill sev-Medium'>$cm</span>"}else{'-'})</td><td style='text-align:center'>$(if($cl){"<span class='pill sev-Low'>$cl</span>"}else{'-'})</td><td style='text-align:center;font-weight:700'>$ct</td></tr>"
     }
 
     $css = Get-EntraRiskCss
@@ -3633,7 +3775,7 @@ $nav
   <div class="section">
     <h2>Interpretation</h2>
     <div class="callout">
-      <p><b>Score:</b> the report ADDS points per finding by severity (Critical 25, High 10, Medium 4, Low 1; Information 0) and sums them, so <b>a higher score is worse</b> and <b>volume increases it</b> - 28 permanent Global Admins score far higher than 8. The score is unbounded. The current score is <b>$($Score.Score)</b> (<b>$($Score.Band)</b>).</p>
+      <p><b>Score:</b> each finding adds points by severity (Critical $($script:RiskPoints.Critical), High $($script:RiskPoints.High), Medium $($script:RiskPoints.Medium), Low $($script:RiskPoints.Low); Information $($script:RiskPoints.Information)), with <b>diminishing returns for repeats of the same issue</b>: findings are grouped per check and severity, and each group contributes points &times; &radic;count. So <b>a higher score is worse</b> and volume still raises it (28 permanent Global Admins score well above 8), but one systemic issue repeated across many objects cannot drown out every other signal. The score is unbounded. The current score is <b>$($Score.Score)</b> (<b>$($Score.Band)</b>).</p>
       <div class="matrix-wrap"><br>
         <table class="matrix"><thead><tr><th>Band</th><th>Score range</th><th>Interpretation</th></tr></thead><tbody>$($matrixRows -join "`n")</tbody></table>
       </div>
@@ -3643,6 +3785,7 @@ $nav
   <div class="section">
     <h2>Findings by category</h2>
     <table><thead><tr><th style="text-align:left">Category</th><th style="text-align:center">Critical</th><th style="text-align:center">High</th><th style="text-align:center">Medium</th><th style="text-align:center">Low</th><th style="text-align:center">Total</th></tr></thead><tbody>$($catRows -join "`n")</tbody></table>
+    <div style="margin-top:6px"><small>Information-level findings carry no points and are excluded from this table.</small></div>
   </div>
 
   <div class="section">
@@ -3919,9 +4062,10 @@ function Invoke-EntraAudit {
     # Build reports
     Write-Host ""
     Write-Info "Generating reports..."
-    $counts = @{ Critical=0; High=0; Medium=0; Low=0; Information=0 }
-    foreach ($f in $script:Findings) { $counts[(Normalize-Severity $f.Severity)]++ }
+    # Get-EntraRiskScore normalizes and counts every severity in one pass - reuse its
+    # counts so the report cards and the score can never disagree.
     $score = Get-EntraRiskScore $script:Findings
+    $counts = @{ Critical=$score.Critical; High=$score.High; Medium=$score.Medium; Low=$score.Low; Information=$score.Information }
     $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss K'
 
     $stats = @{

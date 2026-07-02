@@ -68,7 +68,7 @@ Results are written to a tenant-named, timestamped folder (mirrors the AD audit 
 <TenantName>-EntraAudit-<yyyyMMdd-HHmm>\
    HTML Reports\
       EntraAudit-Results.html           # all findings, grouped by severity, filterable
-      Risk-Report.html                  # executive additive risk score (unbounded, higher = worse), band matrix, top risks
+      Risk-Report.html                  # executive risk score (unbounded, higher = worse, diminishing returns per issue), band matrix, top risks
       Posture-Summary.html              # per-check status grid + licensing/coverage
       Raw-Data.html                     # index of every raw dataset (HTML/CSV/TXT links)
    Raw Data\Source\
@@ -196,9 +196,9 @@ Unattended (app-only, certificate), don't open a browser window:
 
 ## How the risk score works
 
-The Risk-Report **accumulates** points per finding by severity and sums them, so **a higher score is worse** and **volume increases it** — 28 permanent Global Admins (28 Critical findings) score far higher than 8. The score is **unbounded**, so the magnitude is visible (e.g. 200 vs 700).
+The Risk-Report **accumulates** points per finding by severity, with **diminishing returns for repeats of the same issue**: findings are grouped into *(check, severity)* buckets and each bucket contributes **points × √count**. So **a higher score is worse** and volume still raises it — 28 permanent Global Admins (28 Critical findings in one bucket) score well above 8 (`25×√28 ≈ 132` vs `25×√8 ≈ 71`) — but one systemic issue repeated across many objects can no longer drown out every other signal the way a straight per-finding sum did. The score is **unbounded**, so the magnitude stays visible.
 
-| Severity | Points each |
+| Severity | Points (per bucket, × √count) |
 |---|---|
 | Critical | 25 |
 | High | 10 |
@@ -209,10 +209,12 @@ The Risk-Report **accumulates** points per finding by severity and sums them, so
 | Score | Band |
 |---|---|
 | 0 | Clean |
-| 1–24 | Low |
-| 25–74 | Moderate |
-| 75–199 | High |
-| 200+ | Critical |
+| 1–19 | Low |
+| 20–59 | Moderate |
+| 60–149 | High |
+| 150+ | Critical |
+
+Severity for standing role assignments is also **tiered by role**: tier-0 roles (Global Administrator, Privileged Role Administrator, Privileged Authentication Administrator) and guest-held roles are **Critical**; every other privileged role caps at **High**, with the risk factors (service-principal/group principal, not MFA-capable, on-prem synced) recorded on the finding instead of inflating its severity.
 
 ---
 
