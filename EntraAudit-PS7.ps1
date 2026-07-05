@@ -87,10 +87,10 @@ param(
     # ---- Tuning ----
     [string]$OutputRoot,
     [string[]]$BreakGlassUpns,
-    [int]$InactiveDays = 90,
-    [int]$ExpiringCredentialDays = 30,
-    [int]$RecentChangeDays = 30,
-    [int]$StaleAppDays = 90,
+    [ValidateRange(1, 3650)][int]$InactiveDays = 90,
+    [ValidateRange(1, 3650)][int]$ExpiringCredentialDays = 30,
+    [ValidateRange(1, 3650)][int]$RecentChangeDays = 30,
+    [ValidateRange(1, 3650)][int]$StaleAppDays = 90,
     [string]$ModulesPath,       # offline: folder containing Save-Module output
     [switch]$NoLaunch           # do not open the report when finished
 )
@@ -128,6 +128,9 @@ $script:ScopesRO = @(
     'RoleManagementPolicy.Read.Directory'
     'Member.Read.Hidden'
 )
+
+# Supported Microsoft Graph SDK major version - the single line to bump for SDK v3.
+$script:GraphModuleMajor = 2
 
 $script:RequiredModules = @(
     'Microsoft.Graph.Authentication'
@@ -188,15 +191,19 @@ $script:DangerousAppPermissions = @(
 $script:Findings    = New-Object System.Collections.Generic.List[object]
 $script:CheckStatus = [ordered]@{}
 $script:AuthType    = 'Delegated'
+$script:GraphConnectedByScript = $false   # only disconnect sessions this script created
 $script:HasP1       = $false
 $script:HasP2       = $false
+$script:LicenseKnown = $true              # false when the SKU read itself failed (license UNKNOWN, not absent)
 $script:WorkloadIdP = $false
 $script:Tenant      = $null
 $script:UsersCache  = $null
 $script:UsersCacheHasSignIn = $false   # whether $UsersCache was fetched WITH signInActivity
+$script:SignInFetchError = $null       # remembered failure of the signInActivity superset fetch
 $script:UserById    = @{}
 $script:RegCache    = $null
 $script:AppsCache   = $null
+$script:SpsCache    = $null
 $script:MfaCapableById = @{}
 $script:RoleDefById = @{}
 $script:RawDatasets = New-Object System.Collections.Generic.List[object]
@@ -268,15 +275,23 @@ function Resolve-CheckIds {
     @($out | Select-Object -Unique)
 }
 
+# Stable rule discriminator for TREND IDS: an explicit RuleId when set, else a
+# digit-stripped title slug so a changing COUNT ("5 stale users" -> "7") does not change
+# the id. (The risk score buckets similarly but additionally strips per-object title
+# suffixes - see Get-EntraRiskScore - so ids stay per-object while scoring is per-issue.)
+function Get-FindingRule {
+    param([object]$Finding)
+    if ($Finding.RuleId) { return [string]$Finding.RuleId }
+    (([string]$Finding.Title -replace '\d+','') -replace '[^A-Za-z]+','-').Trim('-').ToLowerInvariant()
+}
+
 # Stable finding key: strip digits from the title so a changing COUNT
 # ("5 stale users" -> "7 stale users") does not change the id; the rule slug plus the
 # affected object identify the finding across runs (for new/resolved/trend comparison).
 function New-FindingKey {
     param([string]$TenantId, [object]$Finding)
     $checkId = [string]$Finding.CheckId
-    # Stable rule discriminator: an explicit RuleId when set, else a digit-stripped title slug
-    # so a changing COUNT ("5 stale users" -> "7") does not change the id.
-    $rule = if ($Finding.RuleId) { $Finding.RuleId } else { (([string]$Finding.Title -replace '\d+','') -replace '[^A-Za-z]+','-').Trim('-').ToLowerInvariant() }
+    $rule = Get-FindingRule $Finding
     $objType = if ($Finding.ObjectType) { [string]$Finding.ObjectType } else { '' }
     $objId = if ($Finding.ObjectId) { $Finding.ObjectId } elseif ($Finding.AffectedPrincipal) { $Finding.AffectedPrincipal } else { 'tenant' }
     $path = if ($Finding.PathHash) { [string]$Finding.PathHash } else { '' }
@@ -303,15 +318,21 @@ function Get-EAUserScopeIds {
     if ($script:UserScopeCache.ContainsKey($UserId)) { return $script:UserScopeCache[$UserId] }
     $gids = New-Object System.Collections.Generic.HashSet[string]
     $rtids = New-Object System.Collections.Generic.HashSet[string]
+    # Surface fetch failures and do NOT cache them - a silently-cached empty scope would
+    # make every later CA-applicability answer for this user wrong for the whole run.
+    $ok = $true
     try {
-        foreach ($m in @(Get-MgUserTransitiveMemberOf -UserId $UserId -All -ErrorAction SilentlyContinue)) {
+        foreach ($m in @(Get-MgUserTransitiveMemberOf -UserId $UserId -All -ErrorAction Stop)) {
             $t = [string](Get-Ap $m '@odata.type')
             if ($t -eq '#microsoft.graph.group') { [void]$gids.Add($m.Id) }
             elseif ($t -eq '#microsoft.graph.directoryRole') { $rt = Get-Ap $m 'roleTemplateId'; if ($rt) { [void]$rtids.Add([string]$rt) } }
         }
-    } catch {}
+    } catch {
+        $ok = $false
+        Write-Warn2 "  Could not resolve memberships for user $UserId ($($_.Exception.Message)) - CA applicability may be incomplete."
+    }
     $r = [pscustomobject]@{ Groups = $gids; Roles = $rtids }
-    $script:UserScopeCache[$UserId] = $r
+    if ($ok) { $script:UserScopeCache[$UserId] = $r }
     return $r
 }
 
@@ -369,6 +390,9 @@ function Add-EntraFinding {
     )
     $Severity = Normalize-Severity $Severity
     $script:Findings.Add([pscustomobject]@{
+        # Unique per finding (index prefix): two findings sharing Title+CheckId would
+        # otherwise collide on the same HTML id and break index/priority anchors.
+        Anchor            = ('finding-{0}-{1}' -f $script:Findings.Count, (New-Slug ('{0}-{1}' -f $Title, $CheckId)))
         Severity          = $Severity
         Title             = $Title
         Category          = $Category
@@ -434,13 +458,14 @@ function Write-Evidence {
         $header += ('Rows: {0}' -f $count); $header += ''
 
         if ($Rows -and $count -gt 0) {
-            ConvertTo-SafeCsvRows $Rows | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+            # utf8BOM: Excel misdecodes BOM-less UTF-8 CSVs with non-ASCII names/UPNs
+            ConvertTo-SafeCsvRows $Rows | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8BOM
             $table = @($Rows) | Format-Table -AutoSize | Out-String -Width 4096
             Set-Content -LiteralPath $txtPath -Value (($header -join "`r`n") + "`r`n" + $table) -Encoding UTF8
         } else {
             # Always write the CSV (even with no rows) so automation can rely on the file
             # existing and can distinguish "pass / no data" from "CSV generation failed".
-            [pscustomobject]@{ Status = 'NoData'; Message = 'No rows returned for this check.' } | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+            [pscustomobject]@{ Status = 'NoData'; Message = 'No rows returned for this check.' } | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8BOM
             $header += '(no matching objects)'
             Set-Content -LiteralPath $txtPath -Value ($header -join "`r`n") -Encoding UTF8
         }
@@ -492,9 +517,13 @@ function Install-EntraModules {
             Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
         }
         foreach ($m in $script:RequiredModules) {
-            if (Get-Module -ListAvailable -Name $m) { Write-Good "$m already installed."; continue }
+            # Pin to the supported major so a fresh -installdeps cannot mix majors
+            # (Assert-GraphModuleVersions would otherwise fail right after installing).
+            $existing = Get-Module -ListAvailable -Name $m | Sort-Object Version -Descending | Select-Object -First 1
+            if ($existing -and $existing.Version.Major -eq $script:GraphModuleMajor) { Write-Good "$m already installed ($($existing.Version))."; continue }
             Write-Info "Installing $m ..."
-            Install-Module -Name $m -Scope CurrentUser -Force -AllowClobber -Repository PSGallery -ErrorAction Stop
+            Install-Module -Name $m -Scope CurrentUser -Force -AllowClobber -Repository PSGallery `
+                -MinimumVersion "$($script:GraphModuleMajor).0.0" -MaximumVersion "$($script:GraphModuleMajor).999.999" -ErrorAction Stop
             Write-Good "$m installed."
         }
         Assert-GraphModuleVersions
@@ -507,15 +536,26 @@ function Install-EntraModules {
     }
 }
 
-function Import-EntraModules {
+# Prepend the offline modules folder to PSModulePath (idempotent). Called before BOTH
+# install and import so `-installdeps -ModulesPath <x>` sees the offline modules and
+# does not needlessly download from the gallery.
+function Add-EAOfflineModulesPath {
     if ($ModulesPath -and (Test-Path $ModulesPath)) {
-        $env:PSModulePath = (Resolve-Path $ModulesPath).Path + [IO.Path]::PathSeparator + $env:PSModulePath
-        Write-Info "Prepended offline modules path: $ModulesPath"
+        $resolved = (Resolve-Path $ModulesPath).Path
+        if (-not (($env:PSModulePath -split [IO.Path]::PathSeparator) -contains $resolved)) {
+            $env:PSModulePath = $resolved + [IO.Path]::PathSeparator + $env:PSModulePath
+            Write-Info "Prepended offline modules path: $ModulesPath"
+        }
     }
+}
+
+function Import-EntraModules {
+    Add-EAOfflineModulesPath
     $missing = @()
     foreach ($m in $script:RequiredModules) {
         if (-not (Get-Module -ListAvailable -Name $m)) { $missing += $m; continue }
-        try { Import-Module $m -ErrorAction Stop } catch { $missing += $m }
+        try { Import-Module $m -ErrorAction Stop }
+        catch { $missing += $m; Write-Warn2 "Module $m is installed but failed to import: $($_.Exception.Message)" }
     }
     if ($missing.Count -gt 0) {
         throw "Required module(s) not available: $($missing -join ', '). Run with -installdeps (online) or see PREREQUISITE.md for offline install."
@@ -528,12 +568,18 @@ function Import-EntraModules {
 function Connect-EntraAuditGraph {
     Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 
+    # Half an app-only pair must not silently fall back to an interactive prompt -
+    # that surprises unattended runs and signs in as the wrong identity.
+    if (([bool]$ClientId) -ne ([bool]$CertificateThumbprint)) {
+        throw 'App-only authentication requires BOTH -ClientId and -CertificateThumbprint; only one was supplied. Provide both for unattended runs, or neither for interactive sign-in.'
+    }
     $appOnly = ($ClientId -and $CertificateThumbprint)
     if ($appOnly) {
         Write-Info "Connecting to Microsoft Graph (app-only, certificate)..."
         $cp = @{ ClientId = $ClientId; CertificateThumbprint = $CertificateThumbprint; NoWelcome = $true }
         if ($TenantId) { $cp.TenantId = $TenantId }
         Connect-MgGraph @cp -ErrorAction Stop
+        $script:GraphConnectedByScript = $true
         $script:AuthType = 'AppOnly'
     } else {
         Write-Info "Connecting to Microsoft Graph (interactive, read-only scopes)..."
@@ -548,6 +594,7 @@ function Connect-EntraAuditGraph {
             $cp.UseDeviceCode = $true
             Connect-MgGraph @cp -ErrorAction Stop
         }
+        $script:GraphConnectedByScript = $true
         $script:AuthType = 'Delegated'
     }
 
@@ -557,7 +604,10 @@ function Connect-EntraAuditGraph {
     # --- READ-ONLY SELF-CHECK: refuse to run if any write/action scope is present ---
     # Match true write/action tokens only. Deliberately NOT bare 'Manage' - it is a substring
     # of the legitimate read scope 'RoleManagement(Policy).Read.Directory' and would abort every run.
-    $bad = @($ctx.Scopes | Where-Object { $_ -match '(?i)(ReadWrite|\.Write\b|\.Send\b|\.Create\b|\.Delete\b|\.Update\b|\.Invite\b|ManageAsApp|AccessAsUser|FullControl|full_access|Impersonation)' })
+    # '\.Manage' (dot-prefixed, no \b so fused forms like User.ManageIdentities.All match)
+    # and 'PrivilegedOperations' close write-capable scopes the older list missed
+    # (Sites.Manage.All, DeviceManagementManagedDevices.PrivilegedOperations.All).
+    $bad = @($ctx.Scopes | Where-Object { $_ -match '(?i)(ReadWrite|\.Write\b|\.Send\b|\.Create\b|\.Delete\b|\.Update\b|\.Invite\b|\.Manage|PrivilegedOperations|ManageAsApp|AccessAsUser|FullControl|full_access|Impersonation)' })
     if ($bad.Count -gt 0) {
         try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
         throw "Refusing to run: a non-read-only scope was granted -> $($bad -join ', '). This tool is read-only; reconnect with only *.Read.* scopes."
@@ -645,14 +695,18 @@ function Invoke-AuditCheck {
         $script:CheckStatus[$CheckId] = [pscustomobject]@{ Title=$Title; Status='Skipped-NoScope'; Count=0 }
         return
     }
+    # When the SKU read itself failed the license state is UNKNOWN - report that
+    # distinctly instead of a false 'NoLicense' (the tenant may well be licensed).
     if ($NeedP1 -and -not $script:HasP1) {
-        $script:CheckStatus[$CheckId] = [pscustomobject]@{ Title=$Title; Status='Skipped-NoLicense'; Count=0 }
-        Write-Warn2 "  $Title -> Skipped-NoLicense (Entra ID P1 required)"
+        $status = if ($script:LicenseKnown) { 'Skipped-NoLicense' } else { 'Skipped-LicenseUnknown' }
+        $script:CheckStatus[$CheckId] = [pscustomobject]@{ Title=$Title; Status=$status; Count=0 }
+        Write-Warn2 "  $Title -> $status (Entra ID P1 required)"
         return
     }
     if ($NeedP2 -and -not $script:HasP2) {
-        $script:CheckStatus[$CheckId] = [pscustomobject]@{ Title=$Title; Status='Skipped-NoLicense'; Count=0 }
-        Write-Warn2 "  $Title -> Skipped-NoLicense (Entra ID P2 required)"
+        $status = if ($script:LicenseKnown) { 'Skipped-NoLicense' } else { 'Skipped-LicenseUnknown' }
+        $script:CheckStatus[$CheckId] = [pscustomobject]@{ Title=$Title; Status=$status; Count=0 }
+        Write-Warn2 "  $Title -> $status (Entra ID P2 required)"
         return
     }
 
@@ -685,13 +739,19 @@ function Invoke-AuditCheck {
 # Cached data shared across checks
 # ===========================================================================
 function Get-EAUsers {
-    # signInActivity is opt-in: it requires AuditLog.Read.All AND Entra ID P1/P2, and
-    # requesting the property without the licence can fail the whole Get-MgUser call,
-    # breaking checks (accounts/guests/privroles) that do not even need sign-in data.
-    # Only the stale-users and break-glass checks pass -IncludeSignInActivity.
+    # The property set is decided by the LICENSE/SCOPE GATE, not the caller switch: when
+    # P1 + AuditLog.Read.All are present the very first fetch already includes
+    # signInActivity, so later sign-in callers (staleusers/breakglass) hit the cache
+    # instead of re-downloading the entire directory a second time. If the superset
+    # fetch fails anyway (app-only without the AuditLog app permission - Test-MgScope
+    # cannot see that), the failure is remembered: base callers degrade once to the
+    # plain property set, sign-in callers keep today's throw/Skipped-NoPermission path.
+    # -IncludeSignInActivity remains for call-site compatibility.
     param([switch]$IncludeSignInActivity)
 
-    $wantSignIn = $IncludeSignInActivity -and $script:HasP1 -and (Test-MgScope @('AuditLog.Read.All') -Quiet)
+    $gateSignIn = $script:HasP1 -and (Test-MgScope @('AuditLog.Read.All') -Quiet)
+    if ($IncludeSignInActivity -and $gateSignIn -and $script:SignInFetchError) { throw $script:SignInFetchError }
+    $wantSignIn = $gateSignIn -and -not $script:SignInFetchError
 
     # Serve from cache when the cached population already satisfies the request. The
     # sign-in variant is a superset of properties, so a base caller can reuse it freely.
@@ -705,10 +765,20 @@ function Get-EAUsers {
                'AssignedLicenses','LicenseAssignmentStates','PasswordPolicies',
                'OnPremisesSyncEnabled','CreatedDateTime',
                'ExternalUserState','ExternalUserStateChangeDateTime')
-    if ($wantSignIn) { $props += 'SignInActivity' }
-
-    $script:UsersCache = @(Get-MgUser -All -Property $props -ErrorAction Stop)
-    $script:UsersCacheHasSignIn = $wantSignIn
+    if ($wantSignIn) {
+        try {
+            $script:UsersCache = @(Get-MgUser -All -Property ($props + 'SignInActivity') -ErrorAction Stop)
+            $script:UsersCacheHasSignIn = $true
+        } catch {
+            $script:SignInFetchError = $_.Exception
+            if ($IncludeSignInActivity) { throw }   # sign-in caller: same failure path as before
+            $script:UsersCache = @(Get-MgUser -All -Property $props -ErrorAction Stop)   # base caller: degrade once
+            $script:UsersCacheHasSignIn = $false
+        }
+    } else {
+        $script:UsersCache = @(Get-MgUser -All -Property $props -ErrorAction Stop)
+        $script:UsersCacheHasSignIn = $false
+    }
     $script:UserById = @{}
     foreach ($u in $script:UsersCache) { if ($u.Id) { $script:UserById[$u.Id] = $u } }
     return $script:UsersCache
@@ -736,8 +806,19 @@ function Get-EARoleDefMap {
 function Get-EAApplications {
     if ($null -ne $script:AppsCache) { return $script:AppsCache }
     $appProps = 'id,appId,displayName,passwordCredentials,keyCredentials,signInAudience,verifiedPublisher,createdDateTime'
-    $script:AppsCache = @(Get-MgApplication -All -Property $appProps -ErrorAction Stop)
+    # owners expanded (ids only) in the same enumeration: the apps check tests only
+    # "has NO owner", which would otherwise cost one Graph call per credentialed app.
+    $script:AppsCache = @(Get-MgApplication -All -Property $appProps -ExpandProperty 'owners($select=id)' -ErrorAction Stop)
     return $script:AppsCache
+}
+
+# Service principals with the union of the properties the apps and staleapps checks
+# need, cached so a full -all run enumerates the (potentially huge) SP list once.
+function Get-EAServicePrincipals {
+    if ($null -ne $script:SpsCache) { return $script:SpsCache }
+    $spProps = 'id,appId,displayName,appRoles,servicePrincipalType,accountEnabled,passwordCredentials,keyCredentials,appOwnerOrganizationId'
+    $script:SpsCache = @(Get-MgServicePrincipal -All -Property $spProps -ErrorAction Stop)
+    return $script:SpsCache
 }
 
 # Conditional Access policies, cached - four checks (tenantposture, capolicies,
@@ -759,9 +840,10 @@ function Invoke-Check-TenantInfo {
     $skus = @(Get-MgSubscribedSku -All -ErrorAction SilentlyContinue)
 
     $verified = @($org.VerifiedDomains | ForEach-Object { "$($_.Name)$(if($_.IsDefault){' (default)'})$(if($_.Type -eq 'Federated'){' [FEDERATED]'})" })
-    $techMails = @($org.TechnicalNotificationMails)
+    # Filter empties: @($null) has Count 1, which would hide the "not configured" finding.
+    $techMails = @($org.TechnicalNotificationMails | Where-Object { $_ })
     $secMails  = @()
-    try { $secMails = @($org.SecurityComplianceNotificationMails) } catch {}
+    try { $secMails = @($org.SecurityComplianceNotificationMails | Where-Object { $_ }) } catch {}
 
     $rows = @()
     $rows += [pscustomobject]@{ Property='Tenant';            Value=$org.DisplayName }
@@ -881,6 +963,7 @@ function Invoke-Check-PrivRoles {
     }
 
     # --- Fallback: classic roleAssignments when PIM is not in use/licensed ---
+    $fetchErr = $null
     if (-not $pimAvailable -or $assignments.Count -eq 0) {
         try {
             foreach ($a in @(Get-MgRoleManagementDirectoryRoleAssignment -All -ExpandProperty Principal -ErrorAction Stop)) {
@@ -894,28 +977,40 @@ function Invoke-Check-PrivRoles {
                 })
             }
         } catch {
-            # last resort: classic directoryRoles + members
-            foreach ($dr in @(Get-MgDirectoryRole -All -ErrorAction SilentlyContinue)) {
-                $ri = _RoleInfo $dr.RoleTemplateId
-                foreach ($m in @(Get-MgDirectoryRoleMember -DirectoryRoleId $dr.Id -All -ErrorAction SilentlyContinue)) {
-                    $pr = _Principal $m
-                    $assignments.Add([pscustomobject]@{
-                        PrincipalId=$pr.Id; Principal=($pr.Upn ?? $pr.Name); PrincipalType=$pr.Type
-                        Role=$ri.Name; RoleTemplateId=$ri.TemplateId; IsPrivileged=$ri.IsPrivileged; IsGA=$ri.IsGA
-                        State='Permanent'; EndDateTime=$null; MemberType='Direct'; AssignmentType='Assigned'
-                        DirectoryScopeId='/'; Synced=$pr.Synced; MfaCapable=$pr.MfaCapable
-                    })
+            $fetchErr = $_
+            # last resort: classic directoryRoles + members (errors recorded, not hidden -
+            # a failed fetch must surface as Error/Skipped, never as a clean 'Pass')
+            try {
+                foreach ($dr in @(Get-MgDirectoryRole -All -ErrorAction Stop)) {
+                    $ri = _RoleInfo $dr.RoleTemplateId
+                    foreach ($m in @(Get-MgDirectoryRoleMember -DirectoryRoleId $dr.Id -All -ErrorAction Stop)) {
+                        $pr = _Principal $m
+                        $assignments.Add([pscustomobject]@{
+                            PrincipalId=$pr.Id; Principal=($pr.Upn ?? $pr.Name); PrincipalType=$pr.Type
+                            Role=$ri.Name; RoleTemplateId=$ri.TemplateId; IsPrivileged=$ri.IsPrivileged; IsGA=$ri.IsGA
+                            State='Permanent'; EndDateTime=$null; MemberType='Direct'; AssignmentType='Assigned'
+                            DirectoryScopeId='/'; Synced=$pr.Synced; MfaCapable=$pr.MfaCapable
+                        })
+                    }
                 }
-            }
+                $fetchErr = $null
+            } catch { if (-not $fetchErr) { $fetchErr = $_ } }
         }
     }
 
     # De-duplicate (PrincipalId, RoleTemplateId, DirectoryScopeId, State)
     $seen = New-Object System.Collections.Generic.HashSet[string]
-    $rows = @()
-    foreach ($a in $assignments) {
+    $rows = @(foreach ($a in $assignments) {
         $k = '{0}|{1}|{2}|{3}' -f $a.PrincipalId,$a.RoleTemplateId,$a.DirectoryScopeId,$a.State
-        if ($seen.Add($k)) { $rows += $a }
+        if ($seen.Add($k)) { $a }
+    })
+
+    # Every real tenant has at least one active role assignment - an EMPTY result with
+    # every fetch failed is "UNKNOWN", not "no standing admins". Throw so Invoke-AuditCheck
+    # classifies the check Error/Skipped-NoPermission instead of a false clean 'Pass'.
+    if ($rows.Count -eq 0 -and -not $pimAvailable) {
+        if ($fetchErr) { throw $fetchErr }
+        throw "Privileged role assignments could not be retrieved from any endpoint (PIM, classic roleAssignments, directoryRoles) - result is UNKNOWN, not clean."
     }
 
     $src = Write-Evidence -BaseName 'privileged_roles' -Rows $rows `
@@ -925,6 +1020,15 @@ function Invoke-Check-PrivRoles {
     $bg = Normalize-StringList -Values $BreakGlassUpns
     $permanentPriv = @($rows | Where-Object { $_.IsPrivileged -and $_.State -eq 'Permanent' })
     $permanentGA   = @($permanentPriv | Where-Object { $_.IsGA })
+
+    # Index rows by principal once - re-scanning all rows per permanent assignment is
+    # O(n*m) with hundreds of standing assignments (the systemic case this check exists for).
+    $rowsByPrincipal = @{}
+    foreach ($r in $rows) {
+        $pid0 = [string]$r.PrincipalId
+        if (-not $rowsByPrincipal.ContainsKey($pid0)) { $rowsByPrincipal[$pid0] = New-Object System.Collections.Generic.List[object] }
+        $rowsByPrincipal[$pid0].Add($r) | Out-Null
+    }
 
     # Per-assignment findings for permanent privileged roles
     foreach ($a in $permanentPriv) {
@@ -940,7 +1044,7 @@ function Invoke-Check-PrivRoles {
                 -WhyItMatters 'Emergency-access accounts should be minimal and predictable. Extra standing roles increase blast radius and make exception handling (CA exclusions, monitoring, credential storage) unclear.' `
                 -RecommendedAction 'Keep the break-glass account permanent only for Global Administrator unless there is a documented recovery requirement for the extra role.' `
                 -SourceFile $src -AffectedPrincipal $a.Principal -ObjectType $a.PrincipalType -ObjectId $a.PrincipalId `
-                -ResultRows @($rows | Where-Object { $_.PrincipalId -eq $a.PrincipalId })
+                -ResultRows @($rowsByPrincipal[[string]$a.PrincipalId])
             continue
         }
 
@@ -967,7 +1071,7 @@ function Invoke-Check-PrivRoles {
             -WhyItMatters 'Standing privileged access is the largest cloud attack surface - the credential is always active. PIM-eligible (just-in-time) access is the target posture; permanent high-value roles, synced admins, and SP/guest admins defeat the boundaries PIM enforces.' `
             -RecommendedAction 'Convert this assignment to PIM-eligible (JIT) and remove the standing grant. Keep only two cloud-only break-glass Global Admins permanent. Require phishing-resistant MFA on every privileged principal.' `
             -SourceFile $src -AffectedPrincipal $a.Principal -ObjectType $a.PrincipalType -ObjectId $a.PrincipalId `
-            -ResultRows @($rows | Where-Object { $_.PrincipalId -eq $a.PrincipalId })
+            -ResultRows @($rowsByPrincipal[[string]$a.PrincipalId])
     }
 
     # Redundant: principal is BOTH eligible AND permanently active for the same role
@@ -1023,10 +1127,16 @@ function Invoke-Check-PrivRoles {
 function Invoke-Check-DirectoryRoles {
     Get-EARoleDefMap | Out-Null
     $rows = @()
-    $active = @()
-    try { $active += @(Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -All -ExpandProperty Principal -ErrorAction Stop) } catch {}
-    if ($active.Count -eq 0) {
-        try { $active += @(Get-MgRoleManagementDirectoryRoleAssignment -All -ExpandProperty Principal -ErrorAction SilentlyContinue) } catch {}
+    # Shared assignment cache (one Graph download per run instead of a private re-fetch).
+    $active = @((Get-EAPrivAssignments) | Where-Object { $_.State -eq 'Active' })
+    if ($active.Count -eq 0 -and $script:PrivAssignmentsFailed) {
+        # Both role-assignment fetches failed - the volume is UNKNOWN, not confirmed low.
+        Add-EntraFinding -Severity 'Information' -CheckId 'directory-roles' -Category 'Privileged Access' `
+            -Title 'Privileged role assignment volume could not be evaluated' `
+            -Evidence 'Both role-assignment fetches failed - Global Admin and privileged-assignment volume is unknown, not confirmed low.' `
+            -WhyItMatters 'A failed fetch must not be reported as a low-admin-count pass; the volume was not assessed.' `
+            -RecommendedAction 'Re-run the directory-roles check; verify Graph connectivity/throttling and the RoleManagement.Read.Directory permission.'
+        return
     }
 
     # Key by role TEMPLATE id (not display name, which can be localized/renamed) so the
@@ -1034,12 +1144,10 @@ function Invoke-Check-DirectoryRoles {
     $byRole = @{}        # templateId -> HashSet[principalId]
     $roleName = @{}      # templateId -> display name
     foreach ($a in $active) {
-        $rd = $script:RoleDefById[$a.RoleDefinitionId]
-        $tmpl = if ($rd) { $rd.TemplateId } else { $a.RoleDefinitionId }
-        $roleName[$tmpl] = if ($rd) { $rd.DisplayName } else { $a.RoleDefinitionId }
+        $tmpl = $a.RoleTemplateId
+        $roleName[$tmpl] = $a.RoleName
         if (-not $byRole.ContainsKey($tmpl)) { $byRole[$tmpl] = [System.Collections.Generic.HashSet[string]]::new() }
-        $prinId = if ($a.PrincipalId) { $a.PrincipalId } elseif ($a.Principal) { $a.Principal.Id } else { $null }
-        if ($prinId) { [void]$byRole[$tmpl].Add($prinId) }
+        if ($a.PrincipalId) { [void]$byRole[$tmpl].Add($a.PrincipalId) }
     }
     foreach ($tmpl in ($byRole.Keys | Sort-Object { $roleName[$_] })) {
         $rows += [pscustomobject]@{ Role=$roleName[$tmpl]; DistinctPrincipals=$byRole[$tmpl].Count; Privileged=$script:PrivilegedRoleTemplates.ContainsKey($tmpl) }
@@ -1150,12 +1258,9 @@ function Invoke-Check-StaleUsers {
     $users = Get-EAUsers -IncludeSignInActivity
 
     # Privileged principals get a tighter inactivity bar (escalated severity).
+    # Shared assignment cache (one Graph download per run instead of a private re-fetch).
     $privIds = @{}
-    try {
-        $active = @(); try { $active += @(Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -All -ErrorAction Stop) } catch {}
-        if ($active.Count -eq 0) { try { $active += @(Get-MgRoleManagementDirectoryRoleAssignment -All -ErrorAction SilentlyContinue) } catch {} }
-        foreach ($a in $active) { if ($a.PrincipalId) { $privIds[$a.PrincipalId] = $true } }
-    } catch {}
+    try { foreach ($a in (Get-EAPrivAssignments)) { if ($a.State -eq 'Active' -and $a.PrincipalId) { $privIds[$a.PrincipalId] = $true } } } catch {}
 
     $now0      = (Get-Date).ToUniversalTime()
     $cut       = $now0.AddDays(-$InactiveDays)
@@ -1163,8 +1268,8 @@ function Invoke-Check-StaleUsers {
     $created30 = $now0.AddDays(-30)
     $privCut   = $now0.AddDays(-([Math]::Min($InactiveDays, 45)))   # admins held to <= 45 days
 
-    $rows = @()
-    foreach ($u in $users) {
+    # Collected as a single foreach expression: array += per user is O(n^2) at 50k users.
+    $rows = @(foreach ($u in $users) {
         if ($u.UserType -eq 'Guest') { continue }
         $sa = $u.SignInActivity
         $eff = $null; $conf = 'NeverSeen'
@@ -1178,7 +1283,7 @@ function Invoke-Check-StaleUsers {
                 $conf = 'AttemptOnly'
             }
         }
-        $rows += [pscustomobject]@{
+        [pscustomobject]@{
             UserPrincipalName       = $u.UserPrincipalName
             Enabled                 = $u.AccountEnabled
             Privileged              = [bool]($u.Id -and $privIds.ContainsKey($u.Id))
@@ -1186,11 +1291,13 @@ function Invoke-Check-StaleUsers {
             LastSuccessfulOrAttempt = $eff
             Confidence              = $conf
         }
-    }
+    })
     $src = Write-Evidence -BaseName 'stale_users' -Rows $rows -Title ("Stale / Inactive Users (> {0} days)" -f $InactiveDays) `
         -Notes @('Activity prefers lastSuccessfulSignInDateTime. Confidence "AttemptOnly" = only failed/attempted sign-ins were recorded (no successful sign-in).')
 
-    $privStale  = @($rows | Where-Object { $_.Privileged -and $_.Enabled -and (($_.Confidence -eq 'NeverSeen') -or ($_.LastSuccessfulOrAttempt -lt $privCut)) })
+    # Never-seen admins only count once the account is older than the 30-day grace window,
+    # matching the non-privileged rule - a GA created yesterday is not a dormant admin.
+    $privStale  = @($rows | Where-Object { $_.Privileged -and $_.Enabled -and ((($_.Confidence -eq 'NeverSeen') -and $_.Created -and $_.Created -lt $created30) -or ($_.Confidence -ne 'NeverSeen' -and $_.LastSuccessfulOrAttempt -lt $privCut)) })
     $never      = @($rows | Where-Object { -not $_.Privileged -and $_.Confidence -eq 'NeverSeen' -and $_.Enabled -and $_.Created -and $_.Created -lt $created30 })
     $stale      = @($rows | Where-Object { -not $_.Privileged -and $_.Confidence -ne 'NeverSeen' -and $_.Enabled -and $_.LastSuccessfulOrAttempt -lt $cut })
     $stale180   = @($stale | Where-Object { $_.LastSuccessfulOrAttempt -lt $cut180 })
@@ -1237,19 +1344,18 @@ function Invoke-Check-Guests {
     $users = Get-EAUsers
     $guestUsers = @($users | Where-Object { $_.UserType -eq 'Guest' })
 
-    # privileged guests (cross-ref active role assignments)
+    # privileged guests (cross-ref active role assignments via the shared cache, which
+    # also tracks fetch failure so silence here is never mistaken for "no privileged guests").
+    # A THROW from the cache helper (e.g. the role-definition read 403s before its own
+    # failure tracking) must count as a failed cross-reference too.
     $privGuestUpns = @()
+    $privXrefFailed = $false
     try {
-        Get-EARoleDefMap | Out-Null
-        $active = @()
-        try { $active += @(Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -All -ExpandProperty Principal -ErrorAction Stop) } catch {}
-        if ($active.Count -eq 0) { try { $active += @(Get-MgRoleManagementDirectoryRoleAssignment -All -ExpandProperty Principal -ErrorAction SilentlyContinue) } catch {} }
-        foreach ($a in $active) {
-            $upn = Get-Ap $a.Principal 'userPrincipalName'
-            if ($upn -and $upn -like '*#EXT#*') { $privGuestUpns += $upn }
+        foreach ($a in (Get-EAPrivAssignments)) {
+            if ($a.State -eq 'Active' -and $a.PrincipalUpn -and $a.PrincipalUpn -like '*#EXT#*') { $privGuestUpns += $a.PrincipalUpn }
         }
         $privGuestUpns = @($privGuestUpns | Sort-Object -Unique)
-    } catch {}
+    } catch { $privXrefFailed = $true }
 
     $authz = $null; try { $authz = Get-MgPolicyAuthorizationPolicy -ErrorAction SilentlyContinue } catch {}
     $rows = $guestUsers | Select-Object UserPrincipalName, DisplayName, AccountEnabled, CreatedDateTime,
@@ -1266,6 +1372,13 @@ function Invoke-Check-Guests {
             -WhyItMatters 'A guest holding an admin role is an externally-managed identity with tenant power - you do not control its credentials, MFA or lifecycle.' `
             -RecommendedAction 'Remove guests from privileged roles; if external administration is required, use a dedicated member account governed by your own controls.' `
             -SourceFile $src -ResultRows @($privGuestUpns | ForEach-Object { [pscustomobject]@{ Guest=$_ } })
+    } elseif ($script:PrivAssignmentsFailed -or $privXrefFailed) {
+        # The role-assignment fetch failed - "no privileged guests" is UNKNOWN, not clean.
+        Add-EntraFinding -Severity 'Information' -CheckId 'guests' -Category 'External Access' `
+            -Title 'Privileged-guest cross-reference could not be evaluated' `
+            -Evidence 'Role assignments could not be read, so whether any guest holds a directory role is unknown - not confirmed clean.' `
+            -WhyItMatters 'Silence here must not read as a pass; a privileged guest is a High finding when visible.' `
+            -RecommendedAction 'Grant RoleManagement.Read.Directory (or retry on transient failure) and re-run the guests check.' -SourceFile $src
     }
     if ($authz) {
         if ($authz.GuestUserRoleId -eq 'a0b1b346-4d3e-4e8b-98f8-753987be4970') {
@@ -1315,15 +1428,9 @@ function Invoke-Check-Guests {
 # ===========================================================================
 function Invoke-Check-Mfa {
     $reg = Get-EARegistrationDetails
-    # privileged principals
+    # privileged principals (shared assignment cache - one Graph download per run)
     $privIds = @{}
-    try {
-        Get-EARoleDefMap | Out-Null
-        $active = @()
-        try { $active += @(Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -All -ExpandProperty Principal -ErrorAction Stop) } catch {}
-        if ($active.Count -eq 0) { try { $active += @(Get-MgRoleManagementDirectoryRoleAssignment -All -ErrorAction SilentlyContinue) } catch {} }
-        foreach ($a in $active) { if ($a.PrincipalId) { $privIds[$a.PrincipalId] = $true } }
-    } catch {}
+    try { foreach ($a in (Get-EAPrivAssignments)) { if ($a.State -eq 'Active' -and $a.PrincipalId) { $privIds[$a.PrincipalId] = $true } } } catch {}
 
     # Disabled accounts are excluded from the risk findings (a disabled account that is
     # not MFA-capable is not a live risk).
@@ -1340,19 +1447,19 @@ function Invoke-Check-Mfa {
     $phishRx  = '(?i)(fido2|windowsHello|passKey|x509Certificate)'
     $strongRx = '(?i)(microsoftAuthenticator|oneTimePasscode)'
 
-    $rows = @()
-    foreach ($r in $reg) {
+    # Collected as a single foreach expression: array += per user is O(n^2) at 50k rows.
+    $rows = @(foreach ($r in $reg) {
         $methods = @($r.MethodsRegistered)
         $hasPhish  = (@($methods | Where-Object { $_ -match $phishRx }).Count -gt 0)
         $hasStrong = (@($methods | Where-Object { $_ -match $strongRx }).Count -gt 0)
         $isPriv = ([bool]$r.IsAdmin -or ($r.Id -and $privIds.ContainsKey($r.Id)))
         $enabled = if ($r.Id -and $enabledById.ContainsKey($r.Id)) { $enabledById[$r.Id] } else { $true }
-        $rows += [pscustomobject]@{
+        [pscustomobject]@{
             UserPrincipalName=$r.UserPrincipalName; Privileged=$isPriv; Enabled=$enabled
             MfaRegistered=[bool]$r.IsMfaRegistered; MfaCapable=[bool]$r.IsMfaCapable
             StrongMethod=$hasStrong; PhishingResistant=$hasPhish; Methods=($methods -join ',')
         }
-    }
+    })
     $src = Write-Evidence -BaseName 'mfa_registration' -Rows $rows -Title 'MFA Posture - Registered / Capable / Strong / Phishing-Resistant'
 
     $priv         = @($rows | Where-Object { $_.Privileged -and $_.Enabled })
@@ -1412,7 +1519,12 @@ function Invoke-Check-LegacyAuth {
     # fi-FI/da-DK render '14.35.12' - an invalid OData timestamp that 400s the query.
     $since = (Get-Date).ToUniversalTime().AddDays(-30).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
     $legacyClients = 'Exchange ActiveSync|Authenticated SMTP|IMAP4|POP3|MAPI Over HTTP|Other clients|AutoDiscover|Exchange Online PowerShell|Exchange Web Services|Outlook Anywhere'
-    $signins = @(Get-MgAuditLogSignIn -All -Filter "createdDateTime ge $since" -ErrorAction Stop |
+    # Filter clientAppUsed SERVER-SIDE: downloading every sign-in for 30 days and
+    # filtering locally pulls millions of rows on real tenants (hours / throttling).
+    # The regex Where-Object stays as a defensive post-filter.
+    $legacyList = @('Exchange ActiveSync','Authenticated SMTP','IMAP4','POP3','MAPI Over HTTP','Other clients','AutoDiscover','Exchange Online PowerShell','Exchange Web Services','Outlook Anywhere (RPC over HTTP)')
+    $clientFilter = (($legacyList | ForEach-Object { "clientAppUsed eq '$_'" }) -join ' or ')
+    $signins = @(Get-MgAuditLogSignIn -All -Filter "createdDateTime ge $since and ($clientFilter)" -ErrorAction Stop |
         Where-Object { $_.ClientAppUsed -and $_.ClientAppUsed -match $legacyClients })
 
     $rows = $signins | Select-Object CreatedDateTime, UserPrincipalName, ClientAppUsed, AppDisplayName,
@@ -1450,9 +1562,11 @@ function Invoke-Check-LegacyAuth {
 # CHECK 9 - tenantposture (security defaults, authorization, consent)
 # ===========================================================================
 function Invoke-Check-TenantPosture {
-    $sd = $null; try { $sd = Get-MgPolicyIdentitySecurityDefaultEnforcementPolicy -ErrorAction Stop } catch {}
-    $authz = $null; try { $authz = Get-MgPolicyAuthorizationPolicy -ErrorAction SilentlyContinue } catch {}
-    $caCount = 0; try { $caCount = @(Get-EACaPolicies | Where-Object { $_.State -eq 'enabled' }).Count } catch {}
+    # Track read success per source: a swallowed read must not evaluate as "setting is
+    # fine" (false clean) or as "zero CA policies" (false High).
+    $sd = $null;    $sdKnown = $true;    try { $sd = Get-MgPolicyIdentitySecurityDefaultEnforcementPolicy -ErrorAction Stop } catch { $sdKnown = $false }
+    $authz = $null; $authzKnown = $true; try { $authz = Get-MgPolicyAuthorizationPolicy -ErrorAction Stop } catch { $authzKnown = $false }
+    $caCount = 0;   $caKnown = $true;    try { $caCount = @(Get-EACaPolicies | Where-Object { $_.State -eq 'enabled' }).Count } catch { $caKnown = $false }
 
     $rows = @()
     if ($sd)    { $rows += [pscustomobject]@{ Setting='Security Defaults enabled'; Value=$sd.IsEnabled } }
@@ -1468,13 +1582,19 @@ function Invoke-Check-TenantPosture {
     }
     $src = Write-Evidence -BaseName 'tenant_posture' -Rows $rows -Title 'Security Defaults, Authorization & Consent Settings'
 
-    if ($sd -and -not $sd.IsEnabled -and $caCount -eq 0) {
+    if ($sd -and -not $sd.IsEnabled -and $caKnown -and $caCount -eq 0) {
         Add-EntraFinding -Severity 'High' -CheckId 'tenantposture' -Category 'Tenant Posture' `
             -Title 'Security Defaults are OFF and zero Conditional Access policies are enabled' `
             -Evidence 'IsEnabled=false on Security Defaults with zero enabled Conditional Access policies - the tenant can be password-only.' `
             -WhyItMatters 'With neither Security Defaults nor Conditional Access, there is no baseline MFA enforcement at all - the most common cause of account takeover.' `
             -RecommendedAction 'Enable Conditional Access MFA policies (preferred on licensed tenants) or turn on Security Defaults as an interim baseline.' -SourceFile $src
-    } elseif ($sd -and $sd.IsEnabled -and $caCount -gt 0) {
+    } elseif ($sd -and -not $sd.IsEnabled -and -not $caKnown) {
+        Add-EntraFinding -Severity 'Information' -CheckId 'tenantposture' -Category 'Tenant Posture' `
+            -Title 'Conditional Access posture unknown - Security Defaults are off but CA policies could not be read' `
+            -Evidence 'Security Defaults are disabled and the Conditional Access policy read failed, so whether baseline MFA enforcement exists is UNKNOWN - not confirmed either way.' `
+            -WhyItMatters 'A failed CA read must not be reported as "zero CA policies" (false alarm) or as covered (false clean).' `
+            -RecommendedAction 'Verify Policy.Read.All is granted and re-run the tenantposture check.' -SourceFile $src
+    } elseif ($sd -and $sd.IsEnabled -and $caKnown -and $caCount -gt 0) {
         Add-EntraFinding -Severity 'Medium' -CheckId 'tenantposture' -Category 'Tenant Posture' `
             -Title 'Security Defaults enabled while Conditional Access policies also exist' `
             -Evidence 'Security Defaults and CA cannot be used together for granular control.' `
@@ -1505,7 +1625,14 @@ function Invoke-Check-TenantPosture {
                 -RecommendedAction 'Restrict user consent to verified-publisher low-impact permissions (or none) and enable the admin-consent request workflow.' -SourceFile $src
         }
     }
-    if ($script:Findings.Where({$_.CheckId -eq 'tenantposture'}).Count -eq 0) {
+    if (-not $sdKnown -or -not $authzKnown) {
+        $failed = @(); if (-not $sdKnown) { $failed += 'Security Defaults policy' }; if (-not $authzKnown) { $failed += 'authorization policy' }
+        Add-EntraFinding -Severity 'Information' -CheckId 'tenantposture' -Category 'Tenant Posture' `
+            -Title 'Tenant posture settings could not be fully assessed' `
+            -Evidence ("Could not read: {0}. The unread settings are UNKNOWN, not confirmed clean." -f ($failed -join ', ')) `
+            -WhyItMatters 'A swallowed policy read must not be reported as "no permissive defaults detected".' `
+            -RecommendedAction 'Verify Policy.Read.All is granted and re-run the tenantposture check.' -SourceFile $src
+    } elseif ($script:Findings.Where({$_.CheckId -eq 'tenantposture'}).Count -eq 0) {
         Add-EntraFinding -Severity 'Information' -CheckId 'tenantposture' -Category 'Tenant Posture' `
             -Title 'Tenant default permissions and consent settings reviewed' `
             -Evidence 'No permissive defaults detected in authorization / consent settings.' `
@@ -1582,7 +1709,12 @@ function Invoke-Check-CAPolicies {
         $isTrusted = (Get-Ap $n 'isTrusted')
         $ranges = (Get-Ap $n 'ipRanges')
         if ($isTrusted -and $ranges) {
-            $broad = @($ranges | Where-Object { (Get-Ap $_ 'cidrAddress') -match '/(?:[0-9]|1[0-6])$' })
+            # ipRanges elements are raw dictionaries (no AdditionalProperties member), so
+            # Get-Ap always returned $null here and this finding could never fire.
+            $broad = @($ranges | Where-Object {
+                $cidr = if ($_ -is [System.Collections.IDictionary]) { $_['cidrAddress'] } else { Get-Ap $_ 'cidrAddress' }
+                "$cidr" -match '/(?:[0-9]|1[0-6])$'
+            })
             if ($broad.Count -gt 0) {
                 Add-EntraFinding -Severity 'High' -CheckId 'capolicies' -Category 'Tenant Posture' `
                     -Title ("Trusted named location '{0}' contains a very broad IP range" -f $n.DisplayName) `
@@ -1647,23 +1779,24 @@ function Invoke-Check-CAPolicies {
 # CHECK 11 - riskyusers (Identity Protection)
 # ===========================================================================
 function Invoke-Check-RiskyUsersOnly {
-    $risky = @(Get-MgRiskyUser -All -ErrorAction Stop | Where-Object { $_.RiskState -in @('atRisk','confirmedCompromised') })
+    # Filter server-side: without it every HISTORICALLY risky user (remediated/dismissed,
+    # years of history) is downloaded just to be discarded client-side.
+    $risky = @(Get-MgRiskyUser -All -Filter "riskState eq 'atRisk' or riskState eq 'confirmedCompromised'" -ErrorAction Stop)
     $detections = @()
-    try { $detections = @(Get-MgRiskDetection -All -ErrorAction SilentlyContinue) } catch {}
+    # 30-day window server-side, consistent with the other log-based checks. ('gt' - the
+    # documented detectedDateTime filter operators are eq/gt/lt, not ge.)
+    $dsince = (Get-Date).ToUniversalTime().AddDays(-30).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+    try { $detections = @(Get-MgRiskDetection -All -Filter "detectedDateTime gt $dsince" -ErrorAction SilentlyContinue) } catch {}
     $rows = $risky | Select-Object UserPrincipalName, RiskLevel, RiskState, RiskDetail, RiskLastUpdatedDateTime
     $src = Write-Evidence -BaseName 'risky_users' -Rows $rows -Title 'Identity Protection - Risky Users'
     if ($detections.Count -gt 0) {
         $drows = $detections | Select-Object UserPrincipalName, RiskEventType, RiskLevel, RiskState, DetectedDateTime, IPAddress
-        Write-Evidence -BaseName 'risk_detections' -Rows $drows -Title 'Identity Protection - Risk Detections' | Out-Null
+        Write-Evidence -BaseName 'risk_detections' -Rows $drows -Title 'Identity Protection - Risk Detections (last 30 days)' | Out-Null
     }
 
-    # privileged cross-ref
+    # privileged cross-ref (shared assignment cache - one Graph download per run)
     $privIds = @{}
-    try {
-        $active = @(); try { $active += @(Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -All -ErrorAction Stop) } catch {}
-        if ($active.Count -eq 0) { try { $active += @(Get-MgRoleManagementDirectoryRoleAssignment -All -ErrorAction SilentlyContinue) } catch {} }
-        foreach ($a in $active) { if ($a.PrincipalId) { $privIds[$a.PrincipalId] = $true } }
-    } catch {}
+    try { foreach ($a in (Get-EAPrivAssignments)) { if ($a.State -eq 'Active' -and $a.PrincipalId) { $privIds[$a.PrincipalId] = $true } } } catch {}
 
     if ($risky.Count -gt 0) {
         $privRisky = @($risky | Where-Object { $_.Id -and $privIds.ContainsKey($_.Id) })
@@ -1701,27 +1834,40 @@ function Invoke-Check-RiskyUsersOnly {
 #   still be able to evaluate them. The check is gated internally on $script:WorkloadIdP.
 # ===========================================================================
 function Invoke-Check-RiskyServicePrincipals {
-    # Risky service principals (beta, best-effort)
+    # Risky service principals (v1.0, best-effort). Track read SUCCESS separately from
+    # result count: an errored read must surface as a coverage gap, never as "clean".
     $rspFound = $false
+    $readOk = $true
+    $rsp = @()
     try {
-        $rsp = @()
         if (Get-Command Get-MgRiskyServicePrincipal -ErrorAction SilentlyContinue) {
-            $rsp = @(Get-MgRiskyServicePrincipal -All -ErrorAction SilentlyContinue | Where-Object { $_.RiskState -in @('atRisk','confirmedCompromised') })
+            $rsp = @(Get-MgRiskyServicePrincipal -All -ErrorAction Stop | Where-Object { $_.RiskState -in @('atRisk','confirmedCompromised') })
         } else {
-            $resp = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/beta/identityProtection/riskyServicePrincipals' -ErrorAction SilentlyContinue
-            if ($resp.value) { $rsp = @($resp.value | Where-Object { $_.riskState -in @('atRisk','confirmedCompromised') }) }
+            # Raw fallback: paginate (first page only would under-report) against v1.0.
+            $uri = 'https://graph.microsoft.com/v1.0/identityProtection/riskyServicePrincipals'
+            $acc = @(); $guard = 0
+            while ($uri -and $guard -lt 50) {
+                $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop
+                if ($resp['value']) { $acc += @($resp['value']) }
+                $uri = $resp['@odata.nextLink']; $guard++
+            }
+            $rsp = @($acc | Where-Object { $_.riskState -in @('atRisk','confirmedCompromised') })
         }
-        if ($rsp.Count -gt 0) {
-            $rspFound = $true
-            $rsprows = $rsp | Select-Object @{n='DisplayName';e={ $_.DisplayName ?? $_.displayName }}, @{n='RiskState';e={ $_.RiskState ?? $_.riskState }}
-            $rspsrc = Write-Evidence -BaseName 'risky_serviceprincipals' -Rows $rsprows -Title 'Identity Protection - Risky Service Principals'
-            Add-EntraFinding -Severity 'High' -CheckId 'riskyserviceprincipals' -Category 'Threat Signals' `
-                -Title ("{0} risky service principal(s) flagged" -f $rsp.Count) `
-                -Evidence 'A workload identity (app/service principal) is flagged as risky/compromised.' `
-                -WhyItMatters 'A compromised workload identity often holds application permissions exercised without any user interaction - a high-impact, stealthy foothold.' `
-                -RecommendedAction 'Investigate the flagged service principals, rotate their credentials, and review their granted application permissions.' -SourceFile $rspsrc -ResultRows $rsprows
-        }
-    } catch {}
+    } catch {
+        # Permission failures should land in the posture summary as Skipped-NoPermission.
+        if ($_.Exception.Response.StatusCode.value__ -in 401,403 -or $_ -match 'Authorization_RequestDenied|Insufficient privileges') { throw }
+        $readOk = $false
+    }
+    if ($readOk -and $rsp.Count -gt 0) {
+        $rspFound = $true
+        $rsprows = $rsp | Select-Object @{n='DisplayName';e={ $_.DisplayName ?? $_.displayName }}, @{n='RiskState';e={ $_.RiskState ?? $_.riskState }}
+        $rspsrc = Write-Evidence -BaseName 'risky_serviceprincipals' -Rows $rsprows -Title 'Identity Protection - Risky Service Principals'
+        Add-EntraFinding -Severity 'High' -CheckId 'riskyserviceprincipals' -Category 'Threat Signals' `
+            -Title ("{0} risky service principal(s) flagged" -f $rsp.Count) `
+            -Evidence 'A workload identity (app/service principal) is flagged as risky/compromised.' `
+            -WhyItMatters 'A compromised workload identity often holds application permissions exercised without any user interaction - a high-impact, stealthy foothold.' `
+            -RecommendedAction 'Investigate the flagged service principals, rotate their credentials, and review their granted application permissions.' -SourceFile $rspsrc -ResultRows $rsprows
+    }
 
     if ($rspFound) { return }
 
@@ -1734,6 +1880,12 @@ function Invoke-Check-RiskyServicePrincipals {
             -Evidence 'Risky workload identities require Microsoft Entra Workload ID Premium, which was not detected - this check is license-gated, not clean.' `
             -WhyItMatters 'Risky service principals surface compromised workload identities; without Workload ID Premium they cannot be evaluated even when Entra ID P2 is present.' `
             -RecommendedAction 'License Microsoft Entra Workload ID Premium to enable risky service principal detection.' -SourceFile $null
+    } elseif (-not $readOk) {
+        Add-EntraFinding -Severity 'Information' -CheckId 'riskyserviceprincipals' -Category 'Threat Signals' `
+            -Title 'Risky service principals could NOT be read (coverage gap, not clean)' `
+            -Evidence 'Workload Identities Premium is present but the risky-service-principal read failed (throttling / transient Graph error). This result is UNKNOWN, not "no risky workload identities".' `
+            -WhyItMatters 'A failed read must not be mistaken for a clean result - compromised workload identities may exist unseen.' `
+            -RecommendedAction 'Re-run the audit (or just -riskyserviceprincipals) when the service is reachable.' -SourceFile $null
     } else {
         Add-EntraFinding -Severity 'Information' -CheckId 'riskyserviceprincipals' -Category 'Threat Signals' `
             -Title 'No risky service principals flagged by Identity Protection' `
@@ -1748,7 +1900,7 @@ function Invoke-Check-RiskyServicePrincipals {
 # ===========================================================================
 function Invoke-Check-Apps {
     $apps = Get-EAApplications
-    $sps  = @(Get-MgServicePrincipal -All -Property 'id,appId,displayName,appRoles,servicePrincipalType,accountEnabled' -ErrorAction Stop)
+    $sps  = @(Get-EAServicePrincipals)
     $script:AppCount = $apps.Count
     # NB: secret/certificate credential EXPIRY is reported by the dedicated 'appcredentials'
     # check (Invoke-Check-AppCredentials), which shares the cached Get-EAApplications call.
@@ -1773,20 +1925,29 @@ function Invoke-Check-Apps {
         if ($v) { $v } else { [string]$appRoleId }
     }
 
+    # Enumerate assignments from the RESOURCE side: only SPs that define named app roles
+    # (the APIs - Graph, Exchange, SharePoint, custom) can grant application permissions,
+    # and there are far fewer APIs than client SPs. One Get-...AppRoleAssignedTo per API
+    # replaces one Get-...AppRoleAssignment per service principal (N+1 at tenant scale).
     $permRows = @()
     $spPermErrors = @()
-    foreach ($sp in $sps) {
+    $resourceSps = @($sps | Where-Object { @($_.AppRoles | Where-Object { $_.Id -and $_.Value }).Count -gt 0 })
+    foreach ($res in $resourceSps) {
         $asn = @()
-        try { $asn = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -All -ErrorAction Stop) }
-        catch { $spPermErrors += [pscustomobject]@{ ServicePrincipal=$sp.DisplayName; AppId=$sp.AppId; Error=$_.Exception.Message }; continue }
+        try { $asn = @(Get-MgServicePrincipalAppRoleAssignedTo -ServicePrincipalId $res.Id -All -ErrorAction Stop) }
+        catch { $spPermErrors += [pscustomobject]@{ ServicePrincipal=$res.DisplayName; AppId=$res.AppId; Error=("(resource API read) " + $_.Exception.Message) }; continue }
         foreach ($x in $asn) {
+            # appRoleAssignedTo also lists user/group app assignments (gallery apps) - only
+            # service principals HOLD application permissions.
+            if ([string]$x.PrincipalType -ne 'ServicePrincipal') { continue }
             $permName = _ResolveAppRoleValue $x.ResourceId $x.AppRoleId
             $isTier0 = ($permName -in $script:DangerousAppPermissions)
             $isWrite = ($permName -match $writeRx)
             if (-not ($isTier0 -or $isWrite)) { continue }
             $tier = if ($isTier0) { 'Tier0' } else { 'Write/High' }
+            $client = $spById[[string]$x.PrincipalId]
             $permRows += [pscustomobject]@{
-                ServicePrincipal=$sp.DisplayName; AppId=$sp.AppId; SpId=$sp.Id
+                ServicePrincipal=($client.DisplayName ?? [string]$x.PrincipalDisplayName); AppId=$client.AppId; SpId=[string]$x.PrincipalId
                 Permission=$permName; Resource=$x.ResourceDisplayName; Tier=$tier
             }
         }
@@ -1847,7 +2008,8 @@ function Invoke-Check-Apps {
             if ($disabled -or ($privKnown -and -not $isPriv)) { $nonAdminOwner = $true }
         }
         $app = $appById[$sp.AppId]
-        $multiTenant = [bool]($app -and $app.SignInAudience -match 'AzureADMultipleOrgs')
+        # Both multi-org audiences: AzureADandPersonalMicrosoftAccount is also multi-tenant.
+        $multiTenant = [bool]($app -and $app.SignInAudience -match 'AzureADMultipleOrgs|AzureADandPersonalMicrosoftAccount')
         # verifiedPublisher exists on the application object, not the service principal.
         $verifiedPub = [bool]($app -and $app.VerifiedPublisher -and $app.VerifiedPublisher.DisplayName)
         $hardenRows += [pscustomobject]@{
@@ -1892,15 +2054,11 @@ function Invoke-Check-Apps {
     }
 
     # --- owners (no-owner credentialed app) ---
-    $ownerRows = @()
-    foreach ($a in $apps) {
-        if (@($a.PasswordCredentials).Count -gt 0 -or @($a.KeyCredentials).Count -gt 0) {
-            $owners = @(); try { $owners = @(Get-MgApplicationOwner -ApplicationId $a.Id -All -ErrorAction SilentlyContinue) } catch {}
-            if ($owners.Count -eq 0) {
-                $ownerRows += [pscustomobject]@{ App=$a.DisplayName; AppId=$a.AppId; Note='Orphaned credentialed app' }
-            }
-        }
-    }
+    # Owners come pre-expanded on the cached application objects (Get-EAApplications),
+    # so this is a pure in-memory filter instead of one Graph call per credentialed app.
+    $ownerRows = @($apps |
+        Where-Object { (@($_.PasswordCredentials).Count -gt 0 -or @($_.KeyCredentials).Count -gt 0) -and @($_.Owners).Count -eq 0 } |
+        ForEach-Object { [pscustomobject]@{ App=$_.DisplayName; AppId=$_.AppId; Note='Orphaned credentialed app' } })
     $ownerSrc = Write-Evidence -BaseName 'app_owners' -Rows $ownerRows -Title 'Application Ownership'
     if ($ownerRows.Count -gt 0) {
         Add-EntraFinding -Severity 'Medium' -CheckId 'apps' -Category 'Applications' `
@@ -2033,24 +2191,27 @@ function Invoke-Check-AppCredentials {
 # ===========================================================================
 function Invoke-Check-ConsentGrants {
     $grants = @(Get-MgOauth2PermissionGrant -All -ErrorAction Stop)
+    # Resolve SP display names from the shared cache when a check already populated it;
+    # otherwise ONE paged list call (id,displayName) replaces the previous per-id lookups
+    # (two Graph calls per grant on tenants with thousands of grants).
     $spById = @{}
-    foreach ($g in $grants) {
-        foreach ($id in @($g.ClientId, $g.ResourceId)) {
-            if ($id -and -not $spById.ContainsKey($id)) {
-                try { $spById[$id] = (Get-MgServicePrincipal -ServicePrincipalId $id -ErrorAction SilentlyContinue) } catch {}
-            }
-        }
+    if ($null -ne $script:SpsCache) {
+        foreach ($sp in $script:SpsCache) { if ($sp.Id) { $spById[$sp.Id] = $sp } }
+    } else {
+        try { foreach ($sp in @(Get-MgServicePrincipal -All -Property 'id,displayName' -PageSize 999 -ErrorAction Stop)) { if ($sp.Id) { $spById[$sp.Id] = $sp } } } catch {}
     }
-    $highScopes = 'Mail\.|Files\.ReadWrite|offline_access|Directory\.ReadWrite|User\.ReadWrite|full_access|Sites\.ReadWrite|Sites\.FullControl'
-    $rows = @()
-    foreach ($g in $grants) {
+    # offline_access alone is routine (it only lengthens token lifetime) and User.ReadWrite
+    # (self-profile) is not high-impact - flagging them alone made nearly every ordinary
+    # admin-consented app a High finding. Only data/directory-write scopes count as high.
+    $highScopes = 'Mail\.|Files\.ReadWrite|Directory\.ReadWrite|User\.ReadWrite\.All|full_access|Sites\.ReadWrite|Sites\.FullControl'
+    $rows = @(foreach ($g in $grants) {
         $client = if ($spById.ContainsKey($g.ClientId)) { $spById[$g.ClientId] } else { $null }
-        $rows += [pscustomobject]@{
+        [pscustomobject]@{
             Client=($client.DisplayName ?? $g.ClientId); ConsentType=$g.ConsentType
             Resource=(($spById[$g.ResourceId]).DisplayName ?? $g.ResourceId); Scope=$g.Scope
             High=($g.Scope -match $highScopes)
         }
-    }
+    })
     $src = Write-Evidence -BaseName 'oauth_consent_grants' -Rows $rows -Title 'OAuth2 Delegated Consent Grants'
 
     $tenantWideHigh = @($rows | Where-Object { $_.ConsentType -eq 'AllPrincipals' -and $_.High })
@@ -2206,13 +2367,13 @@ function Invoke-Check-RecentChanges {
         $rcrows = $roleChanges | Select-Object ActivityDateTime, ActivityDisplayName,
             @{n='Initiator';e={ $_.InitiatedBy.User.UserPrincipalName }},
             @{n='Target';e={ ($_.TargetResources.UserPrincipalName -join ',') }}
-        Write-Evidence -BaseName 'recent_role_changes' -Rows $rcrows -Title 'Recent Role-Management Changes' | Out-Null
+        $rcsrc = Write-Evidence -BaseName 'recent_role_changes' -Rows $rcrows -Title 'Recent Role-Management Changes'
         Add-EntraFinding -Severity 'Medium' -CheckId 'recentchanges' -Category 'Change Monitoring' `
             -Title ("{0} role-management change(s) in the last {1} days" -f $roleChanges.Count, $RecentChangeDays) `
             -Evidence 'Privileged role assignments/removals occurred recently and should be verified against change records.' `
             -WhyItMatters 'New role grants in the recent window are where rogue-admin or compromised-provisioning activity first appears. Direct equivalent of the AD recent-changes review.' `
             -RecommendedAction 'Verify each recent role change against an approved change record and investigate any unexpected initiator.' `
-            -SourceFile $src -ResultRows @($rcrows | Select-Object -First 50)
+            -SourceFile $rcsrc -ResultRows @($rcrows | Select-Object -First 50)
     }
     Add-EntraFinding -Severity 'Information' -CheckId 'recentchanges' -Category 'Change Monitoring' `
         -Title ("{0} user(s) and {1} group(s) created in the last {2} days" -f $newUsers.Count, $newGroups.Count, $RecentChangeDays) `
@@ -2340,10 +2501,11 @@ function Get-EAPrivAssignments {
     # Eligibility is P2-gated; its absence is expected on P1 tenants and stays silent.
     try { foreach ($a in @(Get-MgRoleManagementDirectoryRoleEligibilityScheduleInstance -All -ExpandProperty Principal -ErrorAction SilentlyContinue)) { _Add $a 'Eligible' } } catch {}
 
-    if ($list.Count -eq 0 -and $fetchErr) {
-        # Both active-assignment fetches FAILED - this is "unknown", not "no admins".
-        # Do not cache (a later check may retry successfully) and flag the failure so
-        # consumers report "could not validate" instead of findings built on blindness.
+    if ($active.Count -eq 0 -and $fetchErr) {
+        # Both ACTIVE-assignment fetches FAILED - this is "unknown", not "no admins",
+        # even when the eligibility fetch above returned rows. Do not cache (a later
+        # check may retry successfully) and flag the failure so consumers report
+        # "could not validate" instead of findings built on blindness.
         $script:PrivAssignmentsFailed = $true
         Write-Warn2 "  Privileged-assignment fetch failed: $($fetchErr.Exception.Message)"
         return $list
@@ -2504,14 +2666,17 @@ function Invoke-Check-BreakGlass {
     # on ActivationModel -eq 'Permanent', not merely "currently active".
     $gaIds = @{}
     $privRolesByUser = @{}
+    $gaExpandFailed = $false; $gaExpandFailedGroups = @()
     foreach ($a in (Get-EAPrivAssignments)) {
         if ($a.IsGA -and $a.ActivationModel -eq 'Permanent' -and $a.PrincipalId) {
             $gaIds[$a.PrincipalId] = $true
             # GA held via a role-assignable GROUP is still permanent standing GA for
             # every member - expand so a break-glass account whose GA comes through a
             # group is not falsely reported as "not a permanent Global Administrator".
+            # A FAILED expansion makes GA-via-group status UNKNOWN, not "not GA".
             if ($a.PrincipalType -eq 'group') {
-                try { foreach ($m in @(Get-MgGroupTransitiveMember -GroupId $a.PrincipalId -All -ErrorAction Stop)) { if ($m.Id) { $gaIds[$m.Id] = $true } } } catch {}
+                try { foreach ($m in @(Get-MgGroupTransitiveMember -GroupId $a.PrincipalId -All -ErrorAction Stop)) { if ($m.Id) { $gaIds[$m.Id] = $true } } }
+                catch { $gaExpandFailed = $true; $gaExpandFailedGroups += ($a.PrincipalName ?? $a.PrincipalId) }
             }
         }
         if ($a.PrincipalId -and $a.PrincipalType -eq 'user' -and $a.RoleTemplateId) {
@@ -2594,7 +2759,9 @@ function Invoke-Check-BreakGlass {
         }
 
         $rows += [pscustomobject]@{
-            Account=$u.UserPrincipalName; Enabled=$enabled; GlobalAdmin=$(if ($gaKnown) { $isGA } else { 'unknown' }); CloudOnly=$cloudOnly; OnMicrosoftDomain=$onmsft
+            Account=$u.UserPrincipalName; Enabled=$enabled
+            GlobalAdmin=$(if (-not $gaKnown) { 'unknown' } elseif ($isGA) { $isGA } elseif ($gaExpandFailed) { 'unknown' } else { $isGA })
+            CloudOnly=$cloudOnly; OnMicrosoftDomain=$onmsft
             Licensed=$licensed; LastSuccessfulSignIn=$lastSucc
             BlockAllApps=$(if ($caKnown) { $blockAll -join '; ' } else { 'unknown' }); BlockScoped=$(if ($caKnown) { $blockScoped -join '; ' } else { 'unknown' })
             MfaAllApps=$(if ($caKnown) { $mfaAll -join '; ' } else { 'unknown' }); MfaScoped=$(if ($caKnown) { $mfaScoped -join '; ' } else { 'unknown' })
@@ -2637,11 +2804,21 @@ function Invoke-Check-BreakGlass {
         }
 
         if ($gaKnown -and -not $isGA) {
-            $pending.Add(@{ Severity='Critical'; AffectedPrincipal=$u.UserPrincipalName
-                Title=("Break-glass account is not a permanent Global Administrator: {0}" -f $u.UserPrincipalName)
-                Evidence='The emergency-access account does not hold Global Administrator as a PERMANENT (standing) assignment - directly or via a role-assignable group. An eligible/time-bound or JIT-activated GA does not count, because PIM activation may itself be unavailable during the emergency.'
-                WhyItMatters='A break-glass account must have standing Global Admin so it can recover the tenant when all other access fails.'
-                RecommendedAction='Assign permanent Global Administrator to the break-glass account.' }) | Out-Null
+            if ($gaExpandFailed) {
+                # A GA-granting group could not be expanded - the account may hold GA
+                # through it, so "not a GA" cannot be concluded (a false Critical).
+                $pending.Add(@{ Severity='Medium'; AffectedPrincipal=$u.UserPrincipalName
+                    Title=("Break-glass GA status could not be fully validated: {0}" -f $u.UserPrincipalName)
+                    Evidence=("Global-Administrator-granting group(s) could not be expanded ({0}), so whether this account holds permanent GA through a group is UNKNOWN." -f ((@($gaExpandFailedGroups | Select-Object -Unique | Select-Object -First 5)) -join ', '))
+                    WhyItMatters='A break-glass account must have standing Global Admin; this could not be confirmed or ruled out because group membership was unreadable.'
+                    RecommendedAction='Re-run when group membership is readable (Group.Read.All / Member.Read.Hidden), or verify the account''s GA assignment manually.' }) | Out-Null
+            } else {
+                $pending.Add(@{ Severity='Critical'; AffectedPrincipal=$u.UserPrincipalName
+                    Title=("Break-glass account is not a permanent Global Administrator: {0}" -f $u.UserPrincipalName)
+                    Evidence='The emergency-access account does not hold Global Administrator as a PERMANENT (standing) assignment - directly or via a role-assignable group. An eligible/time-bound or JIT-activated GA does not count, because PIM activation may itself be unavailable during the emergency.'
+                    WhyItMatters='A break-glass account must have standing Global Admin so it can recover the tenant when all other access fails.'
+                    RecommendedAction='Assign permanent Global Administrator to the break-glass account.' }) | Out-Null
+            }
         }
         if (-not $cloudOnly) {
             $pending.Add(@{ Severity='Critical'; AffectedPrincipal=$u.UserPrincipalName
@@ -2738,6 +2915,7 @@ function Invoke-Check-AuthMethodPolicy {
     $src = Write-Evidence -BaseName 'auth_method_policy' -Rows $rows -Title 'Authentication Methods Policy (state + targets)'
 
     $sms = _Method 'Sms'; $voice = _Method 'Voice'; $fido2 = _Method 'Fido2'; $whfb = _Method 'WindowsHelloForBusiness'; $tap = _Method 'TemporaryAccessPass'
+    $x509 = _Method 'X509Certificate'   # certificate-based auth is also phishing-resistant
 
     foreach ($weak in @(@{ n='SMS'; m=$sms }, @{ n='Voice'; m=$voice })) {
         if ($weak.m.State -ne 'enabled') { continue }
@@ -2756,17 +2934,17 @@ function Invoke-Check-AuthMethodPolicy {
         }
     }
 
-    $phishEnabled = (($fido2.Present -and $fido2.State -eq 'enabled') -or ($whfb.Present -and $whfb.State -eq 'enabled'))
+    $phishEnabled = (($fido2.Present -and $fido2.State -eq 'enabled') -or ($whfb.Present -and $whfb.State -eq 'enabled') -or ($x509.Present -and $x509.State -eq 'enabled'))
     if (-not $phishEnabled) {
         Add-EntraFinding -Severity 'Medium' -CheckId 'authmethodpolicy' -Category 'Authentication' `
-            -Title 'No phishing-resistant method (FIDO2 / Windows Hello) is enabled' `
-            -Evidence ("FIDO2 state: {0}; Windows Hello state: {1}." -f $fido2.State, $whfb.State) `
+            -Title 'No phishing-resistant method (FIDO2 / Windows Hello / certificate-based) is enabled' `
+            -Evidence ("FIDO2 state: {0}; Windows Hello state: {1}; Certificate-based state: {2}." -f $fido2.State, $whfb.State, $x509.State) `
             -WhyItMatters 'Phishing-resistant authentication is the strongest defence for privileged accounts; if it is not enabled, admins cannot register it.' `
-            -RecommendedAction 'Enable FIDO2 security keys / passkeys and Windows Hello for Business and require them for privileged users.' -SourceFile $src
-    } elseif (-not ($fido2.TenantWide -or $whfb.TenantWide)) {
+            -RecommendedAction 'Enable FIDO2 security keys / passkeys, Windows Hello for Business or certificate-based authentication and require them for privileged users.' -SourceFile $src
+    } elseif (-not ($fido2.TenantWide -or $whfb.TenantWide -or $x509.TenantWide)) {
         Add-EntraFinding -Severity 'Low' -CheckId 'authmethodpolicy' -Category 'Authentication' `
             -Title 'Phishing-resistant methods are enabled only for a scoped group' `
-            -Evidence ("FIDO2 targets: {0}; WHfB targets: {1}." -f $fido2.Targets, $whfb.Targets) `
+            -Evidence ("FIDO2 targets: {0}; WHfB targets: {1}; Certificate-based targets: {2}." -f $fido2.Targets, $whfb.Targets, $x509.Targets) `
             -WhyItMatters 'Phishing-resistant methods scoped to a pilot group are not yet available to all admins/users.' `
             -RecommendedAction 'Expand phishing-resistant method availability to all privileged users, then all users.' -SourceFile $src
     }
@@ -2796,9 +2974,10 @@ function Invoke-Check-AuthMethodPolicy {
     if ($script:Findings.Where({$_.CheckId -eq 'authmethodpolicy'}).Count -eq 0) {
         $f2scope = if ($fido2.TenantWide) { 'all' } else { 'scoped' }
         $whscope = if ($whfb.TenantWide) { 'all' } else { 'scoped' }
+        $cbscope = if ($x509.TenantWide) { 'all' } else { 'scoped' }
         Add-EntraFinding -Severity 'Information' -CheckId 'authmethodpolicy' -Category 'Authentication' `
             -Title 'Authentication methods policy reviewed' `
-            -Evidence ("FIDO2={0}/{1}, WHfB={2}/{3}; SMS={4}, Voice={5}." -f $fido2.State,$f2scope,$whfb.State,$whscope,$sms.State,$voice.State) `
+            -Evidence ("FIDO2={0}/{1}, WHfB={2}/{3}, CBA={4}/{5}; SMS={6}, Voice={7}." -f $fido2.State,$f2scope,$whfb.State,$whscope,$x509.State,$cbscope,$sms.State,$voice.State) `
             -WhyItMatters 'The method policy decides which factors users can register and use, and at what scope.' `
             -RecommendedAction 'Prefer phishing-resistant methods tenant-wide; minimise SMS/voice.' -SourceFile $src -ResultRows $rows
     }
@@ -2834,10 +3013,13 @@ function Invoke-Check-AccessPaths {
     $groupAssign = @($assignments | Where-Object { $_.IsPrivileged -and $_.PrincipalType -eq 'group' -and $_.PrincipalId })
     $pathByUserRole = @{}     # "userId|roleTemplateId" -> list of @{Group;State}
     $hiddenGaps = @()
+    $hiddenGapIds = New-Object System.Collections.Generic.HashSet[string]   # dedup by ID, not name ($groupAssign repeats a group once per state)
+    $ownerGaps = @()
     foreach ($g in $groupAssign) {
         $members = @()
         try { $members = @(Get-MgGroupTransitiveMember -GroupId $g.PrincipalId -All -ErrorAction Stop) } catch {
-            $hiddenGaps += ($g.PrincipalName ?? $g.PrincipalId); continue
+            if ($hiddenGapIds.Add([string]$g.PrincipalId)) { $hiddenGaps += ($g.PrincipalName ?? $g.PrincipalId) }
+            continue
         }
         foreach ($m in $members) {
             $mid = $m.Id
@@ -2903,10 +3085,15 @@ function Invoke-Check-AccessPaths {
     foreach ($key in $pathByUserRole.Keys) { if (@($pathByUserRole[$key] | Where-Object { $_.State -eq 'Active' }).Count -gt 0) { [void]$sameRoleActiveKey.Add($key) } }
 
     # Ownership-based escalation: owners of groups assigned a privileged role.
+    # $groupAssign holds one row per (group, role, STATE) - dedup on (group, role) so
+    # owners are neither double-counted nor fetched twice, and treat a failed owner
+    # read as a coverage gap rather than "no owners".
     $ownEscRows = @()
+    $seenGroupRole = New-Object System.Collections.Generic.HashSet[string]
     foreach ($g in $groupAssign) {
+        if (-not $seenGroupRole.Add(('{0}|{1}' -f $g.PrincipalId, $g.RoleTemplateId))) { continue }
         $grantsGAorPRA = ($g.RoleTemplateId -eq $script:GlobalAdminTemplateId -or ($script:PrivilegedRoleTemplates[$g.RoleTemplateId] -match 'Privileged Role Administrator|Privileged Authentication'))
-        $owners = @(); try { $owners = @(Get-MgGroupOwner -GroupId $g.PrincipalId -All -ErrorAction SilentlyContinue) } catch {}
+        $owners = @(); try { $owners = @(Get-MgGroupOwner -GroupId $g.PrincipalId -All -ErrorAction Stop) } catch { $ownerGaps += ($g.PrincipalName ?? $g.PrincipalId) }
         foreach ($o in $owners) {
             $oid   = $o.Id
             $otype = [string](Get-Ap $o '@odata.type')
@@ -2974,7 +3161,7 @@ function Invoke-Check-AccessPaths {
         $info = $caExcl[$gid]
         $gname = $gid
         try { $gg = Get-MgGroup -GroupId $gid -Property 'id,displayName' -ErrorAction SilentlyContinue; if ($gg) { $gname = $gg.DisplayName } } catch {}
-        $owners = @(); try { $owners = @(Get-MgGroupOwner -GroupId $gid -All -ErrorAction SilentlyContinue) } catch {}
+        $owners = @(); try { $owners = @(Get-MgGroupOwner -GroupId $gid -All -ErrorAction Stop) } catch { $ownerGaps += $gname }
         foreach ($o in $owners) {
             $oupn = Get-Ap $o 'userPrincipalName'; $oname = Get-Ap $o 'displayName'
             $label = if ($oupn) { $oupn } elseif ($oname) { $oname } else { $o.Id }
@@ -3010,8 +3197,16 @@ function Invoke-Check-AccessPaths {
             -WhyItMatters 'Groups with hidden membership or insufficient read permission cannot be fully evaluated for privilege paths - the absence of a finding here is a coverage gap, not a clean result.' `
             -RecommendedAction 'Grant Member.Read.Hidden (read-only) to evaluate hidden-membership groups, or review those groups manually.' -SourceFile $src
     }
+    $ownerGaps = @($ownerGaps | Select-Object -Unique)
+    if ($ownerGaps.Count -gt 0) {
+        Add-EntraFinding -Severity 'Low' -CheckId 'accesspaths' -Category 'Privileged Access' `
+            -Title ("{0} group(s) whose owners could not be read (coverage gap)" -f $ownerGaps.Count) `
+            -Evidence ("Owner lists could not be read for: {0}" -f (($ownerGaps | Select-Object -First 8) -join ', ')) `
+            -WhyItMatters 'If group owners cannot be read, ownership-based escalation paths through those groups cannot be evaluated - "no unsafe owners" is unknown, not confirmed.' `
+            -RecommendedAction 'Verify the audit identity can read group owners (Group.Read.All) and re-run, or review those groups'' owners manually.' -SourceFile $src
+    }
 
-    if ($dupRows.Count -eq 0 -and $ownEscRows.Count -eq 0 -and $caOwnRows.Count -eq 0 -and $hiddenGaps.Count -eq 0) {
+    if ($dupRows.Count -eq 0 -and $ownEscRows.Count -eq 0 -and $caOwnRows.Count -eq 0 -and $hiddenGaps.Count -eq 0 -and $ownerGaps.Count -eq 0) {
         Add-EntraFinding -Severity 'Information' -CheckId 'accesspaths' -Category 'Privileged Access' `
             -Title 'No duplicate privilege paths or ownership-escalation paths detected' `
             -Evidence 'Each privileged role is reached through a single reviewed path, and role-granting groups have no unsafe owners.' `
@@ -3025,7 +3220,11 @@ function Invoke-Check-AccessPaths {
 # ===========================================================================
 function Invoke-Check-StaleApps {
     $cut = (Get-Date).ToUniversalTime().AddDays(-$StaleAppDays)
-    $msftTenant = 'f8cdef31-a31e-4b4a-93e4-5f571e91255a'   # Microsoft first-party owner tenant
+    # BOTH Microsoft first-party owner tenants - built-in SPs are owned by either.
+    $msftTenants = @(
+        'f8cdef31-a31e-4b4a-93e4-5f571e91255a'   # Microsoft services
+        '72f988bf-86f1-41af-91ab-2d7cd011db47'   # Microsoft corporate
+    )
 
     # Service-principal sign-in activity (beta report; covers interactive + app-only sign-ins).
     # lastSignInDateTime is a persisted "last seen" timestamp, so it surfaces sign-ins older
@@ -3063,9 +3262,12 @@ function Invoke-Check-StaleApps {
         return
     }
 
-    $sps = @(Get-MgServicePrincipal -All -Property 'id,appId,displayName,servicePrincipalType,accountEnabled,passwordCredentials,keyCredentials,appOwnerOrganizationId' -ErrorAction Stop)
+    $sps = @(Get-EAServicePrincipals)
+    # Reuse the shared application cache (it carries createdDateTime + credentials),
+    # preserving the original ignore-on-failure semantics of this enrichment step.
     $appCreated = @{}; $appCreds = @{}
-    foreach ($a in @(Get-MgApplication -All -Property 'id,appId,displayName,createdDateTime,passwordCredentials,keyCredentials' -ErrorAction SilentlyContinue)) {
+    $appsAll = @(); try { $appsAll = @(Get-EAApplications) } catch {}
+    foreach ($a in $appsAll) {
         if ($a.AppId) {
             $appCreated[$a.AppId] = $a.CreatedDateTime
             $appCreds[$a.AppId] = ((@($a.PasswordCredentials).Count + @($a.KeyCredentials).Count) -gt 0)
@@ -3078,7 +3280,7 @@ function Invoke-Check-StaleApps {
         # Real applications only (skip managed identities etc.) and skip Microsoft first-party
         # service principals - those are built-in and are not the customer's to remove.
         if ($sp.ServicePrincipalType -and $sp.ServicePrincipalType -notin @('Application','Legacy')) { continue }
-        if ($sp.AppOwnerOrganizationId -and ([string]$sp.AppOwnerOrganizationId) -eq $msftTenant) { continue }
+        if ($sp.AppOwnerOrganizationId -and (([string]$sp.AppOwnerOrganizationId) -in $msftTenants)) { continue }
         $reviewed++
         $appId = [string]$sp.AppId
         $last = if ($lastByAppId.ContainsKey($appId)) { $lastByAppId[$appId] } else { $null }
@@ -3133,6 +3335,9 @@ function Invoke-Check-StaleApps {
 # ===========================================================================
 
 function New-FindingAnchor([object]$f) {
+    # Anchor is assigned once at Add-EntraFinding time so every report writer resolves
+    # the same finding to the same id; fall back for objects created outside it.
+    if ($f.PSObject.Properties['Anchor'] -and $f.Anchor) { return $f.Anchor }
     'finding-' + (New-Slug ('{0}-{1}' -f $f.Title, $f.CheckId))
 }
 
@@ -3382,11 +3587,12 @@ function Get-EntraMainJs {
   function osPrefersDark(){return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);}
   function currentTheme(){var s=null;try{s=localStorage.getItem('entraaudit-theme');}catch(_){}if(s==='light'||s==='dark')return s;return osPrefersDark()?'dark':'light';}
   function applyTheme(t){document.body.setAttribute('data-theme',t);var b=q('#themeToggle');if(b){b.innerText=t==='dark'?'Light mode':'Dark mode';}try{localStorage.setItem('entraaudit-theme',t);}catch(e){}}
-  function applyFilters(){var sev=q('#severityFilter').value;var query=(q('#searchFilter').value||'').toLowerCase().trim();var visible=0;findings().forEach(function(it){var s=it.getAttribute('data-sev');var text=(it.innerText||'').toLowerCase();var show=(sev==='All'||s===sev)&&(!query||text.indexOf(query)>=0);it.style.display=show?'':'none';if(show)visible++;});var el=q('#visibleFindings');if(el)el.value=visible;}
+  function applyFilters(){var sev=q('#severityFilter').value;var cf=q('#categoryFilter');var cat=cf?cf.value:'All';var query=(q('#searchFilter').value||'').toLowerCase().trim();var visible=0;findings().forEach(function(it){var s=it.getAttribute('data-sev');var c=it.getAttribute('data-category')||'';var text=(it.innerText||'').toLowerCase();var show=(sev==='All'||s===sev)&&(cat==='All'||c===cat)&&(!query||text.indexOf(query)>=0);it.style.display=show?'':'none';if(show)visible++;});var el=q('#visibleFindings');if(el)el.value=visible;}
   var b=q('#themeToggle');if(b){b.addEventListener('click',function(){var n=document.body.getAttribute('data-theme')==='dark'?'light':'dark';applyTheme(n);});}
   applyTheme(currentTheme());
   if(window.matchMedia){var mq=window.matchMedia('(prefers-color-scheme: dark)');var h=function(e){var s=null;try{s=localStorage.getItem('entraaudit-theme');}catch(_){}if(s!=='light'&&s!=='dark')applyTheme(e.matches?'dark':'light');};if(mq.addEventListener)mq.addEventListener('change',h);else if(mq.addListener)mq.addListener(h);}
   var sf=q('#severityFilter');if(sf)sf.addEventListener('change',applyFilters);
+  var cft=q('#categoryFilter');if(cft)cft.addEventListener('change',applyFilters);
   var se=q('#searchFilter');if(se)se.addEventListener('input',applyFilters);
   applyFilters();
 })();
@@ -3503,26 +3709,47 @@ $script:RiskBands = @(
 
 function Get-EntraRiskScore($findings) {
     # ACCUMULATING risk with DIMINISHING RETURNS: higher = worse. Findings are grouped
-    # into (check, severity) buckets and each bucket contributes points * sqrt(count),
-    # so volume still raises the score - 28 permanent Global Admins score well above 8
-    # (sqrt 28 vs sqrt 8) - but ONE systemic issue repeated across many objects can no
-    # longer dominate the whole score the way a straight per-finding sum did.
+    # into (check, RULE, severity) buckets - the same rule discriminator the stable
+    # finding ids use - and each bucket contributes points * sqrt(count). So volume
+    # still raises the score - 28 permanent Global Admins score well above 8
+    # (sqrt 28 vs sqrt 8) - but ONE systemic issue repeated across many objects cannot
+    # drown out every other signal, while DISTINCT issues inside the same check still
+    # add up instead of sharing one bucket (bucketing by check alone under-counted a
+    # check that surfaces several different problems at the same severity).
     # Unbounded on purpose, so magnitude stays visible.
     $counts = @{ Critical = 0; High = 0; Medium = 0; Low = 0; Information = 0 }
-    $buckets = @{}
+    $buckets = [ordered]@{}
     foreach ($f in $findings) {
         $sev = Normalize-Severity $f.Severity
         $counts[$sev]++
         if ($sev -eq 'Information') { continue }
-        $k = '{0}|{1}' -f [string]$f.CheckId, $sev
-        if ($buckets.ContainsKey($k)) { $buckets[$k].Count++ } else { $buckets[$k] = @{ Severity = $sev; Count = 1 } }
+        # Bucket rule: explicit RuleId when set; otherwise the digit-stripped title slug.
+        # PER-OBJECT findings title as "issue: object" - strip the object suffix so 28
+        # permanent Global Admins share ONE bucket (25 x sqrt(28)) instead of becoming 28
+        # single-count buckets, which would defeat the diminishing returns entirely.
+        # (Scoring only - the stable trend ids in New-FindingKey keep the full rule.)
+        $bucketTitle = [string]$f.Title
+        if (($f.AffectedPrincipal -or $f.ObjectId) -and $bucketTitle.Contains(':')) { $bucketTitle = (($bucketTitle -split ':', 2)[0]).Trim() }
+        $rule = if ($f.RuleId) { [string]$f.RuleId } else { (($bucketTitle -replace '\d+','') -replace '[^A-Za-z]+','-').Trim('-').ToLowerInvariant() }
+        $k = '{0}|{1}|{2}' -f [string]$f.CheckId, $rule, $sev
+        if ($buckets.Contains($k)) { $buckets[$k].Count++ }
+        else { $buckets[$k] = @{ Severity = $sev; Count = 1; CheckId = [string]$f.CheckId; Title = $bucketTitle } }
     }
     $raw = 0.0
-    foreach ($b in $buckets.Values) { $raw += $script:RiskPoints[$b.Severity] * [math]::Sqrt($b.Count) }
+    $drivers = foreach ($b in $buckets.Values) {
+        $pts = $script:RiskPoints[$b.Severity] * [math]::Sqrt($b.Count)
+        $raw += $pts
+        [pscustomobject]@{ Severity = $b.Severity; CheckId = $b.CheckId; Title = $b.Title; Count = $b.Count; Points = [math]::Round($pts, 1) }
+    }
     $score = [int][math]::Round($raw)
     $band = 'Clean'
     foreach ($bd in $script:RiskBands) { if ($score -ge $bd.Min) { $band = $bd.Level; break } }
-    [pscustomobject]@{ Score = $score; Band = $band; Critical = $counts.Critical; High = $counts.High; Medium = $counts.Medium; Low = $counts.Low; Information = $counts.Information }
+    [pscustomobject]@{
+        Score = $score; Band = $band
+        Critical = $counts.Critical; High = $counts.High; Medium = $counts.Medium; Low = $counts.Low; Information = $counts.Information
+        # Per-bucket contributions, largest first, so the report can show WHAT drives the score.
+        Drivers = @($drivers | Sort-Object Points -Descending)
+    }
 }
 
 # Higher score = worse, so map the risk band to the matching severity colour.
@@ -3609,6 +3836,10 @@ function Write-EntraResultsReport {
         $sectionHtml.Add("<section class='severity-section' id='section-$(New-Slug $sev)'><div class='section-header'><h2>$sev</h2><div class='section-count'>$($bucket.Count) findings</div></div>$($cards -join "`n")</section>") | Out-Null
     }
 
+    # Category filter options from the categories actually present in this run.
+    $catOptions = @('<option>All</option>') + @($Items | ForEach-Object { [string]$_.Category } | Where-Object { $_ } |
+        Sort-Object -Unique | ForEach-Object { "<option>$(HtmlEncode $_)</option>" })
+
     $css = Get-EntraMainCss
     $js  = Get-EntraMainJs
     $nav = Get-EntraPrimaryNav 'audit'
@@ -3665,6 +3896,8 @@ $nav
         <div class="toolbar-row">
           <div class="filter"><label for="severityFilter">Severity</label>
             <select id="severityFilter"><option>All</option><option>Critical</option><option>High</option><option>Medium</option><option>Low</option><option>Information</option></select></div>
+          <div class="filter"><label for="categoryFilter">Category</label>
+            <select id="categoryFilter">$($catOptions -join '')</select></div>
           <div class="filter"><label for="searchFilter">Search</label><input id="searchFilter" type="text" placeholder="Search findings, evidence, category"></div>
           <div class="filter"><label>Visible findings</label><input type="text" value="$total" id="visibleFindings" readonly></div>
         </div>
@@ -3677,7 +3910,7 @@ $js
 </body>
 </html>
 "@
-    Set-Content -LiteralPath $Path -Value $html -Encoding UTF8
+    Set-Content -LiteralPath $Path -Value $html -Encoding UTF8 -ErrorAction Stop
 }
 
 function Write-EntraRiskReport {
@@ -3711,6 +3944,15 @@ function Write-EntraRiskReport {
     $topHtml = if ($topRisks.Count -gt 0) {
         ($topRisks | ForEach-Object { "<li><span class='pill sev-Critical'>Critical</span> $(HtmlEncode $_.Title)</li>" }) -join "`n"
     } else { '<li>No Critical findings - no tenant-takeover-class risks identified.</li>' }
+
+    # Score drivers: the per-issue buckets behind the score (points = severity x sqrt(count)),
+    # largest contribution first, so the score is explainable instead of a black box.
+    $driverRows = foreach ($d in @($Score.Drivers | Select-Object -First 10)) {
+        $pct = if ($Score.Score -gt 0) { [math]::Round(100 * $d.Points / $Score.Score) } else { 0 }
+        "<tr><td><span class='pill sev-$($d.Severity)'>$($d.Severity)</span></td><td class='title'>$(HtmlEncode $d.Title)</td><td class='mono'>$(HtmlEncode $d.CheckId)</td><td style='text-align:right'>$($d.Count)</td><td style='text-align:right' class='mono'>$($d.Points)</td><td style='text-align:right' class='mono'>$pct%</td></tr>"
+    }
+    if (-not $driverRows) { $driverRows = @("<tr><td colspan='6'>No risk-bearing findings - nothing contributes to the score.</td></tr>") }
+    $driverNote = if (@($Score.Drivers).Count -gt 10) { "<div style='margin-top:6px'><small>Top 10 of $(@($Score.Drivers).Count) issue buckets shown; the full list is in the findings below.</small></div>" } else { '' }
 
     $catGroups = $Items | ForEach-Object { [pscustomobject]@{ Category=$_.Category; Severity=(Normalize-Severity $_.Severity) } } |
         Group-Object Category | Sort-Object Name
@@ -3773,9 +4015,15 @@ $nav
   </div>
 
   <div class="section">
+    <h2>What drives the score</h2>
+    <table><thead><tr><th>Severity</th><th style="text-align:left">Issue</th><th style="text-align:left">Check</th><th style="text-align:right">Findings</th><th style="text-align:right">Points</th><th style="text-align:right">Share</th></tr></thead><tbody>$($driverRows -join "`n")</tbody></table>
+    $driverNote
+  </div>
+
+  <div class="section">
     <h2>Interpretation</h2>
     <div class="callout">
-      <p><b>Score:</b> each finding adds points by severity (Critical $($script:RiskPoints.Critical), High $($script:RiskPoints.High), Medium $($script:RiskPoints.Medium), Low $($script:RiskPoints.Low); Information $($script:RiskPoints.Information)), with <b>diminishing returns for repeats of the same issue</b>: findings are grouped per check and severity, and each group contributes points &times; &radic;count. So <b>a higher score is worse</b> and volume still raises it (28 permanent Global Admins score well above 8), but one systemic issue repeated across many objects cannot drown out every other signal. The score is unbounded. The current score is <b>$($Score.Score)</b> (<b>$($Score.Band)</b>).</p>
+      <p><b>Score:</b> each finding adds points by severity (Critical $($script:RiskPoints.Critical), High $($script:RiskPoints.High), Medium $($script:RiskPoints.Medium), Low $($script:RiskPoints.Low); Information $($script:RiskPoints.Information)), with <b>diminishing returns for repeats of the same issue</b>: findings are grouped per issue (rule) and severity, and each group contributes points &times; &radic;count. So <b>a higher score is worse</b> and volume still raises it (28 permanent Global Admins score well above 8), but one systemic issue repeated across many objects cannot drown out every other signal, while distinct issues each add their own weight. The score is unbounded. The current score is <b>$($Score.Score)</b> (<b>$($Score.Band)</b>).</p>
       <div class="matrix-wrap"><br>
         <table class="matrix"><thead><tr><th>Band</th><th>Score range</th><th>Interpretation</th></tr></thead><tbody>$($matrixRows -join "`n")</tbody></table>
       </div>
@@ -3806,7 +4054,7 @@ $js
 </body>
 </html>
 "@
-    Set-Content -LiteralPath $Path -Value $html -Encoding UTF8
+    Set-Content -LiteralPath $Path -Value $html -Encoding UTF8 -ErrorAction Stop
 }
 
 function Write-PostureSummaryReport {
@@ -3829,8 +4077,9 @@ function Write-PostureSummaryReport {
     $js  = Get-EntraRiskJs2
 
     $licNote = @()
-    if (-not $script:HasP2) { $licNote += 'Entra ID P2 not detected - PIM eligibility, Identity Protection (risky users) and risk-based checks may be license-gated.' }
-    if (-not $script:HasP1) { $licNote += 'Entra ID P1 not detected - sign-in activity (stale users / legacy auth) may be unavailable.' }
+    if (-not $script:LicenseKnown) { $licNote += 'License detection FAILED (the subscribed-SKU read errored) - the tenant may hold P1/P2; gated checks were skipped as license-unknown, not because the license is absent.' }
+    if (-not $script:HasP2) { $licNote += ("Entra ID P2 not {0} - PIM eligibility, Identity Protection (risky users) and risk-based checks may be license-gated." -f ($(if ($script:LicenseKnown) { 'detected' } else { 'confirmed (detection failed)' }))) }
+    if (-not $script:HasP1) { $licNote += ("Entra ID P1 not {0} - sign-in activity (stale users / legacy auth) may be unavailable." -f ($(if ($script:LicenseKnown) { 'detected' } else { 'confirmed (detection failed)' }))) }
     $licHtml = if ($licNote.Count -gt 0) { '<ul>' + (($licNote | ForEach-Object { "<li>$(HtmlEncode $_)</li>" }) -join '') + '</ul>' } else { '<p>Premium licensing (P1/P2) detected - all checks available.</p>' }
 
     $html = @"
@@ -3881,7 +4130,7 @@ $js
 </body>
 </html>
 "@
-    Set-Content -LiteralPath $Path -Value $html -Encoding UTF8
+    Set-Content -LiteralPath $Path -Value $html -Encoding UTF8 -ErrorAction Stop
 }
 
 function Write-RawDataIndexReport {
@@ -3932,7 +4181,7 @@ $js
 </body>
 </html>
 "@
-    Set-Content -LiteralPath $Path -Value $html -Encoding UTF8
+    Set-Content -LiteralPath $Path -Value $html -Encoding UTF8 -ErrorAction Stop
 }
 
 # Posture page needs only the theme toggle (no findings table) - reuse a trimmed JS.
@@ -4000,6 +4249,7 @@ function Invoke-EntraAudit {
     $anySelected = $all -or ($select -and $select.Count) -or (@($individual.Values | Where-Object { $_ }).Count -gt 0)
 
     if ($installdeps) {
+        Add-EAOfflineModulesPath   # so an offline -ModulesPath is honored by the install too
         Install-EntraModules
         if (-not $anySelected) { Write-Good "Dependencies installed. Re-run with -all (or specific checks) to audit."; return }
     }
@@ -4027,15 +4277,20 @@ function Invoke-EntraAudit {
     try { $script:Tenant = Get-MgOrganization -ErrorAction SilentlyContinue | Select-Object -First 1 } catch {}
     # License detection from enabled SERVICE PLANS (not just SKU part number) - many
     # tenants get Entra P1/P2 bundled inside other SKUs (e.g. EMS, M365 E3/E5).
+    # A FAILED read must not masquerade as 'no license': track it so gated checks are
+    # reported as 'license unknown' instead of a false 'Skipped-NoLicense'.
     try {
-        foreach ($sku in @(Get-MgSubscribedSku -All -ErrorAction SilentlyContinue)) {
+        foreach ($sku in @(Get-MgSubscribedSku -All -ErrorAction Stop)) {
             $enabledPlans = @($sku.ServicePlans | Where-Object { $_.ProvisioningStatus -eq 'Success' } | ForEach-Object { $_.ServicePlanName })
             if ($sku.SkuPartNumber -eq 'AAD_PREMIUM_P2' -or $enabledPlans -contains 'AAD_PREMIUM_P2') { $script:HasP2 = $true }
             if ($sku.SkuPartNumber -eq 'AAD_PREMIUM'    -or $enabledPlans -contains 'AAD_PREMIUM')    { $script:HasP1 = $true }
             if ($enabledPlans -match 'WorkloadIdentit') { $script:WorkloadIdP = $true }
         }
         if ($script:HasP2) { $script:HasP1 = $true }
-    } catch {}
+    } catch {
+        $script:LicenseKnown = $false
+        Write-Warn2 "License (SKU) detection failed: $($_.Exception.Message) - license-gated checks will be reported as 'license unknown', not 'no license'."
+    }
 
     $tenantName = if ($script:Tenant -and $script:Tenant.DisplayName) { $script:Tenant.DisplayName } else { [string]$ctx.TenantId }
     Write-Good ("Tenant: {0} | Licensing P1={1} P2={2}" -f $tenantName, $script:HasP1, $script:HasP2)
@@ -4047,9 +4302,11 @@ function Invoke-EntraAudit {
     $root = if ($OutputRoot) { $OutputRoot } else { $PSScriptRoot }
     $script:RunRoot = Join-Path $root ("{0}-EntraAudit-{1}" -f $safeTenant, $ts)
     $script:HtmlDir = Join-Path $script:RunRoot 'HTML Reports'
-    $script:RawDir  = Join-Path $script:RunRoot 'Raw Data\Source'
-    New-Item -ItemType Directory -Force -Path $script:HtmlDir | Out-Null
-    New-Item -ItemType Directory -Force -Path $script:RawDir  | Out-Null
+    $script:RawDir  = Join-Path $script:RunRoot 'Raw Data' 'Source'   # segment-wise: '\' is a literal filename char on non-Windows pwsh
+    # Fail fast: if the output folders cannot be created, every later write fails too -
+    # do not run the whole audit only to print 'Audit complete' over a missing report.
+    New-Item -ItemType Directory -Force -Path $script:HtmlDir -ErrorAction Stop | Out-Null
+    New-Item -ItemType Directory -Force -Path $script:RawDir  -ErrorAction Stop | Out-Null
 
     # Run the selected checks
     Write-Host ""
@@ -4104,8 +4361,10 @@ function Invoke-EntraAudit {
         }
     }
     try {
-        ConvertTo-SafeCsvRows $exportRows | Export-Csv -LiteralPath (Join-Path $script:RunRoot 'Findings.csv') -NoTypeInformation -Encoding UTF8
-        @($exportRows) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $script:RunRoot 'Findings.json') -Encoding UTF8
+        # utf8BOM so Excel decodes non-ASCII display names / UPNs correctly; -InputObject
+        # keeps Findings.json a JSON ARRAY even when the run produced exactly one finding.
+        ConvertTo-SafeCsvRows $exportRows | Export-Csv -LiteralPath (Join-Path $script:RunRoot 'Findings.csv') -NoTypeInformation -Encoding utf8BOM
+        ConvertTo-Json -InputObject @($exportRows) -Depth 5 | Set-Content -LiteralPath (Join-Path $script:RunRoot 'Findings.json') -Encoding UTF8
     } catch { Write-Warn2 "Could not write Findings.json/csv: $($_.Exception.Message)" }
 
     # Summary
@@ -4125,18 +4384,23 @@ function Invoke-EntraAudit {
 # ===========================================================================
 # Entry point
 # ===========================================================================
+$script:AuditFailed = $false
 try {
     Invoke-EntraAudit
 } catch {
     Write-Err2 "Audit failed: $($_.Exception.Message)"
     Write-Err2 $_.ScriptStackTrace
+    $script:AuditFailed = $true
 } finally {
+    # Only tear down a session this script created - never a pre-existing one the
+    # operator connected themselves before running the audit.
     try {
-        if (Get-Command Get-MgContext -ErrorAction SilentlyContinue) {
+        if ($script:GraphConnectedByScript -and (Get-Command Get-MgContext -ErrorAction SilentlyContinue)) {
             if (Get-MgContext) { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null; Write-Info "Disconnected from Microsoft Graph." }
         }
     } catch {}
 }
+if ($script:AuditFailed) { exit 1 }
 
 
 

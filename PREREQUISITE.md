@@ -32,14 +32,15 @@ There are two ways to authenticate — pick one:
 ```powershell
 .\EntraAudit-PS7.ps1 -installdeps
 ```
-or manually:
+or manually (pin to v2.x, like `-installdeps` does, so sub-module majors can't mix):
 ```powershell
 $modules = @(
   'Microsoft.Graph.Authentication','Microsoft.Graph.Identity.DirectoryManagement',
   'Microsoft.Graph.Identity.SignIns','Microsoft.Graph.Identity.Governance',
   'Microsoft.Graph.Users','Microsoft.Graph.Groups','Microsoft.Graph.Applications',
   'Microsoft.Graph.Reports','Microsoft.Graph.DirectoryObjects')
-Install-Module $modules -Scope CurrentUser -Repository PSGallery -Force
+Install-Module $modules -Scope CurrentUser -Repository PSGallery -Force `
+  -MinimumVersion 2.0.0 -MaximumVersion 2.999.999
 ```
 
 **Offline (air-gapped):** on an internet-connected machine, run `Save-Module` into a folder, copy the folder across, then point the script at it:
@@ -54,7 +55,9 @@ Save-Module Microsoft.Graph.Authentication,Microsoft.Graph.Identity.DirectoryMan
 .\EntraAudit-PS7.ps1 -all -ModulesPath C:\GraphModules
 ```
 
-> Keep all Microsoft.Graph sub-modules at the **same version** to avoid assembly-load conflicts.
+`-ModulesPath` also works together with `-installdeps`: the installer sees the offline modules and skips the gallery download instead of trying to go online.
+
+> Keep all Microsoft.Graph sub-modules at the **same version** to avoid assembly-load conflicts. `-installdeps` pins to v2.x and the script warns at import time if it finds mixed majors.
 
 ---
 
@@ -171,11 +174,13 @@ $cert.Thumbprint                                                  # use this wit
   -CertificateThumbprint A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0
 ```
 
+> `-ClientId` and `-CertificateThumbprint` must be supplied **together**. If only one is given the script stops with an error — it deliberately does **not** fall back to an interactive sign-in prompt, which would hang a scheduled run (and sign in as the wrong identity).
+
 ---
 
 ## Licensing — what each tier unlocks
 
-The script detects your SKUs (`Get-MgSubscribedSku`) and records the tier in the report. License-gated checks are reported as **Skipped-NoLicense**, never as "clean".
+The script detects your SKUs (`Get-MgSubscribedSku`) and records the tier in the report. License-gated checks are reported as **Skipped-NoLicense**, never as "clean". If the SKU read itself **fails**, gated checks are reported as **Skipped-LicenseUnknown** instead — the tenant may well be licensed, so a failed detection is never presented as "no license".
 
 | Tier | Unlocks |
 |---|---|
@@ -196,14 +201,14 @@ If you want to grant the absolute minimum for a subset of checks, this maps each
 |---|---|
 | `Directory.Read.All` | underpins most; tenant info, accounts, guests, posture, apps, devices, recent changes, health |
 | `Organization.Read.All` | tenant-info, tenanthealth |
-| `RoleManagement.Read.Directory` | privroles, directoryroles, breakglass, guests (priv), mfa (admin x-ref), apps (group roles), riskyusers (priv x-ref) |
+| `RoleManagement.Read.Directory` | privroles, directoryroles, accesspaths, breakglass, guests (priv), mfa (admin x-ref), apps (group roles), riskyusers (priv x-ref), staleusers (priv x-ref) |
 | `RoleEligibilitySchedule.Read.Directory` + `RoleAssignmentSchedule.Read.Directory` | privroles, directoryroles (PIM instances) |
 | `User.Read.All` | accounts, staleusers, guests, recentchanges |
 | `AuditLog.Read.All` | staleusers, mfa (registration report), legacyauth, recentchanges, guests, staleapps (service-principal sign-in activity, beta report) |
 | `Policy.Read.All` | tenantposture, capolicies, trusts, guests (guest policy) |
-| `Application.Read.All` | apps, appcredentials |
+| `Application.Read.All` | apps, appcredentials, staleapps |
 | `DelegatedPermissionGrant.Read.All` | consentgrants |
-| `Group.Read.All` | guests, apps (role-assignable groups), recentchanges |
+| `Group.Read.All` | accesspaths, guests, apps (role-assignable groups), recentchanges |
 | `Device.Read.All` | devices |
 | `IdentityRiskyUser.Read.All` / `IdentityRiskEvent.Read.All` | riskyusers |
 | `IdentityRiskyServicePrincipal.Read.All` | riskyserviceprincipals (gated on Workload Identities Premium, not P2) |
@@ -219,7 +224,7 @@ If you want to grant the absolute minimum for a subset of checks, this maps each
 
 ## Verifying it's read-only
 
-At startup the script calls `Get-MgContext` and **aborts** if any granted scope matches `ReadWrite`, `.Write`, `AccessAsUser`, or `FullControl`. You can confirm at any time:
+At startup the script calls `Get-MgContext` and **aborts** if any granted scope matches a write-capable token: `ReadWrite`, `.Write`, `.Send`, `.Create`, `.Delete`, `.Update`, `.Invite`, `.Manage` (e.g. `Sites.Manage.All`, `User.ManageIdentities.All`), `PrivilegedOperations`, `ManageAsApp`, `AccessAsUser`, `FullControl`, `full_access` or `Impersonation`. You can confirm at any time:
 
 ```powershell
 (Get-MgContext).Scopes      # should be all *.Read.* entries

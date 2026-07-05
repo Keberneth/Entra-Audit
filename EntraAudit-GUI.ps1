@@ -224,6 +224,7 @@ $lblExcludeHint = Add-Label "Select checks to skip when running all:" ($y - 4) $
 $lblExcludeHint.ForeColor = [System.Drawing.Color]::Gray
 $y += 22
 $excludeCheckboxes = @{}
+$excludeDescLabels = @()   # kept so the whole exclude section can be hidden together
 $col = 0
 foreach ($key in $AuditChecks.Keys) {
     $xPos = if ($col -eq 0) { $leftLabel } else { $leftLabel + 470 }
@@ -232,6 +233,7 @@ foreach ($key in $AuditChecks.Keys) {
     $exDesc.ForeColor = [System.Drawing.Color]::DimGray
     $exChk.Tag = "exclude_$key"
     $excludeCheckboxes[$key] = $exChk
+    $excludeDescLabels += $exDesc
     $col++
     if ($col -ge 2) { $col = 0; $y += 24 }
 }
@@ -307,13 +309,18 @@ function Update-Preview {
 # tenant ids and output folders with spaces/quotes/special characters are passed safely.
 # -------------------------
 function Test-IsGuid([string]$s) { $g = [guid]::Empty; return [guid]::TryParse(($s).Trim(), [ref]$g) }
-function Test-IsThumbprint([string]$s) { return ((($s -replace '\s','')) -match '^[0-9A-Fa-f]{40}$') }
+# Strip whitespace AND Unicode format chars (\p{Cf}: LRM/RLM/BOM etc.) - certificate
+# dialogs copy thumbprints with invisible marks that '\s' does not match, which would
+# fail validation with a misleading "must be 40 hex characters" error.
+function Test-IsThumbprint([string]$s) { return ((($s -replace '[\s\p{Cf}]','')) -match '^[0-9A-Fa-f]{40}$') }
 
 # Start-Process -ArgumentList joins array elements with spaces WITHOUT quoting, so any value
 # containing whitespace (e.g. the script path "C:\Users\Niclas Skarnes\..." or an -OutputRoot
-# with spaces) MUST be pre-quoted or it is split into separate tokens.
+# with spaces) MUST be pre-quoted or it is split into separate tokens. ';' and ',' are also
+# quoted: pasted into a PowerShell console, an unquoted ';' terminates the statement and an
+# unquoted 'a,b' is parsed as an array and splatted into separate native arguments.
 function ConvertTo-ArgLine([string[]]$InputArgs) {
-    @($InputArgs | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"','""') + '"' } else { $_ } })
+    @($InputArgs | ForEach-Object { if ($_ -match '[\s";,]') { '"' + ($_ -replace '"','""') + '"' } else { $_ } })
 }
 
 # Launch pwsh via .NET ProcessStartInfo.ArgumentList: each element is passed as a distinct
@@ -333,7 +340,12 @@ function Start-PwshWithArgs {
 function Build-LaunchArgs {
     param([switch]$InstallOnly)
     $a = @('-NoExit','-ExecutionPolicy','Bypass','-File', $script:AuditScriptPath)
-    if ($InstallOnly) { $a += '-installdeps'; return $a }
+    if ($InstallOnly) {
+        $a += '-installdeps'
+        # honor the offline modules path for installs too, not only audit runs
+        if ($script:txtModulesPath.Text.Trim()) { $a += @('-ModulesPath', $script:txtModulesPath.Text.Trim()) }
+        return $a
+    }
 
     if ($script:chkAll.Checked) {
         $a += '-all'
@@ -345,7 +357,7 @@ function Build-LaunchArgs {
     }
     if ($script:rdoAppOnly.Checked) {
         if ($script:txtClientId.Text.Trim()) { $a += @('-ClientId', $script:txtClientId.Text.Trim()) }
-        if ($script:txtThumb.Text.Trim())    { $a += @('-CertificateThumbprint', ($script:txtThumb.Text -replace '\s','')) }
+        if ($script:txtThumb.Text.Trim())    { $a += @('-CertificateThumbprint', ($script:txtThumb.Text -replace '[\s\p{Cf}]','')) }
     } elseif ($script:chkDeviceCode.Checked) {
         $a += '-UseDeviceCode'
     }
@@ -373,10 +385,14 @@ $chkAll.Add_CheckedChanged({
         $script:checkboxes[$key].Enabled = -not $allChecked
         if ($allChecked) { $script:checkboxes[$key].Checked = $false }
     }
+    # Hide the WHOLE exclude section (checkboxes + descriptions, not only the headers) -
+    # orphaned disabled checkboxes under a vanished header read as broken UI.
     foreach ($key in $script:excludeCheckboxes.Keys) {
         $script:excludeCheckboxes[$key].Enabled = $allChecked
+        $script:excludeCheckboxes[$key].Visible = $allChecked
         if (-not $allChecked) { $script:excludeCheckboxes[$key].Checked = $false }
     }
+    foreach ($lbl in $script:excludeDescLabels) { $lbl.Visible = $allChecked }
     $script:lblExclude.Visible = $allChecked
     $script:lblExcludeHint.Visible = $allChecked
     Update-Preview
@@ -445,7 +461,11 @@ $btnRun.Add_Click({
         @{ n='Recent-change window'; t=$script:txtRecentDays }, @{ n='Stale-application window'; t=$script:txtStaleApp }
     )) {
         $v = $pair.t.Text.Trim()
-        if ($v -and ($v -notmatch '^\d+$')) { Msg-Error ("{0} days must be a whole number." -f $pair.n); return }
+        # 1-3650 (mirrors the script's ValidateRange): 0 produces meaningless results and
+        # an Int32-overflowing value would kill the launched pwsh at parameter binding.
+        if ($v -and ($v -notmatch '^\d{1,4}$' -or [int]$v -lt 1 -or [int]$v -gt 3650)) {
+            Msg-Error ("{0} days must be a whole number between 1 and 3650." -f $pair.n); return
+        }
     }
     if ($script:txtOutput.Text.Trim() -and -not (Test-Path -IsValid $script:txtOutput.Text.Trim())) {
         Msg-Error "Output folder path is not a valid path."; return

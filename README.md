@@ -67,8 +67,8 @@ Results are written to a tenant-named, timestamped folder (mirrors the AD audit 
 ```
 <TenantName>-EntraAudit-<yyyyMMdd-HHmm>\
    HTML Reports\
-      EntraAudit-Results.html           # all findings, grouped by severity, filterable
-      Risk-Report.html                  # executive risk score (unbounded, higher = worse, diminishing returns per issue), band matrix, top risks
+      EntraAudit-Results.html           # all findings, grouped by severity, filterable (severity / category / free text)
+      Risk-Report.html                  # executive risk score (unbounded, higher = worse, diminishing returns per issue), band matrix, top risks, score drivers
       Posture-Summary.html              # per-check status grid + licensing/coverage
       Raw-Data.html                     # index of every raw dataset (HTML/CSV/TXT links)
    Raw Data\Source\
@@ -196,7 +196,9 @@ Unattended (app-only, certificate), don't open a browser window:
 
 ## How the risk score works
 
-The Risk-Report **accumulates** points per finding by severity, with **diminishing returns for repeats of the same issue**: findings are grouped into *(check, severity)* buckets and each bucket contributes **points × √count**. So **a higher score is worse** and volume still raises it — 28 permanent Global Admins (28 Critical findings in one bucket) score well above 8 (`25×√28 ≈ 132` vs `25×√8 ≈ 71`) — but one systemic issue repeated across many objects can no longer drown out every other signal the way a straight per-finding sum did. The score is **unbounded**, so the magnitude stays visible.
+The Risk-Report **accumulates** points per finding by severity, with **diminishing returns for repeats of the same issue**: findings are grouped into *(check, rule, severity)* buckets — the *rule* is an explicit `RuleId` where set, else the digit-stripped title with any per-object suffix removed (so every *"Permanent (standing) Global Administrator: `<user>`"* finding lands in **one** bucket) — and each bucket contributes **points × √count**. So **a higher score is worse** and volume still raises it — 28 permanent Global Admins (28 Critical findings in one bucket) score well above 8 (`25×√28 ≈ 132` vs `25×√8 ≈ 71`) — but one systemic issue repeated across many objects can no longer drown out every other signal the way a straight per-finding sum did, while **distinct issues inside the same check each add their own weight** instead of sharing one bucket. The score is **unbounded**, so the magnitude stays visible.
+
+The Risk-Report shows a **"What drives the score"** table — every issue bucket with its finding count, its points contribution and its share of the total — so the score is explainable rather than a black box.
 
 | Severity | Points (per bucket, × √count) |
 |---|---|
@@ -221,10 +223,12 @@ Severity for standing role assignments is also **tiered by role**: tier-0 roles 
 ## Notes & limitations
 
 - **Read-only guarantee:** the script self-aborts if Graph returns any write scope. In **app-only** mode it goes further — it reads the app's *actual* granted app-role assignments (across all resource APIs) and **fails closed** unless **every** one is on the **exact documented audit allowlist**. *Read-only does not mean low-impact: broad read permissions (e.g. `Mail.Read`) can expose sensitive data, so the app-only startup check permits only the documented audit permissions, not arbitrary `*.Read.*` permissions* — anything else (write, send, create, delete, update, invite, manage, impersonate, full-control, **or any unknown/custom app role**) is refused. Remediation is always left to the operator.
-- **License gating:** P1-gated checks (`staleusers`, `legacyauth`) and P2-gated checks (`pimpolicies`, `riskyusers`) are reported as *Skipped-NoLicense* (not "clean") when the tier isn't detected; license detection reads enabled **service plans**, so P1/P2 bundled inside EMS/M365 SKUs is recognised. `riskyserviceprincipals` is a **separate** check gated on **Workload Identities Premium** (not P2), so a Workload-ID-Premium tenant without P2 still evaluates risky workload identities. `privileged-roles` always runs (it falls back to classic role assignments without PIM).
+- **License gating:** P1-gated checks (`staleusers`, `legacyauth`) and P2-gated checks (`pimpolicies`, `riskyusers`) are reported as *Skipped-NoLicense* (not "clean") when the tier isn't detected; license detection reads enabled **service plans**, so P1/P2 bundled inside EMS/M365 SKUs is recognised. If the license read itself **fails**, gated checks are reported as *Skipped-LicenseUnknown* instead — a failed detection is never presented as "no license". `riskyserviceprincipals` is a **separate** check gated on **Workload Identities Premium** (not P2), so a Workload-ID-Premium tenant without P2 still evaluates risky workload identities. `privileged-roles` always runs (it falls back to classic role assignments without PIM).
 - **Posture Summary status:** the per-check grid distinguishes `RiskFindings(n)` (an actual risk-level finding), `InfoOnly(n)` (only Information-level baselines were added — treated as clean), `Pass`, `Skipped-*` and `Error`, so informational baselines don't make a clean check look noisy.
 - **Stable finding ids:** `Findings.json`/`.csv` ids are count-independent (a finding's id doesn't change when "5 stale users" becomes "7"), so they're usable for run-over-run trend/diff. Every check also always writes its CSV (a `NoData` row when empty) so automation can rely on the file existing.
-- **Sign-in logs** are retained ~30 days; the legacy-auth check only sees that window.
+- **Failed reads are never "clean":** when a Graph read that feeds a check fails (role assignments, CA policies, group members/owners, Identity Protection), the check reports *could not be evaluated / coverage gap* — or errors outright — instead of silently passing. An audit that couldn't see the data says so.
+- **Exit code:** the script exits `1` when the audit run fails (connection, output folder, report generation), so scheduled/unattended runs can detect failure.
+- **Sign-in logs** are retained ~30 days; the legacy-auth check only sees that window (the legacy-client filter is applied server-side, so large tenants no longer download the full sign-in log).
 - A few signals (on-prem banned-password configuration, some Identity Protection detail) are not fully exposed by Graph read APIs and are reported with that caveat.
 
 See **[PREREQUISITE.md](PREREQUISITE.md)** for the exact Graph permissions, the recommended read-only roles, and app-registration setup.
