@@ -11,7 +11,8 @@
 
   Requirements:
     - PowerShell 7 (pwsh.exe)
-    - EntraAudit-PS7.ps1 in the same folder as this script
+    - EntraAudit-PS7.ps1 and both EntraAudit-Checks-*.ps1 companion libraries
+      in the same folder as this script
 #>
 
 [CmdletBinding()]
@@ -28,8 +29,10 @@ Write-Host "Opening Entra Audit GUI..."
 
 $ScriptDir = $PSScriptRoot
 $AuditScriptPath = Join-Path $ScriptDir 'EntraAudit-PS7.ps1'
-if (-not (Test-Path $AuditScriptPath)) {
-    Write-Error "EntraAudit-PS7.ps1 not found in '$ScriptDir'. Place this GUI in the same folder as EntraAudit-PS7.ps1."
+$RequiredAuditFiles = @('EntraAudit-PS7.ps1','EntraAudit-Checks-Governance.ps1','EntraAudit-Checks-Applications.ps1')
+$MissingAuditFiles = @($RequiredAuditFiles | Where-Object { -not (Test-Path -LiteralPath (Join-Path $ScriptDir $_) -PathType Leaf) })
+if ($MissingAuditFiles.Count -gt 0) {
+    Write-Error "Required audit file(s) not found in '$ScriptDir': $($MissingAuditFiles -join ', '). Keep the GUI, main script, and both check libraries together."
     exit 1
 }
 
@@ -74,6 +77,18 @@ $AuditChecks = [ordered]@{
     authmethodpolicy = "Tenant authentication-methods policy (weak vs phishing-resistant)"
     accesspaths    = "Effective-access / attack-path graph (duplicate & ownership privilege paths)"
     staleapps      = "Stale / unused applications by service-principal sign-in activity - needs P1"
+    recommendations = "Microsoft Entra recommendations and unresolved high-impact actions"
+    securescore    = "Microsoft Identity Secure Score and incomplete control posture"
+    accessreviews  = "Access-review coverage, recurrence, reviewers and completion behavior"
+    identitygovernance = "Entitlement management, lifecycle workflows, Terms of Use and PIM for Groups"
+    authrecovery   = "SSPR/recovery readiness, registration campaign and system-preferred MFA"
+    groupgovernance = "Group ownership, role-assignable groups, dynamic rules and lifecycle settings"
+    externaldelegation = "External delegation, GDAP relationships and partner trust governance"
+    federationhealth = "Federated-domain certificate, endpoint and hybrid authentication health"
+    workloadcredentials = "Application and service-principal credentials, federated identities and policy enforcement"
+    enterpriseapps = "Enterprise-app ownership, assignment controls and high-impact permissions"
+    monitoring     = "Audit/sign-in visibility, diagnostic export and alert-rule/action-group inventory"
+    changemonitoring = "Recent security-sensitive directory, policy, role and application changes"
 }
 
 # -------------------------
@@ -157,7 +172,7 @@ $y += 36
 $lblVer = Add-Label "Script: EntraAudit-PS7.ps1  |  Location: $ScriptDir" $y 940
 $lblVer.ForeColor = [System.Drawing.Color]::Gray
 $y += 28
-$lblRo = Add-Label "This tool only READS from Microsoft Graph. It never creates, changes or deletes anything." $y 940
+$lblRo = Add-Label "Audit checks only READ Graph and, when available, Azure Resource Manager. They never change tenant resources." $y 940
 $lblRo.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 60)
 $y += 26
 Add-Separator $y; $y += 12

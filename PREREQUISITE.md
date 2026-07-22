@@ -1,6 +1,6 @@
 # PREREQUISITE — Permissions & Setup for EntraAudit-PS7
 
-This document lists exactly what EntraAudit-PS7 needs to run. Everything here is **read-only**. The tool requests only `*.Read.*` Graph scopes, issues only `GET` requests, and **refuses to run if it is ever granted a write-capable scope**.
+This document lists exactly what EntraAudit-PS7 needs to run. All **audit/data-collection API calls are read-only**: the tool requests only documented Graph read permissions, issues only `GET` requests, and **refuses to run if it is ever granted a write-capable Graph permission**. Optional Azure-monitoring enrichment also uses retrieval-only Azure Resource Manager calls. First-time interactive OAuth consent is a separate operator-authorized setup grant for the requested read permissions; pre-consent them before the audit window when literal zero setup changes during execution is required.
 
 There are two ways to authenticate — pick one:
 
@@ -12,6 +12,7 @@ There are two ways to authenticate — pick one:
 ## 0. Software prerequisites
 
 - **PowerShell 7.x** (`pwsh.exe`) on Windows.
+- `EntraAudit-PS7.ps1` and both companion check libraries (`EntraAudit-Checks-Governance.ps1` and `EntraAudit-Checks-Applications.ps1`) in the same folder. Keep `EntraAudit-GUI.ps1` there too when using the GUI.
 - **Microsoft Graph PowerShell SDK v2.x** — the script uses these sub-modules (not the giant meta-module):
 
   | Module | Provides |
@@ -65,14 +66,14 @@ Save-Module Microsoft.Graph.Authentication,Microsoft.Graph.Identity.DirectoryMan
 
 ### A.1 Directory roles for the auditor account
 
-Assign the account these two **read-only** roles (together they cover every check with zero write ability):
+Assign the account these two **read-only** directory roles. Together they cover nearly all Microsoft Graph evidence with zero write ability; the optional Azure-monitoring enrichment is covered separately in [Section C](#c-optional-azure-diagnostic-setting-and-alert-coverage):
 
 | Role | Why |
 |---|---|
 | **Global Reader** | Read-only mirror of Global Administrator: configuration, policies, applications, directory objects, sync status. |
 | **Security Reader** | Identity Protection (risky users/detections), security policies, Secure Score. |
 
-No other role is required. Do **not** use Global Administrator — Global Reader is sufficient and keeps the audit demonstrably read-only.
+Do **not** use Global Administrator. One documented exception remains: tenant-wide delegated `federatedIdentityCredentials` enumeration does not list Global Reader or Security Reader as supported roles. The `workloadcredentials` check reports that relationship evidence as incomplete rather than clean. Use the read-only **app-only** mode with `Application.Read.All` when complete tenant-wide federated-credential coverage is required; do not grant a write-capable application-admin role merely to run an audit.
 
 ### A.2 Delegated scopes requested at sign-in
 
@@ -89,7 +90,6 @@ Application.Read.All
 User.Read.All
 Group.Read.All
 Organization.Read.All
-DelegatedPermissionGrant.Read.All
 Device.Read.All
 IdentityRiskyUser.Read.All
 IdentityRiskEvent.Read.All
@@ -99,6 +99,19 @@ OnPremDirectorySynchronization.Read.All
 Reports.Read.All
 RoleManagementPolicy.Read.Directory
 Member.Read.Hidden
+DirectoryRecommendations.Read.All
+SecurityEvents.Read.All
+SecurityAlert.Read.All
+AccessReview.Read.All
+EntitlementManagement.Read.All
+LifecycleWorkflows.Read.All
+Agreement.Read.All
+PrivilegedAssignmentSchedule.Read.AzureADGroup
+PrivilegedEligibilitySchedule.Read.AzureADGroup
+RoleManagementPolicy.Read.AzureADGroup
+DelegatedAdminRelationship.Read.All
+Domain.Read.All
+Domain-InternalFederation.Read.All
 ```
 
 ### A.3 Run it
@@ -111,7 +124,7 @@ A browser / WAM sign-in window appears. In a terminal with no browser (SSH, some
 .\EntraAudit-PS7.ps1 -all -UseDeviceCode
 ```
 
-> If the auditor account is missing a scope, only the checks that need it are skipped (shown as **Skipped-NoScope** in the Posture-Summary) — the rest of the audit still runs.
+> If the auditor account is missing a scope, the affected check is shown as **Skipped-NoScope**, or a composite check marks only the affected sub-control **Incomplete**. The rest of the audit still runs.
 
 ---
 
@@ -133,7 +146,6 @@ For scheduled runs with no human present. You create one dedicated, read-only ap
    User.Read.All
    Group.Read.All
    Organization.Read.All
-   DelegatedPermissionGrant.Read.All
    Device.Read.All
    IdentityRiskyUser.Read.All
    IdentityRiskEvent.Read.All
@@ -143,6 +155,18 @@ For scheduled runs with no human present. You create one dedicated, read-only ap
    Reports.Read.All
    RoleManagementPolicy.Read.Directory
    Member.Read.Hidden
+   DirectoryRecommendations.Read.All
+   SecurityEvents.Read.All
+   SecurityAlert.Read.All
+   AccessReview.Read.All
+   EntitlementManagement.Read.All
+   LifecycleWorkflows.Read.All
+   PrivilegedAssignmentSchedule.Read.AzureADGroup
+   PrivilegedEligibilitySchedule.Read.AzureADGroup
+   RoleManagementPolicy.Read.AzureADGroup
+   DelegatedAdminRelationship.Read.All
+   Domain.Read.All
+   Domain-InternalFederation.Read.All
    ```
 
    > **App-only read-only enforcement (allowlist, fail-closed):** on every app-only run the script reads this app's *actual* granted app-role assignments (across all resource APIs) and **refuses to run** unless **every** one is clearly read-only. It is an allowlist, not a denylist: anything that writes/sends/creates/deletes/updates/invites/manages/impersonates or grants full control — **and any unknown or custom app role it cannot resolve** — is treated as unsafe. So an accidentally over-permissioned app registration fails closed at startup rather than running with write access.
@@ -150,9 +174,10 @@ For scheduled runs with no human present. You create one dedicated, read-only ap
 4. *(Optional, belt-and-suspenders)* also assign the **Global Reader** directory role to this app's service principal.
 
 > **Notes:**
-> - There is no read-only `AppRoleAssignment.Read.All`; the app-role-assignment reads are covered by `Directory.Read.All` (read via `$expand`), **not** the write-capable `AppRoleAssignment.ReadWrite.All`.
-> - The fine-grained PIM scopes (`RoleEligibilitySchedule.Read.Directory` / `RoleAssignmentSchedule.Read.Directory`) aren't consistently offered as **application** permissions — `RoleManagement.Read.Directory` covers PIM reads in app-only mode.
-> - In app-only mode `Get-MgContext().Scopes` is sparse, so the script treats a runtime `403` as the authoritative "permission/license missing" signal and skips that check.
+> - There is no read-only `AppRoleAssignment.Read.All`; this profile authorizes the direct service-principal app-role-assignment reads with `Directory.Read.All`, **not** the write-capable `AppRoleAssignment.ReadWrite.All`.
+> - The Terms of Use agreements list currently supports **delegated** `Agreement.Read.All` only. Microsoft publishes an application permission with that name, but the agreements-list operation documents app-only as unsupported. Therefore the unattended permission list deliberately omits it, and that sub-control is reported as incomplete in app-only runs.
+> - The optional read-only PIM scopes `RoleEligibilitySchedule.Read.Directory` and `RoleAssignmentSchedule.Read.Directory` are accepted by the startup allowlist when already granted, but are not required in the list above because `RoleManagement.Read.Directory` covers these reads in app-only mode.
+> - In app-only mode `Get-MgContext().Scopes` is sparse, so the script resolves the running app's actual Graph app-role assignments at startup and uses that verified set for per-check scope gates. A later `403` is still recorded as unavailable evidence when an API has an additional role, license, or service constraint.
 
 ### B.2 Add a certificate
 
@@ -178,6 +203,23 @@ $cert.Thumbprint                                                  # use this wit
 
 ---
 
+## C. Optional Azure diagnostic-setting and alert coverage
+
+The `-monitoring` check always evaluates the Microsoft Graph evidence it can read. To also inventory Microsoft Entra diagnostic exports and Azure Monitor scheduled-query alert rules, prepare a **separate, existing read-only Azure context** before starting the audit:
+
+```powershell
+Install-Module Az.Accounts -Scope CurrentUser       # one-time, only if not already installed
+Connect-AzAccount -Tenant <tenant-id>               # interactive example
+Get-AzContext                                       # verify the intended tenant/subscription
+.\EntraAudit-PS7.ps1 -monitoring
+```
+
+Assign that Azure identity **Monitoring Reader** (or an equally narrow custom role containing the required `*/read` actions) at every subscription whose alert configuration should be inspected. The tenant-scoped `Microsoft.AADIAM/diagnosticSettings` read also needs appropriate read-only Entra/tenant authorization for that Azure-context principal (for example Global Reader or Security Reader where supported). The audit does not create an Azure context, change subscriptions, or install `Az.Accounts`; it only consumes a matching context that is already available. If any tenant or subscription read permission is absent, the ARM portion is marked **incomplete/manual verification required**, never passed.
+
+For unattended runs, establish the Azure context with your normal certificate/managed-identity automation before invoking the audit. Keep that identity read-only as well.
+
+---
+
 ## Licensing — what each tier unlocks
 
 The script detects your SKUs (`Get-MgSubscribedSku`) and records the tier in the report. License-gated checks are reported as **Skipped-NoLicense**, never as "clean". If the SKU read itself **fails**, gated checks are reported as **Skipped-LicenseUnknown** instead — the tenant may well be licensed, so a failed detection is never presented as "no license".
@@ -185,9 +227,11 @@ The script detects your SKUs (`Get-MgSubscribedSku`) and records the tier in the
 | Tier | Unlocks |
 |---|---|
 | **Entra ID Free** | Most posture checks: roles (classic), accounts, guests, apps, consent grants, Conditional Access inventory, Security Defaults, devices, tenant health. |
-| **Entra ID P1** | `signInActivity` → **stale users**; sign-in logs → **legacy auth**. |
+| **Entra ID P1** | `signInActivity` and sign-in logs → **stale users**, **legacy auth**, and **stale applications**; also enriches sign-in/activity portions of enterprise-app, external-delegation, and monitoring checks. |
 | **Entra ID P2** | **PIM** eligibility/assignment schedules → the permanent-vs-eligible classification; **Identity Protection** → risky users/detections. |
 | **Workload Identities Premium** | Risky **service principals**. |
+| **Entra ID Governance / applicable governance feature licenses** | Access reviews, entitlement management, lifecycle workflows, Terms of Use, and PIM for Groups evidence. The checks still run without these features and report unavailable sub-controls as incomplete. |
+| **Applicable Microsoft Defender workload/service licensing** | Microsoft 365 Defender identity-security alert evidence in `monitoring`; this optional sub-control is marked incomplete when the service or license is unavailable. |
 
 > Without P2, the privileged-roles check falls back to classic role assignments (everything appears as **permanent**) and notes that PIM/just-in-time isn't in use — which is itself a finding.
 
@@ -195,30 +239,41 @@ The script detects your SKUs (`Get-MgSubscribedSku`) and records the tier in the
 
 ## Scope → check reference
 
-If you want to grant the absolute minimum for a subset of checks, this maps each scope to the checks that need it:
+This is a per-data-source map, not a promise that the script dynamically requests a smaller delegated token. Interactive runs request the complete read-only scope set in section A.2; app-only runs use the documented application-permission profile and need `Directory.Read.All` for the startup permission self-check. The map is useful when reviewing why a scope exists or designing a separately maintained subset profile:
 
 | Scope / permission | Checks |
 |---|---|
-| `Directory.Read.All` | underpins most; tenant info, accounts, guests, posture, apps, devices, recent changes, health |
-| `Organization.Read.All` | tenant-info, tenanthealth |
-| `RoleManagement.Read.Directory` | privroles, directoryroles, accesspaths, breakglass, guests (priv), mfa (admin x-ref), apps (group roles), riskyusers (priv x-ref), staleusers (priv x-ref) |
+| `Directory.Read.All` | underpins most; tenant info, accounts, guests, posture, apps, consentgrants, workload/enterprise-app relationships and delegated grants, devices, recent changes, health, group-governance lifecycle policy, monitoring provisioning evidence, and the app-only startup permission self-check |
+| `Organization.Read.All` | tenant-info, tenanthealth, authrecovery, federationhealth |
+| `RoleManagement.Read.Directory` | privroles, directoryroles, accesspaths, breakglass, guests (priv), mfa (admin x-ref), apps (group roles), riskyusers (priv x-ref), staleusers (priv x-ref), externaldelegation |
 | `RoleEligibilitySchedule.Read.Directory` + `RoleAssignmentSchedule.Read.Directory` | privroles, directoryroles (PIM instances) |
-| `User.Read.All` | accounts, staleusers, guests, recentchanges |
-| `AuditLog.Read.All` | staleusers, mfa (registration report), legacyauth, recentchanges, guests, staleapps (service-principal sign-in activity, beta report) |
-| `Policy.Read.All` | tenantposture, capolicies, trusts, guests (guest policy) |
-| `Application.Read.All` | apps, appcredentials, staleapps |
-| `DelegatedPermissionGrant.Read.All` | consentgrants |
-| `Group.Read.All` | accesspaths, guests, apps (role-assignable groups), recentchanges |
+| `User.Read.All` | accounts, staleusers, guests, recentchanges, externaldelegation |
+| `AuditLog.Read.All` | staleusers, mfa, legacyauth, recentchanges, guests, staleapps, authrecovery, externaldelegation, enterpriseapps, monitoring, changemonitoring |
+| `Policy.Read.All` | tenantposture, capolicies, trusts, guests, authrecovery, workloadcredentials, identitygovernance |
+| `Application.Read.All` | apps, appcredentials, staleapps, workloadcredentials, enterpriseapps |
+| `Group.Read.All` | accesspaths, guests, apps, recentchanges, accessreviews, groupgovernance, identitygovernance |
 | `Device.Read.All` | devices |
-| `IdentityRiskyUser.Read.All` / `IdentityRiskEvent.Read.All` | riskyusers |
+| `IdentityRiskyUser.Read.All` | riskyusers |
+| `IdentityRiskEvent.Read.All` | riskyusers, monitoring (optional risk-detection evidence) |
 | `IdentityRiskyServicePrincipal.Read.All` | riskyserviceprincipals (gated on Workload Identities Premium, not P2) |
 | `CrossTenantInformation.ReadBasic.All` | trusts (partner resolution) |
-| `OnPremDirectorySynchronization.Read.All` | tenanthealth |
-| `Reports.Read.All` | mfa (registration report alt), usage |
+| `OnPremDirectorySynchronization.Read.All` | tenanthealth, authrecovery, federationhealth |
+| `Reports.Read.All` | mfa (registration report alt), groupgovernance activity |
 | `RoleManagementPolicy.Read.Directory` | pimpolicies (PIM activation policy rules) |
 | `Member.Read.Hidden` | accesspaths (expand hidden-membership groups; optional) |
+| `DirectoryRecommendations.Read.All` | recommendations |
+| `SecurityEvents.Read.All` | securescore |
+| `SecurityAlert.Read.All` | monitoring (Microsoft 365 Defender alert evidence; optional when the service/license is unavailable) |
+| `AccessReview.Read.All` | accessreviews |
+| `EntitlementManagement.Read.All` | identitygovernance (catalogs, access packages and assignments) |
+| `LifecycleWorkflows.Read.All` | identitygovernance (lifecycle workflows) |
+| `Agreement.Read.All` | identitygovernance (Terms of Use; delegated operation only, so app-only reports this sub-control incomplete) |
+| `PrivilegedAssignmentSchedule.Read.AzureADGroup` / `PrivilegedEligibilitySchedule.Read.AzureADGroup` | identitygovernance (PIM for Groups assignment/eligibility schedules) |
+| `RoleManagementPolicy.Read.AzureADGroup` | identitygovernance (PIM for Groups policy rules) |
+| `DelegatedAdminRelationship.Read.All` | externaldelegation (GDAP relationships) |
+| `Domain.Read.All` / `Domain-InternalFederation.Read.All` | federationhealth |
 
-> **Least-privilege note:** the `-authmethodpolicy` check is satisfied by the broad `Policy.Read.All` (which the tool already requests for the CA / posture checks). If you want to grant the narrowest possible permission for it instead, `Policy.Read.AuthenticationMethod` is the least-privileged Graph permission for reading the authentication-methods policy.
+> **Least-privilege note:** the `-authmethodpolicy` and `-authrecovery` checks are satisfied by the broad `Policy.Read.All` (which the tool already requests for the CA / posture checks). In a separately maintained subset profile, `Policy.Read.AuthenticationMethod` is the least-privileged Graph permission for reading the authentication-methods policy.
 
 ---
 
@@ -230,4 +285,4 @@ At startup the script calls `Get-MgContext` and **aborts** if any granted scope 
 (Get-MgContext).Scopes      # should be all *.Read.* entries
 ```
 
-Every Graph call in the script is a read (`Get-Mg*` cmdlets and `Invoke-MgGraphRequest -Method GET`). No `New-`, `Set-`, `Update-`, `Remove-`, `Add-`, `Revoke-` or `Disable-` Graph cmdlet is used anywhere.
+Every tenant/API call in the audit is a read (`Get-Mg*` / `Get-Az*` cmdlets, `Invoke-MgGraphRequest -Method GET`, and Azure Resource Manager `GET`). No `New-`, `Set-`, `Update-`, `Remove-`, `Add-`, `Revoke-` or `Disable-` Graph/Azure management cmdlet is used by an audit check.

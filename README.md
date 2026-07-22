@@ -6,7 +6,7 @@
 2. Click **Install Graph Modules** (one-time).
 3. Click **Run Audit** and **sign in** on the page that opens with an account that has enough permissions.
 
-That's it — the HTML reports open when it finishes. Because the audit is **read-only**, a **Global Reader + Security Reader** account is all you need (no admin write rights, no app registration). Everything below is detail.
+That's it — the HTML reports open when it finishes. Because the audit is **read-only**, a **Global Reader + Security Reader** account covers nearly all Microsoft Graph evidence without admin write rights. Microsoft does not list those roles for tenant-wide delegated federated-identity-credential enumeration, so that sub-control can be incomplete; use the read-only app-only mode for complete tenant-wide coverage. Azure diagnostic-setting and alert-rule coverage additionally needs a pre-existing read-only Azure session. Unavailable portions are reported as incomplete rather than clean.
 
 ---
 
@@ -14,8 +14,8 @@ A PowerShell 7 + Microsoft Graph audit tool that mirrors the on-prem ADAudit-PS7
 
 Its flagship capability is auditing **privileged role assignments by activation model** — every privileged role is classified as **Permanent (standing)** vs **Eligible (PIM)** vs **Time-bound active**. A *permanent* Global Administrator is flagged as a risk; the same role held as *eligible* (activated just-in-time through PIM) is the desired posture and is **not** flagged.
 
-> ## 🔒 Read-only against Entra / Microsoft Graph
-> This tool is **read-only against Microsoft Entra / Graph**. It requests only `*.Read.*` scopes, issues only `GET` requests, and **aborts at startup if any write-capable scope is granted**. It never creates, modifies, activates, revokes, assigns or deletes anything in the tenant. Every "Recommended action" in the reports is advisory guidance for a human operator — the tool performs no management.
+> ## 🔒 Read-only against Entra / Microsoft Graph and Azure Resource Manager
+> All **audit/data-collection API calls are read-only** against Microsoft Entra / Graph and Azure Resource Manager. The checks request only documented read permissions, issue only `GET` requests, and **abort at startup if any write-capable Graph permission is granted**. They never create, modify, activate, revoke, assign or delete tenant/subscription resources. First-time interactive OAuth consent is a separate operator-authorized setup grant for those read permissions; pre-consent them before the audit window when literal zero setup changes during execution is required. Every "Recommended action" is advisory.
 >
 > It is **not** local-filesystem read-only: like any reporting tool it **writes** the HTML/CSV/TXT/JSON reports and evidence to the output folder, and with `-installdeps` it installs the Microsoft Graph modules. Those reports contain sensitive identity/security data — point `-OutputRoot` at a restricted directory and avoid sharing the raw CSV/JSON broadly.
 
@@ -37,7 +37,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 .\EntraAudit-PS7.ps1 -all
 ```
 
-You'll be prompted to sign in. Use an account with **Global Reader + Security Reader** (read-only) — see [PREREQUISITE.md](PREREQUISITE.md). Install the Microsoft Graph modules first if you don't have them:
+You'll be prompted to sign in. Use an account with **Global Reader + Security Reader** (read-only); the federated-identity-credential limitation above is reported explicitly — see [PREREQUISITE.md](PREREQUISITE.md). Install the Microsoft Graph modules first if you don't have them:
 
 ```powershell
 .\EntraAudit-PS7.ps1 -installdeps -all
@@ -49,11 +49,12 @@ You'll be prompted to sign in. Use an account with **Global Reader + Security Re
 
 - **PowerShell 7.x** on Windows (`pwsh.exe`)
 - **Microsoft Graph PowerShell SDK v2.x** (installed via `-installdeps`, or see [PREREQUISITE.md](PREREQUISITE.md) for offline install)
+- Keep `EntraAudit-PS7.ps1`, `EntraAudit-Checks-Governance.ps1`, and `EntraAudit-Checks-Applications.ps1` together. The main script loads the two check libraries at startup. Keep `EntraAudit-GUI.ps1` with them when using the GUI.
 - A read-only auditor identity:
-  - **Interactive:** an account with the **Global Reader** and **Security Reader** directory roles (recommended), or any account that can consent to the read-only scopes.
+  - **Interactive:** an account with the **Global Reader** and **Security Reader** directory roles (recommended). Tenant-wide federated-identity-credential enumeration is a documented delegated-role exception and may be incomplete.
   - **App-only / unattended:** a dedicated app registration with the read-only **application** permissions and a certificate.
 - Some checks need premium licensing (the tool detects this and marks gated checks as *Skipped-NoLicense* rather than reporting them clean):
-  - **Entra ID P1** — sign-in activity (stale users, legacy auth).
+  - **Entra ID P1** — sign-in activity (stale users, legacy auth, stale applications).
   - **Entra ID P2** — PIM eligibility data and Identity Protection (risky users).
 
 Full permission and licensing detail is in **[PREREQUISITE.md](PREREQUISITE.md)**.
@@ -114,6 +115,18 @@ The four reports share a top navigation bar (Audit Results · Risk Report · Pos
 | `-authmethodpolicy` | Authentication-methods policy — weak (SMS/voice) vs phishing-resistant (FIDO2/WHfB), TAP reuse | |
 | `-accesspaths` | **Effective-access / attack-path graph** — duplicate privilege paths (classified **active** vs **eligible-only**), ownership-based escalation (group-, app- and SP-owners), and **CA-exclusion-group owners who can self-add to bypass MFA** | needs `Group.Read.All` (+ `Member.Read.Hidden` for hidden groups) |
 | `-staleapps` | **Stale / unused applications** — flags app service principals with no sign-in in `-StaleAppDays` (default 90); stale-with-live-credentials → Medium, stale-no-credentials → Low. Excludes Microsoft first-party SPs | needs **P1** (uses service-principal sign-in activity) |
+| `-recommendations` | Microsoft Entra recommendations, including unresolved high-impact actions and affected-resource counts | `DirectoryRecommendations.Read.All`; beta API |
+| `-securescore` | Latest Microsoft Identity Secure Score, enabled controls, comparison baseline and incomplete actions | `SecurityEvents.Read.All` |
+| `-accessreviews` | Access-review coverage, recurrence, reviewer/fallback configuration, automatic result handling and overdue instances | `AccessReview.Read.All`; governance licensing may apply |
+| `-identitygovernance` | Entitlement-management catalogs/access packages, lifecycle workflows, Terms of Use, and PIM for Groups | governance read scopes; licensing may apply; Terms of Use listing is delegated-only |
+| `-authrecovery` | SSPR and recovery readiness, authentication-method registration campaign, migration state and system-preferred MFA | |
+| `-groupgovernance` | Ownerless and role-assignable groups, dynamic membership rules, expiration/lifecycle and guest/member settings | |
+| `-externaldelegation` | Guest sponsorship/activity, cross-tenant partner posture, and delegated administration/GDAP relationships | `DelegatedAdminRelationship.Read.All` for GDAP |
+| `-federationhealth` | Federated-domain endpoints and signing-certificate expiry plus hybrid authentication posture | domain/federation read scopes |
+| `-workloadcredentials` | Application **and service-principal** secrets/certificates, federated identity credentials, and app-management policy enforcement | app-only `Application.Read.All` gives complete tenant-wide FIC coverage; delegated Global/Security Reader can be incomplete |
+| `-enterpriseapps` | Enterprise-app ownership, user-assignment controls, privileged assignments, and high-impact application/delegated permissions | |
+| `-monitoring` | Sign-in/audit-log observability, Defender identity-alert evidence, plus Azure diagnostic export and alert-rule/action-group inventory | `SecurityAlert.Read.All`; optional pre-connected Azure read context for ARM evidence; destination retention is not assessed |
+| `-changemonitoring` | Recent security-sensitive directory, role, policy, application, consent, credential and federation changes | uses `-RecentChangeDays` |
 
 ### How the AD audit maps to the Entra audit
 
@@ -223,10 +236,11 @@ Severity for standing role assignments is also **tiered by role**: tier-0 roles 
 ## Notes & limitations
 
 - **Read-only guarantee:** the script self-aborts if Graph returns any write scope. In **app-only** mode it goes further — it reads the app's *actual* granted app-role assignments (across all resource APIs) and **fails closed** unless **every** one is on the **exact documented audit allowlist**. *Read-only does not mean low-impact: broad read permissions (e.g. `Mail.Read`) can expose sensitive data, so the app-only startup check permits only the documented audit permissions, not arbitrary `*.Read.*` permissions* — anything else (write, send, create, delete, update, invite, manage, impersonate, full-control, **or any unknown/custom app role**) is refused. Remediation is always left to the operator.
-- **License gating:** P1-gated checks (`staleusers`, `legacyauth`) and P2-gated checks (`pimpolicies`, `riskyusers`) are reported as *Skipped-NoLicense* (not "clean") when the tier isn't detected; license detection reads enabled **service plans**, so P1/P2 bundled inside EMS/M365 SKUs is recognised. If the license read itself **fails**, gated checks are reported as *Skipped-LicenseUnknown* instead — a failed detection is never presented as "no license". `riskyserviceprincipals` is a **separate** check gated on **Workload Identities Premium** (not P2), so a Workload-ID-Premium tenant without P2 still evaluates risky workload identities. `privileged-roles` always runs (it falls back to classic role assignments without PIM).
-- **Posture Summary status:** the per-check grid distinguishes `RiskFindings(n)` (an actual risk-level finding), `InfoOnly(n)` (only Information-level baselines were added — treated as clean), `Pass`, `Skipped-*` and `Error`, so informational baselines don't make a clean check look noisy.
+- **License gating:** P1-gated checks (`staleusers`, `legacyauth`, `staleapps`) and P2-gated checks (`pimpolicies`, `riskyusers`) are reported as *Skipped-NoLicense* (not "clean") when the tier isn't detected; license detection reads enabled **service plans**, so P1/P2 bundled inside EMS/M365 SKUs is recognised. If the license read itself **fails**, gated checks are reported as *Skipped-LicenseUnknown* instead — a failed detection is never presented as "no license". `riskyserviceprincipals` is a **separate** check gated on **Workload Identities Premium** (not P2), so a Workload-ID-Premium tenant without P2 still evaluates risky workload identities. `privileged-roles` always runs (it falls back to classic role assignments without PIM). `enterpriseapps`, `externaldelegation`, and `monitoring` still run without P1, but mark their sign-in/activity portions incomplete when that evidence is unavailable. Governance checks likewise mark feature-specific evidence incomplete when the required governance feature or license is unavailable.
+- **Posture Summary status:** the per-check grid distinguishes `RiskFindings(n)` (actual risk), `RiskFindings(n)+Incomplete(m)` (risk plus one or more evidence gaps), `Incomplete(n)` (not enough evidence to conclude clean), `InfoOnly(n)` (fully evaluated informational baselines), `Pass`, `Skipped-*` and `Error`. Only `Pass` and non-coverage `InfoOnly` checks count as clean.
+- **Coverage severity:** an incomplete-evidence finding can carry a risk-bearing severity (including High) and affect the overall score because a monitoring/audit blind spot is itself operational risk. It is counted under `Incomplete`, not as an adverse `RiskFindings(n)` fact, unless the same check also found a separate confirmed issue.
 - **Stable finding ids:** `Findings.json`/`.csv` ids are count-independent (a finding's id doesn't change when "5 stale users" becomes "7"), so they're usable for run-over-run trend/diff. Every check also always writes its CSV (a `NoData` row when empty) so automation can rely on the file existing.
-- **Failed reads are never "clean":** when a Graph read that feeds a check fails (role assignments, CA policies, group members/owners, Identity Protection), the check reports *could not be evaluated / coverage gap* — or errors outright — instead of silently passing. An audit that couldn't see the data says so.
+- **Failed reads are never "clean":** when a Graph or optional Azure Resource Manager read that feeds a check fails, the check reports `Incomplete`, `Skipped-*`, or `Error` instead of silently passing. A check can retain its risk findings and still be marked incomplete when another evidence source was unavailable.
 - **Exit code:** the script exits `1` when the audit run fails (connection, output folder, report generation), so scheduled/unattended runs can detect failure.
 - **Sign-in logs** are retained ~30 days; the legacy-auth check only sees that window (the legacy-client filter is applied server-side, so large tenants no longer download the full sign-in log).
 - A few signals (on-prem banned-password configuration, some Identity Protection detail) are not fully exposed by Graph read APIs and are reported with that caveat.
