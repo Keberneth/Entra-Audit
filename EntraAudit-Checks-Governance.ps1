@@ -68,11 +68,32 @@ function ConvertTo-EAGovArray {
     return @($Value)
 }
 
+# Invoke-MgGraphRequest turns ISO timestamps into [datetime] values (Kind=Utc). Casting
+# those to text drops the zone, and parsing that text again would read it as local time,
+# moving every Graph timestamp by the machine's UTC offset. Keep typed values as they are
+# (an Unspecified kind is Graph UTC) and read zone-less text as UTC, like the main script.
 function ConvertTo-EAGovDateTime {
     param([AllowNull()]$Value)
-    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
-    try { return [datetimeoffset]::Parse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture) }
-    catch { return $null }
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetimeoffset]) { return $Value }
+    if ($Value -is [datetime]) {
+        $utc = if ($Value.Kind -eq [DateTimeKind]::Unspecified) { [datetime]::SpecifyKind($Value, [DateTimeKind]::Utc) } else { $Value.ToUniversalTime() }
+        return [datetimeoffset]$utc
+    }
+    $s = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    $parsed = [datetimeoffset]::MinValue
+    if ([datetimeoffset]::TryParse($s, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) { return $parsed }
+    return $null
+}
+
+# A Graph timestamp as readable UTC text for evidence ("2026-09-23 12:00 UTC"); $null when
+# the value is missing or unreadable.
+function Format-EAGovDateTime {
+    param([AllowNull()]$Value)
+    $d = ConvertTo-EAGovDateTime $Value
+    if ($null -eq $d) { return $null }
+    return $d.UtcDateTime.ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) + ' UTC'
 }
 
 function ConvertTo-EAGovCompactJson {
@@ -242,6 +263,11 @@ function Add-EAGovFinding {
         [switch]$CoverageGap
     )
 
+    # The Microsoft reference travels only as its own field: the reports render it as a
+    # link and Findings.json/.csv export it as a column, so it is no longer appended to
+    # the RecommendedAction text. Actions end with a full stop like the main-script ones.
+    $action = $RecommendedAction.Trim()
+    if ($action -notmatch '[.!?]$') { $action += '.' }
     $parameters = @{
         Severity          = $Severity
         CheckId           = $CheckId
@@ -249,10 +275,7 @@ function Add-EAGovFinding {
         Title             = $Title
         Evidence          = $Evidence
         WhyItMatters      = $WhyItMatters
-        # The Microsoft reference also travels as its own field so report writers can
-        # render it as a link and exports can carry it as a column. Until every writer
-        # and export does, it stays in the text as well so no output loses it.
-        RecommendedAction = (($RecommendedAction.TrimEnd('.')) + ". Microsoft source: $DocumentationUrl")
+        RecommendedAction = $action
         DocumentationUrl  = $DocumentationUrl
         SourceFile        = $SourceFile
     }
@@ -265,6 +288,21 @@ function Add-EAGovFinding {
     Add-EntraFinding @parameters
 }
 
+# "Could not read" finding. The report must never present a failed or partial read as a
+# clean result, so every one of these is an Information finding marked -CoverageGap.
+#   -DataSource  technical name of the data. It is ALSO the source of the stable rule id
+#                (coverage-<slug>), so existing values must never be reworded; change the
+#                reader-facing wording through -Subject instead.
+#   -Subject     everyday name of what could not be read ("the list of access reviews");
+#                defaults to DataSource.
+#   -Impact      one short sentence naming what may be missing from the report as a result.
+#   -Partial     the read stopped at the page safety limit, so only part of the data was read.
+#   -RecommendedAction  replaces the default "grant access and run again" advice when a
+#                missing permission is not the likely cause.
+#   -ObjectType/-ObjectId/-AffectedPrincipal  for a gap about ONE object (for example one
+#                GDAP relationship): the object goes into the finding id instead of into
+#                DataSource, so renaming the object never changes the rule id and gaps of
+#                several objects group under one rule.
 function Add-EAGovCoverageFinding {
     param(
         [Parameter(Mandatory)][string]$CheckId,
@@ -273,17 +311,77 @@ function Add-EAGovCoverageFinding {
         [Parameter(Mandatory)][string]$Reason,
         [Parameter(Mandatory)][string]$RequiredScope,
         [Parameter(Mandatory)][string]$DocumentationUrl,
-        [AllowNull()][string]$SourceFile
+        [AllowNull()][string]$SourceFile,
+        [AllowNull()][string]$Subject,
+        [AllowNull()][string]$Impact,
+        [switch]$Partial,
+        [AllowNull()][string]$RecommendedAction,
+        [AllowNull()][string]$ObjectType,
+        [AllowNull()][string]$ObjectId,
+        [AllowNull()][string]$AffectedPrincipal
     )
 
+    $name = if ([string]::IsNullOrWhiteSpace($Subject)) { $DataSource } else { $Subject.Trim() }
+    $sentenceName = if ($name.Length -gt 0) { $name.Substring(0, 1).ToUpperInvariant() + $name.Substring(1) } else { $name }
+    $reasonText = ([string]$Reason).Trim()
+    if ($reasonText -and $reasonText -notmatch '[.!?]$') { $reasonText += '.' }
+
+    $title = if ($Partial) { "Only part of $name could be read" } else { "$sentenceName could not be read" }
+    $evidence = if ($Partial) {
+        "Data source: $DataSource. The read stopped early: $reasonText Only the part that was read was checked; this is a partial result, not a clean result."
+    } else {
+        "Data source: $DataSource. Reason: $reasonText This is an unknown result, not a clean result."
+    }
+    $why = if ([string]::IsNullOrWhiteSpace($Impact)) {
+        'The audit could not check this part, so problems in it may be missing from this report. Treat it as not checked, not as clean.'
+    } else {
+        $impactText = $Impact.Trim()
+        if ($impactText -notmatch '[.!?]$') { $impactText += '.' }
+        "$impactText Treat this part as not checked, not as clean."
+    }
+    $action = if (-not [string]::IsNullOrWhiteSpace($RecommendedAction)) { $RecommendedAction }
+        elseif ($Partial) { 'Review this area directly in the admin center, because the audit stopped reading after its page safety limit, then run the audit again to confirm' }
+        else { "Make sure the audit account has $RequiredScope and the reader role or license this data needs, then run the audit again; if the evidence shows a different error, such as throttling, simply run it again" }
+
     Add-EAGovFinding -Severity 'Information' -CheckId $CheckId -Category $Category `
-        -Title "$DataSource coverage is unknown" `
-        -Evidence "$DataSource could not be fully read: $Reason This is an unknown/partial result, not a clean result." `
-        -WhyItMatters "Without $DataSource, this part of the control cannot be evaluated reliably." `
-        -RecommendedAction "Grant the audit account read-only access ($RequiredScope), confirm it has the needed reader role and license, then run the audit again" `
+        -Title $title -Evidence $evidence -WhyItMatters $why -RecommendedAction $action `
         -DocumentationUrl $DocumentationUrl -SourceFile $SourceFile `
         -RuleId ("coverage-" + (($DataSource -replace '[^A-Za-z0-9]+','-').Trim('-').ToLowerInvariant())) `
+        -ObjectType $ObjectType -ObjectId $ObjectId -AffectedPrincipal $AffectedPrincipal `
         -CoverageGap
+}
+
+# GET /directory/onPremisesSynchronization is a collection navigation: Graph answers
+# {"value":[{id, configuration, features}]} even though a tenant has at most one object.
+# Reading 'configuration'/'features' from the top of that answer always gives $null, so
+# unwrap the list (a single-entity answer is accepted too). Object is $null when Graph
+# returned no object; callers report that as not checked, never as clean.
+# Microsoft Graph supports this read only for a delegated sign-in by a Global
+# Administrator with OnPremDirectorySynchronization.Read.All (app-only is not supported).
+function Get-EAGovOnPremisesSyncObject {
+    $result = Invoke-EAGovGraphObject -Uri 'https://graph.microsoft.com/v1.0/directory/onPremisesSynchronization'
+    $object = $null
+    $count = 0
+    if ($result.Success) {
+        $object = $result.Value
+        if (Test-EAGovPropertyPresent $object 'value') {
+            $items = @(Get-EAGovProperty $object 'value' | Where-Object { $null -ne $_ })
+            $count = $items.Count
+            $object = if ($count -gt 0) { $items[0] } else { $null }
+        } elseif ($null -ne $object) {
+            $count = 1
+        }
+    }
+    [pscustomobject]@{ Success=$result.Success; Object=$object; Count=$count; Error=$result.Error; StatusCode=$result.StatusCode }
+}
+
+# Plain-language permission facts for the on-premises sync settings read above: the
+# scope text for coverage findings, and a note added to the reason on app-only runs.
+function Get-EAGovOnPremSyncAccess {
+    [pscustomobject]@{
+        Scope = 'OnPremDirectorySynchronization.Read.All (delegated only, signed in as a Global Administrator; app-only is not supported by Microsoft Graph for this API)'
+        Note  = $(if ([string]$script:AuthType -eq 'AppOnly') { ' This run used an app-only sign-in, which Microsoft Graph does not support for this setting.' } else { '' })
+    }
 }
 
 function Invoke-Check-EntraRecommendations {
@@ -292,6 +390,7 @@ function Invoke-Check-EntraRecommendations {
 
     $checkId = 'recommendations'
     $doc = 'https://learn.microsoft.com/graph/api/directory-list-recommendation?view=graph-rest-beta'
+    $guideDoc = 'https://learn.microsoft.com/en-us/entra/identity/monitoring-health/overview-recommendations'
     # Prefer include-unknown-enum-members so evolvable status/type members (riskAccepted,
     # needsMoreAction, longLivedCredentials, ...) arrive by name instead of collapsing to
     # unknownFutureValue, which would make them unclassifiable and collide on one rule id.
@@ -300,7 +399,7 @@ function Invoke-Check-EntraRecommendations {
     if (-not $result.Success) { throw $result.Error }
 
     $rows = foreach ($recommendation in @($result.Rows)) {
-        $resources = @(Get-EAGovProperty $recommendation 'impactedResources')
+        $resources = @(Get-EAGovProperty $recommendation 'impactedResources' | Where-Object { $null -ne $_ })
         $steps = @(Get-EAGovProperty $recommendation 'actionSteps')
         [pscustomobject]@{
             Id                = Get-EAGovProperty $recommendation 'id'
@@ -316,6 +415,7 @@ function Invoke-Check-EntraRecommendations {
             ImpactedResources = $resources.Count
             CreatedDateTime   = Get-EAGovProperty $recommendation 'createdDateTime'
             LastModifiedDateTime = Get-EAGovProperty $recommendation 'lastModifiedDateTime'
+            LastModifiedBy    = Get-EAGovProperty $recommendation 'lastModifiedBy'
             PostponeUntilDateTime = Get-EAGovProperty $recommendation 'postponeUntilDateTime'
             Insights          = Get-EAGovProperty $recommendation 'insights'
             ActionSteps       = (($steps | ForEach-Object { Get-EAGovProperty $_ 'text' }) -join ' | ')
@@ -323,69 +423,128 @@ function Invoke-Check-EntraRecommendations {
     }
     $src = Write-Evidence -BaseName 'entra_recommendations' -Rows @($rows) `
         -Title 'Microsoft Entra Recommendations (beta, read-only)' `
-        -Notes @('The recommendations API is beta and can change. Only active and needsMoreAction recommendations become risk findings.')
+        -Notes @('The recommendations API is beta and can change. Active and needsMoreAction recommendations become risk findings; planned and postponed ones are not fixed yet and become findings one severity step lower.')
 
     if ($result.Truncated) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Tenant Posture' -DataSource 'Entra recommendations pagination' `
             -Reason "pagination exceeded $($result.Pages) pages." -RequiredScope 'DirectoryRecommendations.Read.All' `
-            -DocumentationUrl $doc -SourceFile $src
+            -DocumentationUrl $doc -SourceFile $src -Partial -Subject 'the Microsoft Entra recommendations list' `
+            -Impact 'Open Microsoft recommendations beyond the part that was read are missing from this report.'
     }
 
     # Documented recommendationStatus members (beta). active and needsMoreAction are open
     # (needsMoreAction = Microsoft re-verified that user-completed resources are still
-    # impacted); every other documented member is a resolved/triaged state. Anything else,
-    # including unknownFutureValue, stays a coverage gap rather than a clean result.
+    # impacted). planned and postponed are NOT fixed either: planned means the work has not
+    # been done yet, and a postponed recommendation becomes active again on its
+    # postponeUntilDateTime. They are reported one severity step lower under the same rule
+    # and object id as the open finding, so the finding id and its trend history do not
+    # change when an admin flips a recommendation between active, planned and postponed.
+    # The remaining documented members close a recommendation (fixed, or closed by a
+    # decision that the baseline lists by name). Anything else, including
+    # unknownFutureValue, stays a coverage gap rather than a clean result.
     $openStatuses = @('active','needsMoreAction')
-    $knownStatuses = @($openStatuses) + @('completedBySystem','completedByUser','dismissed','postponed',
-        'riskAccepted','thirdParty','planned','alternateMitigation')
+    $deferredStatuses = @('planned','postponed')
+    $decisionStatuses = @('dismissed','riskAccepted','thirdParty','alternateMitigation')
+    $knownStatuses = @($openStatuses) + @($deferredStatuses) + @($decisionStatuses) + @('completedBySystem','completedByUser')
     $unknownStatusRows = @($result.Rows | Where-Object {
         $status = [string](Get-EAGovProperty $_ 'status')
         [string]::IsNullOrWhiteSpace($status) -or $status -notin $knownStatuses
     })
     if ($unknownStatusRows.Count -gt 0) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Tenant Posture' -DataSource 'Entra recommendation status' `
-            -Reason ("{0} recommendation record(s) have a missing or unknown status and cannot be classified as active or resolved." -f $unknownStatusRows.Count) `
-            -RequiredScope 'DirectoryRecommendations.Read.All' -DocumentationUrl $doc -SourceFile $src
+            -Reason ((Format-EACount $unknownStatusRows.Count 'recommendation record has' 'recommendation records have') + ' a missing or unknown status and cannot be classified as active or resolved.') `
+            -RequiredScope 'DirectoryRecommendations.Read.All' -DocumentationUrl $doc -SourceFile $src `
+            -Subject 'the status of some Microsoft Entra recommendations' `
+            -Impact 'The audit cannot tell whether these recommendations are still open, so open ones may be missing from this report.' `
+            -RecommendedAction 'Open the listed recommendations in Entra admin center > Entra ID > Overview > Recommendations and check whether they are still open'
     }
 
     $active = @($result.Rows | Where-Object { [string](Get-EAGovProperty $_ 'status') -in $openStatuses })
-    foreach ($recommendation in $active) {
+    $deferred = @($result.Rows | Where-Object { [string](Get-EAGovProperty $_ 'status') -in $deferredStatuses })
+    foreach ($recommendation in @($active) + @($deferred)) {
         $priority = [string](Get-EAGovProperty $recommendation 'priority')
         $status = [string](Get-EAGovProperty $recommendation 'status')
-        $severity = switch -Regex ($priority) {
-            '^critical$' { 'Critical'; break }
-            '^high$'   { 'High'; break }
-            '^medium$' { 'Medium'; break }
-            '^low$'    { 'Low'; break }
-            default    { 'Medium' }
+        $isDeferred = $status -in $deferredStatuses
+        $severity = if ($isDeferred) {
+            # One step lower than an open recommendation of the same priority.
+            switch -Regex ($priority) {
+                '^critical$' { 'High'; break }
+                '^high$'   { 'Medium'; break }
+                default    { 'Low' }
+            }
+        } else {
+            switch -Regex ($priority) {
+                '^critical$' { 'Critical'; break }
+                '^high$'   { 'High'; break }
+                '^medium$' { 'Medium'; break }
+                '^low$'    { 'Low'; break }
+                default    { 'Medium' }
+            }
         }
         $name = [string](Get-EAGovProperty $recommendation 'displayName')
         if ([string]::IsNullOrWhiteSpace($name)) { $name = [string](Get-EAGovProperty $recommendation 'recommendationType') }
         $steps = @(Get-EAGovProperty $recommendation 'actionSteps')
         $firstStep = if ($steps.Count -gt 0) { [string](Get-EAGovProperty $steps[0] 'text') } else { '' }
         # @(null) has Count 1, and a step can have no text; RecommendedAction is mandatory.
-        if ([string]::IsNullOrWhiteSpace($firstStep)) { $firstStep = 'Review the recommendation details and impacted resources in Microsoft Entra.' }
+        $firstStep = $firstStep.Trim()
+        $action = if ([string]::IsNullOrWhiteSpace($firstStep)) {
+            'Open the recommendation in Entra admin center > Entra ID > Overview > Recommendations and follow its steps for each affected item'
+        } else {
+            if ($firstStep -notmatch '[.!?]$') { $firstStep += '.' }
+            "$firstStep Microsoft lists every step and affected item in Entra admin center > Entra ID > Overview > Recommendations"
+        }
         $insights = [string](Get-EAGovProperty $recommendation 'insights')
-        $resourceCount = @(Get-EAGovProperty $recommendation 'impactedResources').Count
+        # @($null) has Count 1, so drop nulls: a missing list is 0 affected items.
+        $resourceCount = @(Get-EAGovProperty $recommendation 'impactedResources' | Where-Object { $null -ne $_ }).Count
         $id = [string](Get-EAGovProperty $recommendation 'id')
+        $scoreText = "Microsoft priority={0}; affected items={1}; score={2}/{3}." -f $priority,$resourceCount,
+            (Get-EAGovProperty $recommendation 'currentScore'),(Get-EAGovProperty $recommendation 'maxScore')
+
+        if ($isDeferred) {
+            $postponeUntil = Format-EAGovDateTime (Get-EAGovProperty $recommendation 'postponeUntilDateTime')
+            $changedBy = [string](Get-EAGovProperty $recommendation 'lastModifiedBy')
+            $changedAt = Format-EAGovDateTime (Get-EAGovProperty $recommendation 'lastModifiedDateTime')
+            $title = "Microsoft Entra recommendation {0}, not fixed yet: {1}" -f $status.ToLowerInvariant(),$name
+            $postponeText = if ($status -ieq 'postponed') { '; postponed until={0}' -f $(if ($postponeUntil) { $postponeUntil } else { 'not set' }) } else { '' }
+            $evidence = ("Status={0}{1}; last changed {2} by {3}. {4} Planned and postponed recommendations are reported one severity step below Microsoft's priority. {5}" -f
+                $status,$postponeText,$(if ($changedAt) { $changedAt } else { 'at an unknown time' }),
+                $(if ($changedBy) { $changedBy } else { 'an unknown user' }),$scoreText,$insights).Trim()
+            $why = if ($status -ieq 'postponed') {
+                'Postponing a recommendation does not fix it: the weakness it describes is still in place. It becomes active again on its postpone date.'
+            } else {
+                'Marking a recommendation as planned does not fix it: the weakness it describes stays in place until the planned work is done.'
+            }
+        } else {
+            $title = "Unresolved Microsoft Entra recommendation: $name"
+            $evidence = ("Status={0}; {1} {2}" -f $status,$scoreText,$insights).Trim()
+            $why = "Microsoft checks this tenant's settings and activity every day and flagged this as a gap that is still open. Until it is fixed, the weakness it describes stays in place."
+        }
 
         Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'Tenant Posture' `
-            -Title "Active Microsoft Entra recommendation: $name" `
-            -Evidence ("Status={5}; priority={0}; impacted resources={1}; score={2}/{3}. {4}" -f $priority,$resourceCount,
-                (Get-EAGovProperty $recommendation 'currentScore'),(Get-EAGovProperty $recommendation 'maxScore'),$insights,$status) `
-            -WhyItMatters 'Microsoft computes these recommendations from tenant configuration and activity, providing a maintained backstop for controls that can evolve after this audit was released.' `
-            -RecommendedAction $firstStep -DocumentationUrl $doc -SourceFile $src `
+            -Title $title -Evidence $evidence -WhyItMatters $why `
+            -RecommendedAction $action -DocumentationUrl $guideDoc -SourceFile $src `
             -RuleId ("entra-recommendation-" + [string](Get-EAGovProperty $recommendation 'recommendationType')) `
             -ObjectType 'recommendation' -ObjectId $id -ResultRows @($rows | Where-Object { $_.Id -eq $id })
     }
 
-    if ($active.Count -eq 0 -and $unknownStatusRows.Count -eq 0 -and -not $result.Truncated) {
+    if ($active.Count -eq 0 -and $deferred.Count -eq 0 -and $unknownStatusRows.Count -eq 0 -and -not $result.Truncated) {
+        # RuleId equals the title slug this finding used before it had an explicit id, so
+        # its stable finding id (and trend history) does not change.
+        $statusCounts = @($rows | Group-Object { [string]$_.Status } | Sort-Object Name | ForEach-Object { '{0}={1}' -f $_.Name,$_.Count })
+        $decisionRows = @($rows | Where-Object { [string]$_.Status -in $decisionStatuses })
+        $decisionText = if ($decisionRows.Count -gt 0) {
+            ' Closed by a decision rather than a fix (check these are still valid): ' +
+                (@($decisionRows | ForEach-Object {
+                    $label = if ([string]::IsNullOrWhiteSpace([string]$_.DisplayName)) { [string]$_.RecommendationType } else { [string]$_.DisplayName }
+                    '{0} ({1})' -f $label,$_.Status
+                }) -join '; ') + '.'
+        } else { '' }
         Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Tenant Posture' `
-            -Title 'Microsoft Entra recommendations reviewed' `
-            -Evidence ("{0} recommendation record(s) returned; none currently have status active or needsMoreAction." -f @($result.Rows).Count) `
-            -WhyItMatters 'The recommendation feed is a Microsoft-maintained signal for tenant-specific identity improvements.' `
-            -RecommendedAction 'Continue reviewing the feed regularly and investigate newly active recommendations' `
-            -DocumentationUrl $doc -SourceFile $src -ResultRows @($rows)
+            -Title ("No active, planned or postponed Microsoft Entra recommendations ({0} checked)" -f @($result.Rows).Count) `
+            -Evidence ("{0} returned; none are active, need more action, planned or postponed. Records per status: {1}.{2}" -f (Format-EACount @($result.Rows).Count 'recommendation record' 'recommendation records'),$(if ($statusCounts.Count -gt 0) { $statusCounts -join ', ' } else { 'none' }),$decisionText) `
+            -WhyItMatters "Microsoft's recommendation list tracks identity improvements for this tenant. None are open right now." `
+            -RecommendedAction 'Check the list in Entra admin center > Entra ID > Overview > Recommendations regularly and act on new recommendations as they appear' `
+            -DocumentationUrl $guideDoc -SourceFile $src -ResultRows @($rows) -RuleId 'microsoft-entra-recommendations-reviewed'
     }
 }
 
@@ -395,6 +554,7 @@ function Invoke-Check-SecureScore {
 
     $checkId = 'securescore'
     $doc = 'https://learn.microsoft.com/graph/api/security-list-securescores?view=graph-rest-1.0'
+    $guideDoc = 'https://learn.microsoft.com/en-us/defender-xdr/microsoft-secure-score'
     $result = Invoke-EAGovGraphCollection -Uri 'https://graph.microsoft.com/v1.0/security/secureScores?$top=30'
     if (-not $result.Success) { throw $result.Error }
 
@@ -426,12 +586,15 @@ function Invoke-Check-SecureScore {
     if ($result.Truncated) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Security Posture' -DataSource 'Secure Score pagination' `
             -Reason "pagination exceeded $($result.Pages) pages." -RequiredScope 'SecurityEvents.Read.All' `
-            -DocumentationUrl $doc -SourceFile $src
+            -DocumentationUrl $doc -SourceFile $src -Partial -Subject 'the Microsoft Secure Score history' `
+            -Impact 'The score trend was judged only on the records that were read.'
     }
     if ($ordered.Count -eq 0) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Security Posture' -DataSource 'Microsoft Secure Score' `
             -Reason 'the API succeeded but returned no score records.' -RequiredScope 'SecurityEvents.Read.All' `
-            -DocumentationUrl $doc -SourceFile $src
+            -DocumentationUrl $doc -SourceFile $src -Subject 'Microsoft Secure Score' `
+            -Impact 'The overall security score and its trend were not checked.' `
+            -RecommendedAction 'Open Microsoft Secure Score in the Microsoft Defender portal (security.microsoft.com/securescore) to confirm it is available for this tenant, then run the audit again'
         return
     }
 
@@ -448,25 +611,30 @@ function Invoke-Check-SecureScore {
     if ($null -eq $latest.Percentage) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Security Posture' -DataSource 'Secure Score percentage' `
             -Reason "latest currentScore/maxScore could not be evaluated ($($latest.CurrentScore)/$($latest.MaxScore))." `
-            -RequiredScope 'SecurityEvents.Read.All' -DocumentationUrl $doc -SourceFile $src
+            -RequiredScope 'SecurityEvents.Read.All' -DocumentationUrl $doc -SourceFile $src `
+            -Subject 'the latest Secure Score percentage' `
+            -Impact 'Whether the score is low was not checked.' `
+            -RecommendedAction 'Check the current score in the Microsoft Defender portal (security.microsoft.com/securescore)'
     } elseif ([double]$latest.Percentage -lt 50) {
         Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Security Posture' `
-            -Title ("Microsoft Secure Score is {0}%" -f $latest.Percentage) `
+            -Title ("Microsoft Secure Score is low: {0}% of the maximum" -f $latest.Percentage) `
             -Evidence ("Latest score {0}/{1}, generated {2}. The 50% threshold is a triage threshold, not a compliance boundary." -f $latest.CurrentScore,$latest.MaxScore,$latest.CreatedDateTime) `
-            -WhyItMatters 'A low aggregate score indicates that a substantial share of applicable Microsoft security controls is not credited as implemented.' `
-            -RecommendedAction 'Prioritize unimplemented high-impact controls in Microsoft Secure Score and validate each recommendation against business requirements' `
-            -DocumentationUrl $doc -SourceFile $controlSrc -RuleId 'secure-score-below-50'
+            -WhyItMatters 'Microsoft Secure Score measures how many of the security settings Microsoft recommends are in place. Below 50% means many of them are missing, which makes common attacks easier.' `
+            -RecommendedAction 'Open Microsoft Secure Score in the Microsoft Defender portal (security.microsoft.com/securescore) and fix the open recommendations with the highest score impact first; record the reason for any you decide not to do' `
+            -DocumentationUrl $guideDoc -SourceFile $controlSrc -RuleId 'secure-score-below-50'
     } elseif ([double]$latest.Percentage -lt 70) {
         Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Security Posture' `
-            -Title ("Microsoft Secure Score is {0}%" -f $latest.Percentage) `
+            -Title ("Microsoft Secure Score has room to improve: {0}% of the maximum" -f $latest.Percentage) `
             -Evidence ("Latest score {0}/{1}, generated {2}. The 70% threshold is a prioritization aid, not a compliance boundary." -f $latest.CurrentScore,$latest.MaxScore,$latest.CreatedDateTime) `
-            -WhyItMatters 'Remaining unimplemented controls can identify useful hardening opportunities even when the aggregate score is not itself a compliance measure.' `
-            -RecommendedAction 'Review the lowest-cost, highest-impact remaining controls and document accepted risk' `
-            -DocumentationUrl $doc -SourceFile $controlSrc -RuleId 'secure-score-below-70'
+            -WhyItMatters 'Some security settings Microsoft recommends are not in place yet. The score is a guide rather than a compliance result, but the remaining items often include cheap, useful fixes.' `
+            -RecommendedAction 'Review the remaining recommendations in Microsoft Secure Score (security.microsoft.com/securescore), fix the low-effort, high-impact ones and record why you accept the rest' `
+            -DocumentationUrl $guideDoc -SourceFile $controlSrc -RuleId 'secure-score-below-70'
     }
 
+    # Without a latest percentage there is no trend to judge ([double]$null would be 0 and
+    # report a false drop); the coverage finding above already says the score is unknown.
     $latestDate = ConvertTo-EAGovDateTime $latest.CreatedDateTime
-    if ($latestDate) {
+    if ($latestDate -and $null -ne $latest.Percentage) {
         $older = @($ordered | Where-Object {
             $d = ConvertTo-EAGovDateTime $_.CreatedDateTime
             $d -and $d -le $latestDate.AddDays(-21) -and $null -ne $_.Percentage
@@ -475,21 +643,23 @@ function Invoke-Check-SecureScore {
             $delta = [math]::Round(([double]$latest.Percentage - [double]$older[0].Percentage), 1)
             if ($delta -le -5) {
                 Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Security Posture' `
-                    -Title ("Microsoft Secure Score declined by {0} percentage points" -f ([math]::Abs($delta))) `
+                    -Title ("Microsoft Secure Score dropped by {0} percentage points" -f ([math]::Abs($delta))) `
                     -Evidence ("Score changed from {0}% on {1} to {2}% on {3}." -f $older[0].Percentage,$older[0].CreatedDateTime,$latest.Percentage,$latest.CreatedDateTime) `
-                    -WhyItMatters 'A material decline can indicate disabled controls, newly applicable controls, licensing changes, or posture regression.' `
-                    -RecommendedAction 'Review the Secure Score history and changed control scores to identify and validate the cause of the decline' `
-                    -DocumentationUrl $doc -SourceFile $src -RuleId 'secure-score-decline'
+                    -WhyItMatters 'A drop usually means a security setting was turned off, a license changed or new recommendations now apply. Finding the cause early stops protection from being lost without anyone noticing.' `
+                    -RecommendedAction 'Open the History tab of Microsoft Secure Score (security.microsoft.com/securescore), find which recommendations changed, and turn back on any protection that was switched off' `
+                    -DocumentationUrl $guideDoc -SourceFile $src -RuleId 'secure-score-decline'
             }
         }
     }
 
+    $percentText = if ($null -eq $latest.Percentage) { 'percentage unknown' } else { '{0}%' -f $latest.Percentage }
+    $baselineTitle = if ($null -eq $latest.Percentage) { 'Microsoft Secure Score recorded (percentage unknown)' } else { "Microsoft Secure Score recorded: $percentText of the maximum" }
     Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Security Posture' `
-        -Title 'Microsoft Secure Score baseline captured' `
-        -Evidence ("Latest score={0}/{1} ({2}%); generated={3}; {4} control score(s) captured." -f $latest.CurrentScore,$latest.MaxScore,$latest.Percentage,$latest.CreatedDateTime,@($controls).Count) `
-        -WhyItMatters 'The dated score and control inventory provide a trend baseline; the score should guide investigation rather than be treated as a compliance certificate.' `
-        -RecommendedAction 'Trend the score and investigate individual controls, including compensating controls that Microsoft cannot detect automatically' `
-        -DocumentationUrl $doc -SourceFile $src -ResultRows $evidenceRows -RuleId 'secure-score-baseline'
+        -Title $baselineTitle `
+        -Evidence ("Latest score={0}/{1} ({2}); generated={3}; {4} captured." -f $latest.CurrentScore,$latest.MaxScore,$percentText,$latest.CreatedDateTime,(Format-EACount @($controls).Count 'control score' 'control scores')) `
+        -WhyItMatters 'The dated score lets you compare future audits with today. Use it to guide work, not as proof of compliance.' `
+        -RecommendedAction 'Compare the score between audits and review individual recommendations, including ones you meet in other ways that Microsoft cannot detect' `
+        -DocumentationUrl $guideDoc -SourceFile $src -ResultRows $evidenceRows -RuleId 'secure-score-baseline'
 }
 
 function Get-EAGovAccessReviewCategory {
@@ -514,6 +684,9 @@ function Invoke-Check-AccessReviews {
 
     $checkId = 'accessreviews'
     $doc = 'https://learn.microsoft.com/graph/api/accessreviewset-list-definitions?view=graph-rest-1.0'
+    $guideDoc = 'https://learn.microsoft.com/en-us/entra/id-governance/create-access-review'
+    $manageDoc = 'https://learn.microsoft.com/en-us/entra/id-governance/manage-access-review'
+    $reviewsPath = 'Entra admin center > ID Governance > Access reviews'
     $result = Invoke-EAGovGraphCollection -Uri 'https://graph.microsoft.com/v1.0/identityGovernance/accessReviews/definitions?$top=100'
     if (-not $result.Success) { throw $result.Error }
 
@@ -524,7 +697,11 @@ function Invoke-Check-AccessReviews {
     $settingGaps = New-Object System.Collections.Generic.List[object]
     $categories = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
     $effectiveCategories = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+    # Groups named in the scope of a recurring review that has not ended (ongoing
+    # coverage, the same rule as $effectiveCategories), and groups named in any review.
     $reviewedGroupIds = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+    $everReviewedGroupIds = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+    $groupIdPattern = '(?i)/groups/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
 
     foreach ($definition in @($result.Rows)) {
         $id = [string](Get-EAGovProperty $definition 'id')
@@ -532,8 +709,8 @@ function Invoke-Check-AccessReviews {
         [void]$categories.Add($category)
         $scope = Get-EAGovProperty $definition 'scope'
         $scopeText = ConvertTo-EAGovCompactJson $scope
-        foreach ($match in [regex]::Matches($scopeText, '(?i)/groups/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')) {
-            [void]$reviewedGroupIds.Add($match.Groups[1].Value)
+        foreach ($match in [regex]::Matches($scopeText, $groupIdPattern)) {
+            [void]$everReviewedGroupIds.Add($match.Groups[1].Value)
         }
 
         $settings = Get-EAGovProperty $definition 'settings'
@@ -558,6 +735,9 @@ function Invoke-Check-AccessReviews {
         $terminalDefinition = $definitionStatus -match '^(Completed|Inactive|Stopped|Cancelled|Canceled)$'
         if (-not $terminalDefinition -and -not [string]::IsNullOrWhiteSpace($recurrencePattern)) {
             [void]$effectiveCategories.Add($category)
+            foreach ($match in [regex]::Matches($scopeText, $groupIdPattern)) {
+                [void]$reviewedGroupIds.Add($match.Groups[1].Value)
+            }
         }
 
         $instances = @()
@@ -627,43 +807,46 @@ function Invoke-Check-AccessReviews {
     if ($result.Truncated) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Access review definitions pagination' `
             -Reason "pagination exceeded $($result.Pages) pages." -RequiredScope 'AccessReview.Read.All' `
-            -DocumentationUrl $doc -SourceFile $src
+            -DocumentationUrl $doc -SourceFile $src -Partial -Subject 'the list of access reviews' `
+            -Impact 'Problems with access reviews beyond the part that was read are missing from this report.'
     }
     if ($partialInstances.Count -gt 0) {
         $partialSrc = Write-Evidence -BaseName 'access_review_instance_errors' -Rows $partialInstances.ToArray() -Title 'Access Review Instance Collection Gaps'
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Access review instances' `
-            -Reason ("{0} definition(s) could not be enumerated completely." -f $partialInstances.Count) `
-            -RequiredScope 'AccessReview.Read.All' -DocumentationUrl $doc -SourceFile $partialSrc
+            -Reason ((Format-EACount $partialInstances.Count 'definition' 'definitions') + ' could not be enumerated completely.') `
+            -RequiredScope 'AccessReview.Read.All' -DocumentationUrl $doc -SourceFile $partialSrc `
+            -Subject 'the review rounds of some access reviews' `
+            -Impact 'Overdue access reviews may be missing from this report.'
     }
     if ($settingGaps.Count -gt 0) {
         $settingGapSrc = Write-Evidence -BaseName 'access_review_setting_gaps' -Rows $settingGaps.ToArray() -Title 'Access Review Setting Coverage Gaps'
         Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Identity Governance' `
-            -Title 'Access review decision-setting coverage is incomplete' `
-            -Evidence ("{0} definition(s) omitted settings required to distinguish automatic application and default-decision behavior. Missing values are unknown, not false." -f $settingGaps.Count) `
-            -WhyItMatters 'Treating an omitted property as disabled can conceal a permissive default decision or an unapplied decision workflow.' `
-            -RecommendedAction 'Confirm AccessReview.Read.All access, inspect the affected definitions, and rerun the audit' `
+            -Title ("Some settings of {0} could not be read" -f (Format-EACount $settingGaps.Count 'access review' 'access reviews')) `
+            -Evidence ((Format-EACount $settingGaps.Count 'definition' 'definitions') + ' omitted settings required to distinguish automatic application and default-decision behavior. Missing values are unknown, not false.') `
+            -WhyItMatters 'The audit cannot tell whether these reviews keep access when reviewers do not answer, or whether their decisions are actually applied.' `
+            -RecommendedAction ("Open the listed reviews in {0} and check their 'Upon completion settings'; confirm the audit account has AccessReview.Read.All, then run the audit again" -f $reviewsPath) `
             -DocumentationUrl $doc -SourceFile $settingGapSrc -ResultRows $settingGaps.ToArray() `
             -RuleId 'access-review-settings-unknown' -CoverageGap
     }
 
     if ($rows.Count -eq 0) {
         Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Identity Governance' `
-            -Title 'No access review definitions are configured' `
+            -Title 'No access reviews are set up' `
             -Evidence 'The definitions API returned zero access reviews. This is a known empty result, not an API failure. Access reviews require Microsoft Entra ID P2, Microsoft Entra ID Governance or Microsoft Entra Suite licensing.' `
-            -WhyItMatters 'Without recurring reviews, privileged, guest, group, and application access can persist after its business need ends.' `
-            -RecommendedAction 'Configure recurring access reviews for privileged roles, sensitive groups, guest access, and enterprise-application assignments. If the tenant is not licensed for access reviews, document the equivalent recertification process you use instead' `
-            -DocumentationUrl $doc -SourceFile $src -RuleId 'access-reviews-none'
+            -WhyItMatters 'Without regular access reviews, people keep admin roles, group memberships, guest access and app access long after they stop needing them. That leftover access is what attackers and former staff misuse.' `
+            -RecommendedAction ("Set up recurring access reviews in {0}, starting with admin roles, guests and sensitive groups. If the tenant is not licensed for access reviews, document the manual review process you use instead" -f $reviewsPath) `
+            -DocumentationUrl $guideDoc -SourceFile $src -RuleId 'access-reviews-none'
         return
     }
 
     $defaultApprove = @($rows | Where-Object { $_.DefaultDecisionEnabled -eq $true -and [string]$_.DefaultDecision -ieq 'Approve' })
     if ($defaultApprove.Count -gt 0) {
         Add-EAGovFinding -Severity 'High' -CheckId $checkId -Category 'Identity Governance' `
-            -Title ("{0} access review definition(s) default unanswered decisions to Approve" -f $defaultApprove.Count) `
+            -Title ((Format-EACount $defaultApprove.Count 'access review approves' 'access reviews approve') + ' access automatically when reviewers do not answer') `
             -Evidence 'DefaultDecisionEnabled=true and DefaultDecision=Approve causes non-responses to retain access.' `
-            -WhyItMatters 'A review that approves unanswered decisions can preserve exactly the stale access the review is intended to remove.' `
-            -RecommendedAction 'Use Deny or Recommendation as the default decision and require reviewers to justify approvals' `
-            -DocumentationUrl $doc -SourceFile $src -ResultRows $defaultApprove -RuleId 'access-review-default-approve'
+            -WhyItMatters 'When a reviewer does not respond, the person keeps their access, so the stale access the review should remove survives it.' `
+            -RecommendedAction ("In {0}, open each listed review and set 'If reviewers don't respond' to Remove access or Take recommendations; require reviewers to give a reason when they approve" -f $reviewsPath) `
+            -DocumentationUrl $guideDoc -SourceFile $src -ResultRows $defaultApprove -RuleId 'access-review-default-approve'
     }
 
     $nonRecurring = @($rows | Where-Object {
@@ -673,49 +856,54 @@ function Invoke-Check-AccessReviews {
     $sensitiveNonRecurring = @($nonRecurring | Where-Object { $_.Category -in @('PrivilegedRoles','Guests','InactiveUsers','EnterpriseApps','Groups') })
     if ($sensitiveNonRecurring.Count -gt 0) {
         Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Identity Governance' `
-            -Title ("{0} sensitive-access review definition(s) are not recurring" -f $sensitiveNonRecurring.Count) `
-            -Evidence 'The review schedule is one-time, ended, or has no readable recurrence pattern.' `
-            -WhyItMatters 'One-time reviews do not control access that is granted or becomes stale after the review ends.' `
-            -RecommendedAction 'Use a recurring schedule with accountable reviewers for privileged, external, inactive-user, and application access' `
-            -DocumentationUrl $doc -SourceFile $src -ResultRows $sensitiveNonRecurring -RuleId 'access-review-sensitive-not-recurring'
+            -Title (Format-EACount $sensitiveNonRecurring.Count 'access review of sensitive access ran only once or has ended' 'access reviews of sensitive access ran only once or have ended') `
+            -Evidence 'The review covers admin roles, guests, inactive users, enterprise applications or groups, and its schedule is one-time, ended, or has no readable recurrence pattern.' `
+            -WhyItMatters 'A one-time review cleans up access once. Anything granted afterwards is never checked again.' `
+            -RecommendedAction ("Give these reviews a recurring schedule (for example quarterly) with a named reviewer in {0}" -f $reviewsPath) `
+            -DocumentationUrl $guideDoc -SourceFile $src -ResultRows $sensitiveNonRecurring -RuleId 'access-review-sensitive-not-recurring'
     }
 
     $manualApply = @($rows | Where-Object { $_.AutoApplyDecisions -eq $false -and $_.Category -in @('PrivilegedRoles','Guests','InactiveUsers','EnterpriseApps') })
     if ($manualApply.Count -gt 0) {
         Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Identity Governance' `
-            -Title ("{0} sensitive-access review definition(s) require manual application of decisions" -f $manualApply.Count) `
+            -Title ((Format-EACount $manualApply.Count 'access review of sensitive access does not' 'access reviews of sensitive access do not') + ' remove denied access automatically') `
             -Evidence 'autoApplyDecisionsEnabled=false. Manual application can be intentional, but must be operationally tracked.' `
-            -WhyItMatters 'Completed review decisions do not remove access until they are applied; an untracked manual step can leave denied access in place.' `
-            -RecommendedAction 'Enable automatic application where safe, or document and monitor the manual apply workflow with an SLA' `
-            -DocumentationUrl $doc -SourceFile $src -ResultRows $manualApply -RuleId 'access-review-manual-apply'
+            -WhyItMatters "A reviewer's 'deny' does nothing until someone applies the results. If that manual step is forgotten, access that should be removed stays in place." `
+            -RecommendedAction "Turn on 'Auto apply results to resource' for these reviews, or name an owner who applies the results within an agreed time" `
+            -DocumentationUrl $manageDoc -SourceFile $src -ResultRows $manualApply -RuleId 'access-review-manual-apply'
     }
 
     if ($overdue.Count -gt 0) {
         $roleOverdue = @($overdue | Where-Object { $_.Category -eq 'PrivilegedRoles' })
         $severity = if ($roleOverdue.Count -gt 0) { 'High' } else { 'Medium' }
         Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'Identity Governance' `
-            -Title ("{0} access review instance(s) are overdue" -f $overdue.Count) `
-            -Evidence ("The scheduled end date has passed while status remains nonterminal; {0} instance(s) cover privileged roles." -f $roleOverdue.Count) `
-            -WhyItMatters 'Overdue reviews delay access removal and indicate that the governance process is not completing as designed.' `
-            -RecommendedAction 'Escalate overdue reviewers, complete the reviews, apply decisions, and fix reviewer/notification ownership' `
-            -DocumentationUrl $doc -SourceFile $overdueSrc -ResultRows $overdue.ToArray() -RuleId 'access-review-overdue'
+            -Title ((Format-EACount $overdue.Count 'access review round is past its' 'access review rounds are past their') + ' end date but not finished') `
+            -Evidence ("The scheduled end date has passed while status remains nonterminal; {0} privileged roles." -f (Format-EACount $roleOverdue.Count 'instance covers' 'instances cover')) `
+            -WhyItMatters 'Access that reviewers should have removed stays in place while a review is overdue. It also shows the review process is not working as intended.' `
+            -RecommendedAction 'Chase the reviewers, finish the listed reviews and apply the results; then fix reviewer assignments and reminders so reviews finish on time' `
+            -DocumentationUrl $manageDoc -SourceFile $overdueSrc -ResultRows $overdue.ToArray() -RuleId 'access-review-overdue'
     }
 
     $desired = @(
-        @{ Category='PrivilegedRoles'; Severity='Medium'; Label='privileged roles' },
-        @{ Category='Guests';          Severity='Low';    Label='guest users' },
-        @{ Category='InactiveUsers';   Severity='Low';    Label='inactive users' },
-        @{ Category='EnterpriseApps';  Severity='Low';    Label='enterprise applications' },
-        @{ Category='Groups';          Severity='Low';    Label='group membership' }
+        @{ Category='PrivilegedRoles'; Severity='Medium'; Label='admin (privileged) roles'
+           Why='Admin roles that nobody re-confirms tend to stay assigned after people change jobs, leaving powerful accounts for attackers to target.' },
+        @{ Category='Guests';          Severity='Low';    Label='guest users'
+           Why='Guest accounts often outlive the project or contract they were created for, leaving outsiders with access to your data.' },
+        @{ Category='InactiveUsers';   Severity='Low';    Label='inactive users'
+           Why='Enabled accounts that nobody uses are easy to misuse, because nobody notices when someone else signs in with them.' },
+        @{ Category='EnterpriseApps';  Severity='Low';    Label='enterprise applications'
+           Why='People keep access to business applications after they stop needing it unless someone regularly checks who is assigned.' },
+        @{ Category='Groups';          Severity='Low';    Label='group memberships'
+           Why='Group memberships grant access to files, apps and sites; without regular review, people keep that access after they change roles.' }
     )
     foreach ($item in $desired) {
         if (-not $effectiveCategories.Contains($item.Category)) {
             Add-EAGovFinding -Severity $item.Severity -CheckId $checkId -Category 'Identity Governance' `
-                -Title ("No access review coverage detected for {0}" -f $item.Label) `
+                -Title ("No recurring access review covers {0}" -f $item.Label) `
                 -Evidence ("No nonterminal recurring definition scope was classified as {0}. One-time, stopped, or completed definitions don't count as ongoing coverage." -f $item.Category) `
-                -WhyItMatters ("Recurring review of {0} limits access accumulation and orphaned assignments." -f $item.Label) `
-                -RecommendedAction ("Create a recurring access review for {0}, or document the equivalent compensating review process" -f $item.Label) `
-                -DocumentationUrl $doc -SourceFile $src -RuleId ("access-review-missing-" + $item.Category.ToLowerInvariant())
+                -WhyItMatters $item.Why `
+                -RecommendedAction ("Create a recurring access review for {0} in {1}, or document the equivalent review process you use instead" -f $item.Label,$reviewsPath) `
+                -DocumentationUrl $guideDoc -SourceFile $src -RuleId ("access-review-missing-" + $item.Category.ToLowerInvariant())
         }
     }
 
@@ -725,32 +913,41 @@ function Invoke-Check-AccessReviews {
     if ($roleGroups.Success) {
         $uncoveredRoleGroups = @($roleGroups.Rows | Where-Object { -not $reviewedGroupIds.Contains([string](Get-EAGovProperty $_ 'id')) })
         if ($uncoveredRoleGroups.Count -gt 0) {
-            $roleRows = @($uncoveredRoleGroups | ForEach-Object { [pscustomobject]@{ Id=(Get-EAGovProperty $_ 'id'); DisplayName=(Get-EAGovProperty $_ 'displayName') } })
-            $roleSrc = Write-Evidence -BaseName 'access_review_uncovered_role_groups' -Rows $roleRows -Title 'Role-Assignable Groups Without Explicit Access Review Scope'
+            $roleRows = @($uncoveredRoleGroups | ForEach-Object {
+                $groupId = [string](Get-EAGovProperty $_ 'id')
+                [pscustomobject]@{
+                    Id=$groupId; DisplayName=(Get-EAGovProperty $_ 'displayName')
+                    OnlyOneTimeOrEndedReview=$everReviewedGroupIds.Contains($groupId)
+                }
+            })
+            $onceReviewed = @($roleRows | Where-Object { $_.OnlyOneTimeOrEndedReview }).Count
+            $roleSrc = Write-Evidence -BaseName 'access_review_uncovered_role_groups' -Rows $roleRows -Title 'Role-Assignable Groups Without a Recurring Access Review'
             Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Identity Governance' `
-                -Title ("{0} role-assignable group(s) lack an explicit access review" -f $roleRows.Count) `
-                -Evidence 'The group IDs were not found in any access-review scope. A broad all-groups review is not assumed to include security role-assignable groups.' `
-                -WhyItMatters 'Membership in a role-assignable group can confer privileged directory access, so stale membership is a privileged access path.' `
-                -RecommendedAction 'Create recurring reviews for role-assignable group membership and ownership, with automatic removal or a monitored apply process' `
-                -DocumentationUrl $doc -SourceFile $roleSrc -ResultRows $roleRows -RuleId 'access-review-role-groups-uncovered'
+                -Title ((Format-EACount $roleRows.Count 'group that can hold admin roles has' 'groups that can hold admin roles have') + ' no recurring access review') `
+                -Evidence ("These role-assignable groups (isAssignableToRole=true) were not found in the scope of any recurring access review that is still running. {0} reviewed only once or in a review that has ended (OnlyOneTimeOrEndedReview=True), which does not count as ongoing coverage. A broad all-groups review is not assumed to include them." -f (Format-EACount $onceReviewed 'of them was' 'of them were')) `
+                -WhyItMatters 'Membership of these groups can give admin rights. Without a review, people who no longer need admin access stay in the group.' `
+                -RecommendedAction ("Create a recurring access review of the members and owners of each listed group in {0}, with 'Auto apply results to resource' turned on" -f $reviewsPath) `
+                -DocumentationUrl $guideDoc -SourceFile $roleSrc -ResultRows $roleRows -RuleId 'access-review-role-groups-uncovered'
         }
         if ($roleGroups.Truncated) {
             Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Role-assignable group access-review coverage' `
                 -Reason "pagination exceeded $($roleGroups.Pages) pages; only the groups read were compared." -RequiredScope 'Group.Read.All' `
-                -DocumentationUrl $doc -SourceFile $src
+                -DocumentationUrl $doc -SourceFile $src -Partial -Subject 'the list of groups that can hold admin roles' `
+                -Impact 'Admin-role groups without an access review may be missing from this report.'
         }
     } else {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Role-assignable group access-review coverage' `
             -Reason ([string]$roleGroups.Error.Exception.Message) -RequiredScope 'Group.Read.All' `
-            -DocumentationUrl $doc -SourceFile $src
+            -DocumentationUrl $doc -SourceFile $src -Subject 'the list of groups that can hold admin roles' `
+            -Impact 'Whether admin-role groups have an access review was not checked.'
     }
 
     Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Identity Governance' `
-        -Title 'Access review inventory captured' `
+        -Title ("Access review setup recorded ({0})" -f (Format-EACount $rows.Count 'review' 'reviews')) `
         -Evidence ("Definitions={0}; recurring nonterminal categories={1}; all categories={2}; overdue instances={3}." -f $rows.Count,($effectiveCategories -join ', '),($categories -join ', '),$overdue.Count) `
-        -WhyItMatters 'A complete definition and instance inventory makes review coverage, recurrence, and operational backlog visible.' `
-        -RecommendedAction 'Reconcile the inventory with the organization security-tier model and access-review ownership register' `
-        -DocumentationUrl $doc -SourceFile $src -ResultRows $rows.ToArray() -RuleId 'access-review-inventory'
+        -WhyItMatters 'The list shows which kinds of access are reviewed regularly and where reviews are running late.' `
+        -RecommendedAction 'Compare the list with your own list of sensitive access and make sure each area has an owner and a recurring review' `
+        -DocumentationUrl $guideDoc -SourceFile $src -ResultRows $rows.ToArray() -RuleId 'access-review-inventory'
 }
 
 function Invoke-Check-AuthRecovery {
@@ -760,6 +957,12 @@ function Invoke-Check-AuthRecovery {
     $checkId = 'authrecovery'
     $doc = 'https://learn.microsoft.com/graph/api/authenticationmethodsroot-list-userregistrationdetails?view=graph-rest-1.0'
     $policyDoc = 'https://learn.microsoft.com/graph/api/authenticationmethodspolicy-get?view=graph-rest-1.0'
+    $ssprDoc = 'https://learn.microsoft.com/en-us/entra/identity/authentication/tutorial-enable-sspr'
+    $passwordlessDoc = 'https://learn.microsoft.com/en-us/entra/identity/authentication/how-to-plan-prerequisites-phishing-resistant-passwordless-authentication'
+    $systemPreferredDoc = 'https://learn.microsoft.com/en-us/entra/identity/authentication/concept-system-preferred-authentication'
+    $migrationDoc = 'https://learn.microsoft.com/en-us/entra/identity/authentication/how-to-authentication-methods-manage'
+    $campaignDoc = 'https://learn.microsoft.com/en-us/entra/identity/authentication/how-to-mfa-registration-campaign'
+    $methodsPath = 'Entra admin center > Entra ID > Authentication methods'
 
     # authrecovery is registered as self-gating (Scopes=@()), so a missing
     # AuditLog.Read.All must not abort the independent policy, password-protection and
@@ -798,11 +1001,16 @@ function Invoke-Check-AuthRecovery {
     if (-not $registrationKnown) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Authentication' -DataSource 'Authentication-method user registration details' `
             -Reason ("the registration report read failed ({0}); SSPR, passwordless and system-preferred registration rules were not evaluated." -f $registrationError) `
-            -RequiredScope 'AuditLog.Read.All' -DocumentationUrl $doc -SourceFile $src
+            -RequiredScope 'AuditLog.Read.All' -DocumentationUrl $doc -SourceFile $src `
+            -Subject "the report of users' registered sign-in methods" `
+            -Impact 'Whether users can reset their own password or sign in without a password was not checked.'
     } elseif ($rows.Count -eq 0) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Authentication' -DataSource 'Authentication-method user registration details' `
             -Reason 'the API returned no rows; disabled users are not represented by this API and tenant-wide recovery posture cannot be inferred.' `
-            -RequiredScope 'AuditLog.Read.All' -DocumentationUrl $doc -SourceFile $src
+            -RequiredScope 'AuditLog.Read.All' -DocumentationUrl $doc -SourceFile $src `
+            -Subject "the report of users' registered sign-in methods" `
+            -Impact 'Whether users can reset their own password or sign in without a password was not checked.' `
+            -RecommendedAction ("Check the user registration details in {0} > Activity; if they are empty too, confirm the audit account has AuditLog.Read.All and a reader role, then run the audit again" -f $methodsPath)
     }
     # Registration-derived rules run only on a successful, non-empty read. The policy,
     # password-protection and hybrid sections below are independent and always run.
@@ -819,38 +1027,38 @@ function Invoke-Check-AuthRecovery {
     if ($registrationAvailable) {
         if ($ssprEnabled.Count -eq 0) {
             Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Authentication' `
-                -Title 'No member users are reported as enabled for self-service password reset' `
-                -Evidence ("The registration report contains {0} member user(s), with IsSsprEnabled=true for zero." -f $members.Count) `
-                -WhyItMatters 'Without governed self-service recovery, password resets depend on helpdesk intervention and are more exposed to social-engineering pressure.' `
-                -RecommendedAction 'Enable SSPR for an appropriate pilot and then broad user population, requiring strong recovery methods and monitoring reset events' `
-                -DocumentationUrl $doc -SourceFile $src -RuleId 'sspr-no-enabled-members'
+                -Title 'Self-service password reset is not turned on for any user' `
+                -Evidence ("The registration report contains {0}, with IsSsprEnabled=true for zero." -f (Format-EACount $members.Count 'member user' 'member users')) `
+                -WhyItMatters 'Without self-service password reset (SSPR), every forgotten password goes through the helpdesk, where an attacker can pose as a user on the phone to get a password reset.' `
+                -RecommendedAction 'Turn on self-service password reset for all users (a pilot group first if needed) in Entra admin center > Entra ID > Password reset > Properties, and require two methods to reset' `
+                -DocumentationUrl $ssprDoc -SourceFile $src -RuleId 'sspr-no-enabled-members'
         } elseif ($ssprNotCapable.Count -gt 0) {
             Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Authentication' `
-                -Title ("{0} SSPR-enabled member user(s) are not capable of self-service reset" -f $ssprNotCapable.Count) `
-                -Evidence 'These users are enabled by policy but do not have the required allowed recovery-method registration.' `
-                -WhyItMatters 'Users who cannot complete SSPR remain dependent on helpdesk resets and may be locked out during an incident.' `
-                -RecommendedAction 'Run a registration campaign and remediate method-policy or registration gaps for the affected users' `
-                -DocumentationUrl $doc -SourceFile $src -ResultRows $ssprNotCapable -RuleId 'sspr-enabled-not-capable'
+                -Title ((Format-EACount $ssprNotCapable.Count 'user allowed to reset their own password has' 'users allowed to reset their own password have') + ' not set up a way to do it') `
+                -Evidence 'IsSsprEnabled=true but IsSsprCapable is not true: these users are enabled by policy but have not registered enough allowed recovery methods.' `
+                -WhyItMatters 'These users cannot reset their own password, so they depend on helpdesk resets (which attackers try to abuse) and can be locked out when it matters most.' `
+                -RecommendedAction "Ask these users to register reset methods at https://aka.ms/mysecurityinfo, and turn on 'Require users to register when signing in' in Entra admin center > Entra ID > Password reset > Registration" `
+                -DocumentationUrl $ssprDoc -SourceFile $src -ResultRows $ssprNotCapable -RuleId 'sspr-enabled-not-capable'
         }
 
         if ($adminsWithoutPasswordless.Count -gt 0) {
             Add-EAGovFinding -Severity 'High' -CheckId $checkId -Category 'Authentication' `
-                -Title ("{0} administrator(s) are not reported as passwordless capable" -f $adminsWithoutPasswordless.Count) `
-                -Evidence ("{0}/{1} administrator(s) have IsPasswordlessCapable=true; every remaining administrator is listed. Passwordless capability is not by itself proof that Conditional Access requires phishing-resistant authentication." -f $passwordlessAdmins.Count,$admins.Count) `
-                -WhyItMatters 'Privileged accounts that still depend on passwords have more exposure to password theft, replay, and helpdesk recovery attacks.' `
-                -RecommendedAction 'Register FIDO2/passkeys, Windows Hello for Business, or another allowed passwordless method for every administrator, then separately require phishing-resistant authentication strength through Conditional Access' `
-                -DocumentationUrl $doc -SourceFile $src -ResultRows $adminsWithoutPasswordless -RuleId 'passwordless-admins-not-capable'
+                -Title ((Format-EACount $adminsWithoutPasswordless.Count 'admin account has' 'admin accounts have') + ' no passwordless sign-in method, such as a passkey, set up') `
+                -Evidence ("Administrators with IsPasswordlessCapable=true: {0}/{1}; every remaining administrator is listed. Passwordless capability is not by itself proof that Conditional Access requires phishing-resistant authentication. Related: the 'MFA Capability & Method Strength' check (mfa) scores admins without a phishing-resistant method separately (rule mfa-admins-not-phishing-resistant); registering a passkey or Windows Hello for Business fixes both." -f $passwordlessAdmins.Count,$admins.Count) `
+                -WhyItMatters 'Admins who still sign in with a password can have it stolen by a fake sign-in page or guessed, and a helpdesk password reset can be abused to take over the account.' `
+                -RecommendedAction 'Register a passkey (FIDO2 security key or passkey in Microsoft Authenticator) or Windows Hello for Business for every admin, then require phishing-resistant sign-in for admins with a Conditional Access authentication strength (Entra admin center > Entra ID > Conditional Access)' `
+                -DocumentationUrl $passwordlessDoc -SourceFile $src -ResultRows $adminsWithoutPasswordless -RuleId 'passwordless-admins-not-capable'
         }
 
         if ($members.Count -gt 0) {
             $passwordlessPercent = [math]::Round(($passwordless.Count * 100.0) / $members.Count, 1)
             if ($passwordlessPercent -lt 25) {
                 Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Authentication' `
-                    -Title ("Passwordless-capable adoption is {0}%" -f $passwordlessPercent) `
+                    -Title ("Only {0}% of users can sign in without a password" -f $passwordlessPercent) `
                     -Evidence ("{0}/{1} member users are reported as passwordless capable. The 25% threshold is an adoption-prioritization threshold, not a compliance requirement." -f $passwordless.Count,$members.Count) `
-                    -WhyItMatters 'Low adoption limits the tenant population that can move away from phishable password-based authentication.' `
-                    -RecommendedAction 'Expand registration and rollout of allowed passwordless methods, prioritizing privileged and high-risk populations' `
-                    -DocumentationUrl $doc -SourceFile $src -RuleId 'passwordless-low-adoption'
+                    -WhyItMatters 'Passwords are the main target of phishing and password-guessing attacks. The fewer users who can sign in without one, the more accounts stay exposed.' `
+                    -RecommendedAction 'Roll out passwordless sign-in (passkeys, Windows Hello for Business or Microsoft Authenticator), starting with admins and other high-risk users, and track the share in each audit' `
+                    -DocumentationUrl $passwordlessDoc -SourceFile $src -RuleId 'passwordless-low-adoption'
             }
         }
 
@@ -858,18 +1066,20 @@ function Invoke-Check-AuthRecovery {
         if ($systemPreferredKnown.Count -eq 0) {
             Add-EAGovCoverageFinding -CheckId $checkId -Category 'Authentication' -DataSource 'System-preferred authentication status' `
                 -Reason 'the property was absent/null on every registration record.' -RequiredScope 'AuditLog.Read.All' `
-                -DocumentationUrl $doc -SourceFile $src
+                -DocumentationUrl $doc -SourceFile $src -Subject 'the system-preferred authentication status of users' `
+                -Impact 'Whether users are steered to their strongest sign-in method was not checked.' `
+                -RecommendedAction ("Check the System-preferred authentication setting in {0} > Settings" -f $methodsPath)
         } else {
             $memberSystemPreferredOff = @($members | Where-Object { $_.IsSystemPreferredAuthenticationMethodEnabled -eq $false })
             if ($memberSystemPreferredOff.Count -gt 0) {
                 $adminSystemPreferredOff = @($memberSystemPreferredOff | Where-Object { $_.IsAdmin -eq $true })
                 $severity = if ($adminSystemPreferredOff.Count -gt 0) { 'Medium' } else { 'Low' }
                 Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'Authentication' `
-                    -Title ("System-preferred authentication is disabled for {0} member registration record(s)" -f $memberSystemPreferredOff.Count) `
-                    -Evidence ("IsSystemPreferredAuthenticationMethodEnabled=false; {0} affected record(s) are administrators. The report exposes effective per-user state, not a user choice." -f $adminSystemPreferredOff.Count) `
-                    -WhyItMatters 'System-preferred MFA helps select the strongest registered method and reduces authentication-strength downgrade.' `
-                    -RecommendedAction 'Enable system-preferred authentication tenant-wide after validating exception populations' `
-                    -DocumentationUrl $doc -SourceFile $src -ResultRows $memberSystemPreferredOff -RuleId 'system-preferred-member-disabled'
+                    -Title ("System-preferred authentication is off for {0}" -f (Format-EACount $memberSystemPreferredOff.Count 'user' 'users')) `
+                    -Evidence ("IsSystemPreferredAuthenticationMethodEnabled=false; {0}. The report exposes effective per-user state, not a user choice." -f (Format-EACount $adminSystemPreferredOff.Count 'affected record is an administrator' 'affected records are administrators')) `
+                    -WhyItMatters 'System-preferred authentication makes Microsoft ask each user for the strongest method they registered. When it is off, users can choose a weaker method, such as a text message, even when a stronger one is available.' `
+                    -RecommendedAction ("Turn on System-preferred authentication for all users in {0} > Settings, and exclude only groups with a documented reason" -f $methodsPath) `
+                    -DocumentationUrl $systemPreferredDoc -SourceFile $src -ResultRows $memberSystemPreferredOff -RuleId 'system-preferred-member-disabled'
             }
         }
     }
@@ -878,7 +1088,8 @@ function Invoke-Check-AuthRecovery {
     if (-not $policyResult.Success) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Authentication' -DataSource 'Authentication-method migration and registration campaign policy' `
             -Reason ([string]$policyResult.Error.Exception.Message) -RequiredScope 'Policy.Read.All' `
-            -DocumentationUrl $policyDoc -SourceFile $src
+            -DocumentationUrl $policyDoc -SourceFile $src -Subject 'the authentication methods policy' `
+            -Impact 'The migration status and the registration campaign were not checked here.'
     } else {
         $policy = $policyResult.Value
         $enforcement = Get-EAGovProperty $policy 'registrationEnforcement'
@@ -899,28 +1110,48 @@ function Invoke-Check-AuthRecovery {
         if ($migration -and $migration -notmatch '^migrationComplete$') {
             $severity = if ($migration -match '^preMigration$') { 'Medium' } else { 'Low' }
             Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'Authentication' `
-                -Title ("Authentication-method policy migration is {0}" -f $migration) `
-                -Evidence 'The tenant has not reached migrationComplete, so legacy MFA/SSPR policy settings may still affect effective behavior.' `
-                -WhyItMatters 'Split legacy and modern policy sources complicate assurance and can leave unintended method availability or inconsistent recovery behavior.' `
-                -RecommendedAction 'Complete the documented migration to the unified Authentication Methods policy after validating method targets and SSPR requirements' `
-                -DocumentationUrl $policyDoc -SourceFile $policySrc -RuleId 'auth-method-policy-migration-not-complete'
+                -Title ("Old MFA and password-reset method settings still apply (migration state: {0})" -f $migration) `
+                -Evidence ("policyMigrationState={0} (finished = migrationComplete), so legacy MFA/SSPR policy settings may still affect which methods work. Related: the 'Authentication Methods Policy' check (authmethodpolicy) reports the same setting as rule authmethodpolicy-migration-incomplete; one fix resolves both." -f $migration) `
+                -WhyItMatters 'Until the move to the single authentication methods policy is finished, the old multifactor authentication (MFA) and self-service password reset (SSPR) settings can still allow methods that the new policy has turned off.' `
+                -RecommendedAction ("Move the old MFA and SSPR method settings into the authentication methods policy, then set {0} > Policies > Manage migration to Migration Complete" -f $methodsPath) `
+                -DocumentationUrl $migrationDoc -SourceFile $policySrc -RuleId 'auth-method-policy-migration-not-complete'
         } elseif ([string]::IsNullOrWhiteSpace($migration)) {
             Add-EAGovCoverageFinding -CheckId $checkId -Category 'Authentication' -DataSource 'Authentication-method migration state' `
                 -Reason 'policyMigrationState was absent from the response.' -RequiredScope 'Policy.Read.All' `
-                -DocumentationUrl $policyDoc -SourceFile $policySrc
+                -DocumentationUrl $policyDoc -SourceFile $policySrc -Subject 'the authentication methods migration status' `
+                -Impact 'Whether old MFA and password-reset method settings still apply was not checked.' `
+                -RecommendedAction ("Check {0} > Policies > Manage migration in the admin center" -f $methodsPath)
         }
 
         # The main authmethodpolicy check already reports a disabled campaign on its own.
         # This rule only adds the population that is not yet passwordless, so it needs
         # registration data; without it the registration coverage finding above applies.
+        # 'default' is the Microsoft managed state, which is an active campaign (the main
+        # check treats it as on too), so only disabled or unreadable states count here.
+        # An empty or unexpected state is not proof that the campaign is off: it is a
+        # coverage gap under its own rule (coverage-registration-campaign-state), adds no
+        # risk points, and never shares a trend identity with the known-off finding.
+        # One-time id change, part of the finding-id migration: the unknown state used to
+        # be reported under registration-campaign-disabled.
         $campaignState = [string](Get-EAGovProperty $campaign 'state')
-        if ($campaignState -notmatch '^enabled$' -and $registrationAvailable -and $members.Count -gt $passwordless.Count) {
-            Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Authentication' `
-                -Title 'Authentication-method registration campaign is not enabled' `
-                -Evidence ("Campaign state={0}; {1} member user(s) are not passwordless capable." -f ($campaignState ?? 'unknown'),($members.Count - $passwordless.Count)) `
-                -WhyItMatters 'Without a targeted registration campaign, users may not enroll in stronger methods despite being eligible to do so.' `
-                -RecommendedAction 'Enable and scope a registration campaign for Microsoft Authenticator or passkeys, with controlled exclusions and communications' `
-                -DocumentationUrl $policyDoc -SourceFile $policySrc -RuleId 'registration-campaign-disabled'
+        if ($campaignState -notmatch '^(enabled|default)$' -and $registrationAvailable -and $members.Count -gt $passwordless.Count) {
+            $notPasswordless = $members.Count - $passwordless.Count
+            if ($campaignState -match '^disabled$') {
+                Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Authentication' `
+                    -Title ("Users are not prompted to set up stronger sign-in methods ({0})" -f (Format-EACount $notPasswordless 'is not passwordless yet' 'are not passwordless yet')) `
+                    -Evidence ("Campaign state={0}; {1} not passwordless capable. Related: the 'Authentication Methods Policy' check (authmethodpolicy) scores the campaign being off (rule authmethodpolicy-registration-campaign-off); this finding adds how many users it affects." -f $campaignState,(Format-EACount $notPasswordless 'member user is' 'member users are')) `
+                    -WhyItMatters 'The registration campaign asks users to set up Microsoft Authenticator or a passkey when they sign in. Without it, many users never move away from weaker methods such as text messages.' `
+                    -RecommendedAction ("Set the registration campaign to Microsoft managed or Enabled for all users in {0} > Registration campaign" -f $methodsPath) `
+                    -DocumentationUrl $campaignDoc -SourceFile $policySrc -RuleId 'registration-campaign-disabled'
+            } else {
+                $stateText = if ([string]::IsNullOrWhiteSpace($campaignState)) { 'empty' } else { $campaignState }
+                Add-EAGovCoverageFinding -CheckId $checkId -Category 'Authentication' -DataSource 'Registration campaign state' `
+                    -Reason ("registrationEnforcement.authenticationMethodsRegistrationCampaign.state was '{0}' (missing or unexpected), so the campaign state is unknown, not proven off. Related: the 'Authentication Methods Policy' check (authmethodpolicy) reports the same unreadable setting (rule authmethodpolicy-registration-campaign-unknown)." -f $stateText) `
+                    -RequiredScope 'Policy.Read.All' -DocumentationUrl $campaignDoc -SourceFile $policySrc `
+                    -Subject 'the registration campaign state' `
+                    -Impact ("Whether {0} prompted to set up stronger sign-in methods was not checked" -f (Format-EACount $notPasswordless 'member user who is not passwordless yet is' 'member users who are not passwordless yet are')) `
+                    -RecommendedAction ("Check the registration campaign in {0} > Registration campaign and set it to Microsoft managed or Enabled for all users if it is off" -f $methodsPath)
+            }
         }
     }
 
@@ -928,6 +1159,10 @@ function Invoke-Check-AuthRecovery {
     # explicit values over the template defaults because Graph returns no setting
     # object when the tenant still uses every default.
     $passwordProtectionDoc = 'https://learn.microsoft.com/graph/group-directory-settings'
+    $customBannedDoc = 'https://learn.microsoft.com/en-us/entra/identity/authentication/tutorial-configure-custom-password-protection'
+    $smartLockoutDoc = 'https://learn.microsoft.com/en-us/entra/identity/authentication/howto-password-smart-lockout'
+    $onPremProtectionDoc = 'https://learn.microsoft.com/en-us/entra/identity/authentication/howto-password-ban-bad-on-premises-operations'
+    $writebackDoc = 'https://learn.microsoft.com/en-us/entra/identity/authentication/tutorial-enable-sspr-writeback'
     $passwordTemplateId = '5cf42378-d67d-4f36-ba46-e8b86229381d'
     $settingResult = Invoke-EAGovGraphCollection -Uri 'https://graph.microsoft.com/v1.0/groupSettings?$top=999'
     $templateResult = Invoke-EAGovGraphObject -Uri ("https://graph.microsoft.com/v1.0/groupSettingTemplates/{0}" -f $passwordTemplateId)
@@ -970,25 +1205,27 @@ function Invoke-Check-AuthRecovery {
         if (-not $templateResult.Success -and -not $passwordSetting) { $reasons.Add([string]$templateResult.Error.Exception.Message) | Out-Null }
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Authentication' -DataSource 'Password protection and smart-lockout settings' `
             -Reason ($reasons -join '; ') -RequiredScope 'Directory.Read.All' `
-            -DocumentationUrl $passwordProtectionDoc -SourceFile $passwordSrc
+            -DocumentationUrl $passwordProtectionDoc -SourceFile $passwordSrc `
+            -Subject 'the password protection and account lockout settings' `
+            -Impact 'The banned-password list, the lockout limit and on-premises password protection were not checked.'
     } elseif ($passwordMap.Count -gt 0) {
         $customEnabled = ConvertTo-EAGovBoolean $passwordMap['EnableBannedPasswordCheck']
         if ($bannedWords.Count -gt 0 -and $customEnabled -ne $true) {
             Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Authentication' `
-                -Title 'A custom banned-password list exists but its check is disabled' `
+                -Title 'Custom banned-password list is set up but not enforced' `
                 -Evidence ("Custom banned-password entries={0}; EnableBannedPasswordCheck={1}." -f $bannedWords.Count,$customEnabled) `
-                -WhyItMatters 'Configured organization-specific weak terms provide no protection when the custom banned-password check is disabled.' `
-                -RecommendedAction 'Enable the tenant-specific banned-password check and validate the normalized custom-word list' `
-                -DocumentationUrl $passwordProtectionDoc -SourceFile $passwordSrc -RuleId 'custom-banned-password-check-disabled'
+                -WhyItMatters 'Users can still choose passwords built from your company, product or place names, which attackers try first when guessing passwords.' `
+                -RecommendedAction ("Set 'Enforce custom list' to Yes in {0} > Password protection, and check that the list is still up to date" -f $methodsPath) `
+                -DocumentationUrl $customBannedDoc -SourceFile $passwordSrc -RuleId 'custom-banned-password-check-disabled'
         }
         $lockoutThreshold = 0
         if ([int]::TryParse([string]$passwordMap['LockoutThreshold'], [ref]$lockoutThreshold) -and $lockoutThreshold -gt 10) {
             Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Authentication' `
-                -Title ("Smart lockout threshold is {0}" -f $lockoutThreshold) `
-                -Evidence 'The effective LockoutThreshold exceeds the Microsoft default of 10 failed attempts; this is a review threshold, not a universal compliance boundary.' `
-                -WhyItMatters 'A high threshold allows more password guesses before smart lockout begins delaying subsequent attempts.' `
-                -RecommendedAction 'Validate the threshold against attack telemetry, user-impact requirements, and current Microsoft guidance' `
-                -DocumentationUrl $passwordProtectionDoc -SourceFile $passwordSrc -RuleId 'smart-lockout-threshold-high'
+                -Title ("Account lockout allows {0} wrong passwords before it starts (Microsoft default: 10)" -f $lockoutThreshold) `
+                -Evidence ("The effective smart lockout LockoutThreshold is {0}, above the Microsoft default of 10 failed attempts; this is a review threshold, not a universal compliance boundary." -f $lockoutThreshold) `
+                -WhyItMatters 'A higher limit gives attackers more password guesses per account before smart lockout temporarily blocks further attempts.' `
+                -RecommendedAction ("Set 'Lockout threshold' back to 10 or lower in {0} > Password protection, unless you have a documented reason for the higher value" -f $methodsPath) `
+                -DocumentationUrl $smartLockoutDoc -SourceFile $passwordSrc -RuleId 'smart-lockout-threshold-high'
         }
     }
 
@@ -997,23 +1234,27 @@ function Invoke-Check-AuthRecovery {
     # without treating true as proof of operational writeback health.
     $syncDoc = 'https://learn.microsoft.com/graph/api/resources/onpremisesdirectorysynchronizationfeature?view=graph-rest-1.0'
     $organizationResult = Invoke-EAGovGraphCollection -Uri 'https://graph.microsoft.com/v1.0/organization?$select=id,onPremisesSyncEnabled'
-    $syncResult = Invoke-EAGovGraphObject -Uri 'https://graph.microsoft.com/v1.0/directory/onPremisesSynchronization'
     $hybrid = $organizationResult.Success -and @($organizationResult.Rows | Where-Object { (Get-EAGovProperty $_ 'onPremisesSyncEnabled') -eq $true }).Count -gt 0
     if ($hybrid) {
-        if (-not $syncResult.Success) {
+        $syncResult = Get-EAGovOnPremisesSyncObject
+        $syncAccess = Get-EAGovOnPremSyncAccess
+        if (-not $syncResult.Success -or $null -eq $syncResult.Object) {
+            $syncReason = if ($syncResult.Success) { 'Graph returned no on-premises synchronization object.' } else { [string]$syncResult.Error.Exception.Message }
             Add-EAGovCoverageFinding -CheckId $checkId -Category 'Authentication' -DataSource 'Hybrid SSPR password-writeback configuration' `
-                -Reason ([string]$syncResult.Error.Exception.Message) -RequiredScope 'OnPremDirectorySynchronization.Read.All' `
-                -DocumentationUrl $syncDoc -SourceFile $src
+                -Reason ($syncReason + $syncAccess.Note) -RequiredScope $syncAccess.Scope `
+                -DocumentationUrl $syncDoc -SourceFile $src -Subject 'the password writeback setting for accounts synced from on-premises' `
+                -Impact 'Whether password resets reach on-premises Active Directory was not checked.' `
+                -RecommendedAction 'Test a self-service password reset with a synced test account and check the writeback settings in Entra admin center > Entra ID > Password reset > On-premises integration; to let the audit read the sync settings, run it signed in as a Global Administrator with OnPremDirectorySynchronization.Read.All (app-only sign-in is not supported for this setting)'
         } else {
-            $features = Get-EAGovProperty $syncResult.Value 'features'
+            $features = Get-EAGovProperty $syncResult.Object 'features'
             $writebackPresent = Test-EAGovPropertyPresent $features 'passwordWritebackEnabled'
             $writebackValue = Get-EAGovProperty $features 'passwordWritebackEnabled'
             Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Authentication' `
-                -Title 'Hybrid SSPR password writeback requires an operational validation' `
+                -Title 'Password writeback to on-premises Active Directory must be tested by hand' `
                 -Evidence ("Graph passwordWritebackEnabled present={0}; value={1}. Microsoft documents that this property isn't in use, so the audit does not interpret it as proof that resets are writing back." -f $writebackPresent,$writebackValue) `
-                -WhyItMatters 'Hybrid users can appear SSPR-capable while a connector, permission, or service failure prevents the reset from reaching on-premises AD.' `
-                -RecommendedAction 'Perform a controlled SSPR writeback test for each synchronized domain and monitor connector/writeback failures' `
-                -DocumentationUrl $syncDoc -SourceFile $src -RuleId 'hybrid-password-writeback-manual-validation' -CoverageGap
+                -WhyItMatters 'The audit cannot see whether password resets made in the cloud reach on-premises Active Directory (AD). If writeback is broken, synced users cannot reset their own password even though the report shows them as able to.' `
+                -RecommendedAction 'Test a self-service password reset with a synced test account in each domain, and check the writeback settings and errors in Entra admin center > Entra ID > Password reset > On-premises integration' `
+                -DocumentationUrl $writebackDoc -SourceFile $src -RuleId 'hybrid-password-writeback-manual-validation' -CoverageGap
         }
 
         if ($passwordMap.Count -gt 0) {
@@ -1028,27 +1269,29 @@ function Invoke-Check-AuthRecovery {
                     'Microsoft template defaults - the tenant has never saved Password protection settings, so domain controller agents are probably not deployed'
                 }
                 Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Authentication' `
-                    -Title 'On-premises Microsoft Entra Password Protection is not in enforced mode' `
+                    -Title 'Banned-password check is not enforced in on-premises Active Directory' `
                     -Evidence ("EnableBannedPasswordCheckOnPremises={0}; mode={1}; source={2}." -f $onPremProtection,$onPremMode,$onPremSource) `
-                    -WhyItMatters "Synchronized and on-premises-only users don't receive the same banned-password control when the DC agents are disabled or audit-only." `
-                    -RecommendedAction 'Deploy healthy proxy/DC agents and enable enforced mode after reviewing audit results and licensing (Microsoft Entra ID P1/P2 is required for synchronized users)' `
-                    -DocumentationUrl $passwordProtectionDoc -SourceFile $passwordSrc -RuleId 'onprem-password-protection-not-enforced'
+                    -WhyItMatters 'Users can still set weak, commonly guessed passwords in on-premises Active Directory (AD), and synced accounts then use the same weak password to sign in to Microsoft 365.' `
+                    -RecommendedAction ("Install the Microsoft Entra Password Protection proxy and domain controller agents, review the audit-mode results, then set 'Mode' to Enforced in {0} > Password protection (Microsoft Entra ID P1 or P2 is required for synced users)" -f $methodsPath) `
+                    -DocumentationUrl $onPremProtectionDoc -SourceFile $passwordSrc -RuleId 'onprem-password-protection-not-enforced'
             }
         }
     } elseif (-not $organizationResult.Success -or $organizationResult.Truncated) {
         $reason = if ($organizationResult.Success) { 'organization pagination limit reached' } else { [string]$organizationResult.Error.Exception.Message }
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Authentication' -DataSource 'Hybrid status for password recovery controls' `
-            -Reason $reason -RequiredScope 'Organization.Read.All' -DocumentationUrl $syncDoc -SourceFile $src
+            -Reason $reason -RequiredScope 'Organization.Read.All' -DocumentationUrl $syncDoc -SourceFile $src `
+            -Subject "the tenant's on-premises sync status" `
+            -Impact 'Password writeback and on-premises password protection were not checked.'
     }
 
     if (-not $registrationAvailable) { return }
     Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Authentication' `
-        -Title 'Authentication recovery and passwordless baseline captured' `
+        -Title 'Password reset and passwordless readiness recorded' `
         -Evidence ("Members={0}; SSPR enabled/registered/capable={1}/{2}/{3}; passwordless capable={4}; admins={5}." -f `
             $members.Count,$ssprEnabled.Count,@($members | Where-Object {$_.IsSsprRegistered -eq $true}).Count,
             @($members | Where-Object {$_.IsSsprCapable -eq $true}).Count,$passwordless.Count,$admins.Count) `
-        -WhyItMatters 'Registration-state evidence shows whether users can actually use recovery and strong authentication, not just whether a policy object exists.' `
-        -RecommendedAction 'Track these adoption and capability measures over time and remediate affected users before enforcing stronger controls' `
+        -WhyItMatters 'Registration data shows whether users can actually reset their password and sign in without one, not just whether a policy exists.' `
+        -RecommendedAction 'Compare these numbers between audits and help users who are not ready before you enforce stronger sign-in rules' `
         -DocumentationUrl $doc -SourceFile $src -ResultRows @($rows) -RuleId 'auth-recovery-baseline'
 }
 
@@ -1059,6 +1302,11 @@ function Invoke-Check-GroupGovernance {
     $checkId = 'groupgovernance'
     $doc = 'https://learn.microsoft.com/entra/identity/users/groups-lifecycle'
     $reportDoc = 'https://learn.microsoft.com/graph/api/reportroot-getoffice365groupsactivitydetail?view=graph-rest-beta'
+    $groupSettingsGuideDoc = 'https://learn.microsoft.com/en-us/entra/identity/users/groups-settings-cmdlets'
+    $namingDoc = 'https://learn.microsoft.com/en-us/entra/identity/users/groups-naming-policy'
+    $roleGroupDoc = 'https://learn.microsoft.com/en-us/entra/identity/role-based-access-control/groups-concept'
+    $dynamicDoc = 'https://learn.microsoft.com/en-us/entra/identity/users/groups-dynamic-membership'
+    $groupsPath = 'Entra admin center > Entra ID > Groups'
     $groupUri = 'https://graph.microsoft.com/v1.0/groups?$select=id,displayName,description,groupTypes,mailEnabled,securityEnabled,visibility,isAssignableToRole,membershipRule,membershipRuleProcessingState,createdDateTime,renewedDateTime,expirationDateTime,onPremisesSyncEnabled,resourceProvisioningOptions&$expand=owners($select=id,displayName,userPrincipalName)&$top=999'
     $result = Invoke-EAGovGraphCollection -Uri $groupUri
     if (-not $result.Success) { throw $result.Error }
@@ -1126,6 +1374,17 @@ function Invoke-Check-GroupGovernance {
             LastActivityDate      = $lastActivity
             ExternalMemberCount   = if ($activityKnownForGroup) { Get-EAGovProperty $activity 'externalMemberCount' } else { $null }
             ReportRefreshDate     = if ($activityKnownForGroup) { Get-EAGovProperty $activity 'reportRefreshDate' } else { $null }
+            # D180 activity counters. lastActivityDate only covers mail, SharePoint and
+            # Yammer, so a Team used only for channel chat and meetings needs the Teams
+            # counters to show as active.
+            IsDeleted                   = if ($activityKnownForGroup) { Get-EAGovProperty $activity 'isDeleted' } else { $null }
+            TeamsChannelMessagesCount   = if ($activityKnownForGroup) { Get-EAGovProperty $activity 'teamsChannelMessagesCount' } else { $null }
+            TeamsMeetingsOrganizedCount = if ($activityKnownForGroup) { Get-EAGovProperty $activity 'teamsMeetingsOrganizedCount' } else { $null }
+            ExchangeReceivedEmailCount  = if ($activityKnownForGroup) { Get-EAGovProperty $activity 'exchangeReceivedEmailCount' } else { $null }
+            SharePointActiveFileCount   = if ($activityKnownForGroup) { Get-EAGovProperty $activity 'sharePointActiveFileCount' } else { $null }
+            YammerPostedMessageCount    = if ($activityKnownForGroup) { Get-EAGovProperty $activity 'yammerPostedMessageCount' } else { $null }
+            YammerReadMessageCount      = if ($activityKnownForGroup) { Get-EAGovProperty $activity 'yammerReadMessageCount' } else { $null }
+            YammerLikedMessageCount     = if ($activityKnownForGroup) { Get-EAGovProperty $activity 'yammerLikedMessageCount' } else { $null }
         }) | Out-Null
     }
 
@@ -1137,25 +1396,29 @@ function Invoke-Check-GroupGovernance {
     if ($activityReturnedNoRows) { $activityCoverage = $false }
 
     $src = Write-Evidence -BaseName 'group_governance' -Rows $rows.ToArray() -Title 'Group Ownership, Lifecycle, Visibility, and Activity Governance' `
-        -Notes @('A group is considered inactive only when the Microsoft 365 D180 activity report contains a row with no activity in the reporting window or an old LastActivityDate. Absence from that report is unknown, not stale.')
+        -Notes @('A group is considered inactive only when the Microsoft 365 D180 activity report contains a row for it, the group was created before the 180-day window, every Teams, mail, SharePoint and Yammer counter in that row is zero, and LastActivityDate is empty or older than the window. Absence from that report, or an unknown creation date, is unknown, not stale.')
 
     if ($result.Truncated) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Group Governance' -DataSource 'Group inventory pagination' `
             -Reason "pagination exceeded $($result.Pages) pages." -RequiredScope 'Group.Read.All' `
-            -DocumentationUrl $doc -SourceFile $src
+            -DocumentationUrl $doc -SourceFile $src -Partial -Subject 'the list of groups' `
+            -Impact 'Problems with groups beyond the part that was read are missing from this report.'
     }
     if ($ownerReadErrors.Count -gt 0) {
         $ownerErrSrc = Write-Evidence -BaseName 'group_owner_collection_errors' -Rows $ownerReadErrors.ToArray() -Title 'Group Owner Collection Gaps'
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Group Governance' -DataSource 'Group owners' `
-            -Reason ("owner data was incomplete for {0} group(s)." -f $ownerReadErrors.Count) -RequiredScope 'Group.Read.All' `
-            -DocumentationUrl $doc -SourceFile $ownerErrSrc
+            -Reason ("owner data was incomplete for {0}." -f (Format-EACount $ownerReadErrors.Count 'group' 'groups')) -RequiredScope 'Group.Read.All' `
+            -DocumentationUrl $doc -SourceFile $ownerErrSrc -Subject 'the owners of some groups' `
+            -Impact 'Groups without an owner may be missing from this report.'
     }
     if (-not $activityCoverage) {
         $reason = if ($activityReturnedNoRows) {
-            "the API returned zero report rows while $m365GroupCount Microsoft 365 group(s) exist"
+            "the API returned zero report rows while {0}" -f (Format-EACount $m365GroupCount 'Microsoft 365 group exists' 'Microsoft 365 groups exist')
         } elseif ($activityResult.Success) { 'pagination limit reached' } else { [string]$activityResult.Error.Exception.Message }
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Group Governance' -DataSource 'Microsoft 365 group activity (D180)' `
-            -Reason $reason -RequiredScope 'Reports.Read.All' -DocumentationUrl $reportDoc -SourceFile $src
+            -Reason $reason -RequiredScope 'Reports.Read.All' -DocumentationUrl $reportDoc -SourceFile $src `
+            -Subject 'the Microsoft 365 group activity report' `
+            -Impact 'Microsoft 365 groups that nobody uses any more were not identified.'
     }
 
     # Tenant-level group settings and the Microsoft 365 group expiration policy
@@ -1194,32 +1457,34 @@ function Invoke-Check-GroupGovernance {
             elseif ($settingsResult.Truncated) { 'groupSettings pagination limit reached' } `
             else { [string]$settingsTemplateResult.Error.Exception.Message }
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Group Governance' -DataSource 'Tenant Group.Unified settings' `
-            -Reason $reason -RequiredScope 'Directory.Read.All' -DocumentationUrl $groupSettingsDoc -SourceFile $groupSettingsSrc
+            -Reason $reason -RequiredScope 'Directory.Read.All' -DocumentationUrl $groupSettingsDoc -SourceFile $groupSettingsSrc `
+            -Subject 'the tenant-wide Microsoft 365 group settings' `
+            -Impact 'Who may create groups, whether guests may own groups and the naming policy were not checked.'
     } elseif ($unifiedMap.Count -gt 0) {
         if ((ConvertTo-EAGovBoolean $unifiedMap['AllowGuestsToBeGroupOwner']) -eq $true) {
             Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Group Governance' `
                 -Title 'Guests are allowed to own Microsoft 365 groups' `
                 -Evidence 'The effective Group.Unified setting AllowGuestsToBeGroupOwner=true.' `
-                -WhyItMatters 'An external identity can control membership and connected resources of a group after its sponsor or business relationship changes.' `
-                -RecommendedAction 'Disable guest ownership unless a documented scenario requires it, and review all existing guest-owned groups' `
-                -DocumentationUrl $groupSettingsDoc -SourceFile $groupSettingsSrc -RuleId 'group-settings-guest-owners-allowed'
+                -WhyItMatters "A guest who owns a group can add members and control the group's files, mailbox and Teams content, even after the business relationship with them ends." `
+                -RecommendedAction 'Set AllowGuestsToBeGroupOwner to false in the Group.Unified directory setting (only available through Microsoft Graph PowerShell) unless a documented need requires it, then review groups that already have guest owners' `
+                -DocumentationUrl $groupSettingsGuideDoc -SourceFile $groupSettingsSrc -RuleId 'group-settings-guest-owners-allowed'
         }
         if ((ConvertTo-EAGovBoolean $unifiedMap['EnableGroupCreation']) -eq $true) {
             Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Group Governance' `
-                -Title 'Microsoft 365 group creation is available to all users' `
+                -Title 'Every user can create Microsoft 365 groups' `
                 -Evidence 'The effective Group.Unified setting EnableGroupCreation=true; no restriction group is applied by this setting.' `
-                -WhyItMatters 'Unrestricted creation can increase unmanaged groups, owners, guests, applications, and collaboration data.' `
-                -RecommendedAction 'Confirm self-service creation is intentional and back it with expiration, naming, sensitivity, ownership, and access-review controls; otherwise restrict creation to a governed group' `
-                -DocumentationUrl $groupSettingsDoc -SourceFile $groupSettingsSrc -RuleId 'group-settings-creation-unrestricted'
+                -WhyItMatters 'Unrestricted creation leads to many groups and Teams with unclear owners, guests and data, which makes access hard to keep under control.' `
+                -RecommendedAction 'Decide whether everyone should create groups. If yes, back it with expiration, naming and owner rules; if not, limit creation to an approved group (Group.Unified settings EnableGroupCreation=false and GroupCreationAllowedGroupId)' `
+                -DocumentationUrl $groupSettingsGuideDoc -SourceFile $groupSettingsSrc -RuleId 'group-settings-creation-unrestricted'
         }
         if ([string]::IsNullOrWhiteSpace([string]$unifiedMap['PrefixSuffixNamingRequirement']) -and
             [string]::IsNullOrWhiteSpace([string]$unifiedMap['CustomBlockedWordsList'])) {
             Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Group Governance' `
-                -Title 'No Microsoft 365 group naming policy is configured' `
+                -Title 'No naming policy for Microsoft 365 groups' `
                 -Evidence 'Both PrefixSuffixNamingRequirement and CustomBlockedWordsList are empty in the effective Group.Unified settings.' `
-                -WhyItMatters 'Naming controls can improve ownership, purpose, search, automation, and cleanup, although they are not a standalone security boundary.' `
-                -RecommendedAction 'Document the naming standard and configure a prefix/suffix or blocked terms when it supports the lifecycle process' `
-                -DocumentationUrl $groupSettingsDoc -SourceFile $groupSettingsSrc -RuleId 'group-settings-naming-policy-absent'
+                -WhyItMatters 'A naming standard makes it easier to see what a group is for and who owns it. It helps cleanup but is not a security control on its own.' `
+                -RecommendedAction ("If it helps your cleanup process, set a prefix/suffix or blocked words in {0} > Naming policy" -f $groupsPath) `
+                -DocumentationUrl $namingDoc -SourceFile $groupSettingsSrc -RuleId 'group-settings-naming-policy-absent'
         }
     }
 
@@ -1236,24 +1501,26 @@ function Invoke-Check-GroupGovernance {
     if (-not $lifecycleResult.Success -or $lifecycleResult.Truncated) {
         $reason = if ($lifecycleResult.Success) { 'groupLifecyclePolicies pagination limit reached' } else { [string]$lifecycleResult.Error.Exception.Message }
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Group Governance' -DataSource 'Microsoft 365 group expiration policy' `
-            -Reason $reason -RequiredScope 'Directory.Read.All' -DocumentationUrl $lifecycleDoc -SourceFile $lifecycleSrc
+            -Reason $reason -RequiredScope 'Directory.Read.All' -DocumentationUrl $lifecycleDoc -SourceFile $lifecycleSrc `
+            -Subject 'the Microsoft 365 group expiration policy' `
+            -Impact 'Whether unused Microsoft 365 groups expire was not checked.'
     } elseif ($m365GroupCount -gt 0 -and ($lifecycleRows.Count -eq 0 -or @($lifecycleRows | Where-Object { [string]$_.ManagedGroupTypes -notmatch '^None$' }).Count -eq 0)) {
         Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Group Governance' `
-            -Title 'No active Microsoft 365 group expiration policy is configured' `
+            -Title 'Microsoft 365 groups never expire' `
             -Evidence ("Microsoft 365 groups={0}; lifecycle policy records={1}; none apply to All or Selected groups." -f $m365GroupCount,$lifecycleRows.Count) `
-            -WhyItMatters 'Groups can persist indefinitely after their purpose ends unless another governed process identifies and retires them.' `
-            -RecommendedAction 'Configure an appropriate expiration/renewal policy or document an equivalent lifecycle process with owner notifications and cleanup evidence' `
-            -DocumentationUrl $lifecycleDoc -SourceFile $lifecycleSrc -RuleId 'm365-group-expiration-policy-absent'
+            -WhyItMatters 'Without expiration, groups and the access they give stay forever after the project ends, unless someone cleans them up by hand.' `
+            -RecommendedAction ("Turn on group expiration in {0} > Expiration (for example 365 days, with owners renewing by email), or document the cleanup process you use instead" -f $groupsPath) `
+            -DocumentationUrl $doc -SourceFile $lifecycleSrc -RuleId 'm365-group-expiration-policy-absent'
     }
 
     $roleOwnerless = @($rows | Where-Object { $_.OwnersKnown -and $_.OwnerCount -eq 0 -and $_.IsAssignableToRole -eq $true })
     if ($roleOwnerless.Count -gt 0) {
         Add-EAGovFinding -Severity 'High' -CheckId $checkId -Category 'Group Governance' `
-            -Title ("{0} role-assignable group(s) have no owner" -f $roleOwnerless.Count) `
-            -Evidence 'Owner enumeration succeeded and returned zero owners for these role-assignable groups.' `
-            -WhyItMatters 'A role-assignable group is a privileged access path; without an accountable owner, membership review and incident response can be orphaned.' `
-            -RecommendedAction 'Assign at least two accountable cloud owners, protect ownership with PIM for Groups, and establish recurring access review' `
-            -DocumentationUrl $doc -SourceFile $src -ResultRows $roleOwnerless -RuleId 'role-group-ownerless'
+            -Title ((Format-EACount $roleOwnerless.Count 'group that can hold admin roles has' 'groups that can hold admin roles have') + ' no owner') `
+            -Evidence 'Owner enumeration succeeded and returned zero owners for these role-assignable groups (isAssignableToRole=true).' `
+            -WhyItMatters 'These groups can give admin rights. With no owner, nobody is accountable for who is in them, so unneeded admin access is not noticed or removed.' `
+            -RecommendedAction 'Name an accountable owner for each listed group (two for resilience), manage that ownership through Privileged Identity Management (PIM) for Groups, and set up a recurring access review of the members' `
+            -DocumentationUrl $roleGroupDoc -SourceFile $src -ResultRows $roleOwnerless -RuleId 'role-group-ownerless'
     }
 
     $cloudOwnerless = @($rows | Where-Object {
@@ -1262,77 +1529,92 @@ function Invoke-Check-GroupGovernance {
     })
     if ($cloudOwnerless.Count -gt 0) {
         Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Group Governance' `
-            -Title ("{0} cloud security/Microsoft 365 group(s) have no owner" -f $cloudOwnerless.Count) `
-            -Evidence 'Owner enumeration succeeded and returned zero owners; synchronized groups are excluded from this medium-severity population.' `
-            -WhyItMatters 'Ownerless cloud groups lack a clear authority to approve membership, review external access, and retire the group.' `
-            -RecommendedAction 'Assign accountable owners or retire unused groups; use expiration and ownerless-group notifications where appropriate' `
+            -Title (Format-EACount $cloudOwnerless.Count 'cloud group has no owner' 'cloud groups have no owner') `
+            -Evidence 'Security or Microsoft 365 groups created in the cloud: owner enumeration succeeded and returned zero owners. Groups synced from on-premises are reported separately.' `
+            -WhyItMatters 'Nobody is responsible for approving members, checking guest access or deleting the group when it is no longer needed.' `
+            -RecommendedAction ("Add an owner to each listed group in {0} > All groups > [group] > Owners, or delete groups that are no longer used" -f $groupsPath) `
             -DocumentationUrl $doc -SourceFile $src -ResultRows $cloudOwnerless -RuleId 'cloud-group-ownerless'
     }
 
     $syncedOwnerless = @($rows | Where-Object { $_.OwnersKnown -and $_.OwnerCount -eq 0 -and $_.OnPremisesSyncEnabled -eq $true })
     if ($syncedOwnerless.Count -gt 0) {
         Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Group Governance' `
-            -Title ("{0} synchronized group(s) have no cloud owner" -f $syncedOwnerless.Count) `
+            -Title ((Format-EACount $syncedOwnerless.Count 'group synced from on-premises has' 'groups synced from on-premises have') + ' no owner in the cloud') `
             -Evidence 'These groups are synchronized from on-premises, so ownership may be managed in the source directory; the cloud owner field is empty.' `
-            -WhyItMatters 'Even when lifecycle is managed on-premises, a documented business owner is needed for access certification and decommissioning.' `
-            -RecommendedAction 'Confirm the source-directory ownership process and record accountable owners in a system used by access reviewers' `
+            -WhyItMatters 'Owners may be managed in on-premises Active Directory, but reviewers still need a named business owner to confirm who should be in each group.' `
+            -RecommendedAction 'Confirm who owns these groups in on-premises Active Directory and record the owner where access reviewers can see it' `
             -DocumentationUrl $doc -SourceFile $src -ResultRows $syncedOwnerless -RuleId 'synced-group-ownerless'
     }
 
     $publicM365 = @($rows | Where-Object { $_.GroupKind -eq 'Microsoft365' -and [string]$_.Visibility -ieq 'Public' })
     if ($publicM365.Count -gt 0) {
         Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Group Governance' `
-            -Title ("{0} Microsoft 365 group(s) are public/self-service joinable" -f $publicM365.Count) `
+            -Title ((Format-EACount $publicM365.Count 'Microsoft 365 group is' 'Microsoft 365 groups are') + ' public: anyone in the organization can join') `
             -Evidence 'Visibility=Public allows users in the organization to discover and join these groups without owner approval.' `
-            -WhyItMatters 'Public membership is appropriate for open collaboration but can expose group-connected resources when the group is used for sensitive content or app access.' `
-            -RecommendedAction 'Validate that each public group is intended for open membership and change sensitive groups to private with approval-based membership' `
+            -WhyItMatters "Anyone in the organization can join a public group without approval and then read its files, mail and Teams content. That is fine for open topics but not for sensitive work." `
+            -RecommendedAction 'Check that each listed group is meant to be open, and make groups with sensitive content private (Microsoft 365 admin center > Teams & groups > Active teams & groups)' `
             -DocumentationUrl $doc -SourceFile $src -ResultRows $publicM365 -RuleId 'public-m365-groups'
     }
 
     $pausedDynamic = @($rows | Where-Object { $_.IsDynamic -and [string]$_.MembershipRuleState -notmatch '^(On|Processing)$' })
     if ($pausedDynamic.Count -gt 0) {
         Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Group Governance' `
-            -Title ("{0} dynamic group(s) do not have active membership-rule processing" -f $pausedDynamic.Count) `
+            -Title (Format-EACount $pausedDynamic.Count 'dynamic group has stopped updating its members' 'dynamic groups have stopped updating their members') `
             -Evidence 'The group is DynamicMembership, but membershipRuleProcessingState is not On/Processing.' `
-            -WhyItMatters 'Paused or failed dynamic processing can leave obsolete users in access-bearing groups or omit users who require access.' `
-            -RecommendedAction 'Validate each membership rule, restore processing, and review the effective membership before relying on the group for access' `
-            -DocumentationUrl $doc -SourceFile $src -ResultRows $pausedDynamic -RuleId 'dynamic-group-processing-off'
+            -WhyItMatters 'Dynamic groups add and remove members automatically based on a rule. While processing is paused, people who left or changed jobs keep the access the group gives, and new people do not get it.' `
+            -RecommendedAction 'Check the membership rule of each listed group, turn processing back on, and review the current members before relying on the group for access' `
+            -DocumentationUrl $dynamicDoc -SourceFile $src -ResultRows $pausedDynamic -RuleId 'dynamic-group-processing-off'
     }
 
     $invalidPrivilegedDynamic = @($rows | Where-Object { $_.IsAssignableToRole -eq $true -and $_.IsDynamic })
     if ($invalidPrivilegedDynamic.Count -gt 0) {
         Add-EAGovFinding -Severity 'High' -CheckId $checkId -Category 'Group Governance' `
-            -Title 'Role-assignable group reported with dynamic membership' `
+            -Title ((Format-EACount $invalidPrivilegedDynamic.Count 'group that can hold admin roles uses' 'groups that can hold admin roles use') + ' automatic (dynamic) membership') `
             -Evidence 'Graph returned both isAssignableToRole=true and DynamicMembership. This unsupported/high-risk combination requires validation.' `
-            -WhyItMatters 'Automatically evaluated attributes must not be able to grant privileged directory roles without direct privileged-access governance.' `
-            -RecommendedAction 'Verify the anomalous objects in Entra, remove dynamic privilege assignment, and use assigned membership governed by PIM for Groups' `
-            -DocumentationUrl $doc -SourceFile $src -ResultRows $invalidPrivilegedDynamic -RuleId 'role-group-dynamic'
+            -WhyItMatters 'Anyone whose user details match the rule would get admin rights automatically, without approval. Microsoft does not normally allow this combination, so it needs checking.' `
+            -RecommendedAction ("Check the listed groups in {0}, switch them to assigned membership, and manage admin access through Privileged Identity Management (PIM) for Groups" -f $groupsPath) `
+            -DocumentationUrl $roleGroupDoc -SourceFile $src -ResultRows $invalidPrivilegedDynamic -RuleId 'role-group-dynamic'
     }
 
     if ($activityCoverage) {
-        $cutoff = [datetimeoffset]::UtcNow.AddDays(-180)
+        # The D180 window ends at the report's refresh date (the report lags by about two
+        # days), so measure the window from there; fall back to now when it is unreadable.
+        # A group counts as inactive only when every signal agrees: it existed for the
+        # whole window, no activity counter is above zero, and lastActivityDate (mail,
+        # SharePoint and Yammer only) is empty or older than the window.
+        $activityCounters = @('TeamsChannelMessagesCount','TeamsMeetingsOrganizedCount','ExchangeReceivedEmailCount',
+            'SharePointActiveFileCount','YammerPostedMessageCount','YammerReadMessageCount','YammerLikedMessageCount')
         $inactive = @($rows | Where-Object {
-            if (-not $_.ActivityEvidenceKnown) { return $false }
+            if (-not $_.ActivityEvidenceKnown -or $_.IsDeleted -eq $true) { return $false }
+            $windowEnd = ConvertTo-EAGovDateTime $_.ReportRefreshDate
+            if (-not $windowEnd) { $windowEnd = [datetimeoffset]::UtcNow }
+            $cutoff = $windowEnd.AddDays(-180)
+            $created = ConvertTo-EAGovDateTime $_.CreatedDateTime
+            if (-not $created -or $created -ge $cutoff) { return $false }
+            foreach ($counter in $activityCounters) {
+                $value = 0.0
+                if ([double]::TryParse([string]$_.$counter, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$value) -and $value -gt 0) { return $false }
+            }
             $last = ConvertTo-EAGovDateTime $_.LastActivityDate
             return (-not $last -or $last -lt $cutoff)
         })
         if ($inactive.Count -gt 0) {
             Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Group Governance' `
-                -Title ("{0} Microsoft 365 group(s) show no recent activity in the D180 report" -f $inactive.Count) `
-                -Evidence 'Only groups with an explicit activity-report row were evaluated; missing report rows were treated as unknown.' `
-                -WhyItMatters 'Inactive groups accumulate memberships, guests, content, and application access after their collaboration purpose ends.' `
-                -RecommendedAction 'Confirm business need with owners, review memberships/content, and archive or delete groups through the approved lifecycle process' `
-                -DocumentationUrl $reportDoc -SourceFile $src -ResultRows $inactive -RuleId 'm365-groups-inactive-180d'
+                -Title ((Format-EACount $inactive.Count 'Microsoft 365 group has' 'Microsoft 365 groups have') + ' had no activity for 180 days') `
+                -Evidence 'Microsoft 365 groups activity report (D180): only groups with an explicit report row were evaluated; missing report rows were treated as unknown. Groups created within the 180-day window (or with an unknown creation date), deleted groups, and groups with any Teams channel message, Teams meeting, received mail, active SharePoint file or Yammer activity counted in the report were excluded.' `
+                -WhyItMatters 'Unused groups keep their members, guests, files and app access long after the work ended.' `
+                -RecommendedAction 'Ask the owners whether each group is still needed, then archive or delete unused ones through your normal process (group expiration can do this automatically)' `
+                -DocumentationUrl $doc -SourceFile $src -ResultRows $inactive -RuleId 'm365-groups-inactive-180d'
         }
     }
 
     Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Group Governance' `
-        -Title 'Group governance inventory captured' `
+        -Title ("Group owners, visibility and activity recorded ({0})" -f (Format-EACount $rows.Count 'group' 'groups')) `
         -Evidence ("Groups={0}; role-assignable={1}; dynamic={2}; public M365={3}; activity coverage={4}." -f `
             $rows.Count,@($rows | Where-Object {$_.IsAssignableToRole -eq $true}).Count,
             @($rows | Where-Object {$_.IsDynamic}).Count,$publicM365.Count,$activityCoverage) `
-        -WhyItMatters 'Ownership, visibility, lifecycle, dynamic membership, and activity are complementary signals for group access governance.' `
-        -RecommendedAction 'Reconcile this inventory with group naming, ownership, expiration, sensitivity, and access-review standards' `
+        -WhyItMatters 'The list shows which groups have owners, who can join them and which are no longer used.' `
+        -RecommendedAction 'Compare the list with your group standards for naming, owners, expiration and access reviews' `
         -DocumentationUrl $doc -SourceFile $src -ResultRows $rows.ToArray() -RuleId 'group-governance-inventory'
 }
 
@@ -1341,6 +1623,21 @@ function ConvertFrom-EAGovDurationDays {
     if ([string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
     try { return [math]::Round([System.Xml.XmlConvert]::ToTimeSpan([string]$Value).TotalDays, 1) }
     catch { return $null }
+}
+
+# Readable name of the customer tenant in a GDAP row (this tenant is the partner): the
+# customer's display name, else its tenant id, else the relationship name.
+function Get-EAGovGdapCustomerLabel {
+    param([AllowNull()]$Row)
+    foreach ($name in @('CustomerDisplayName', 'CustomerTenantId')) {
+        $candidate = [string](Get-EAGovProperty $Row $name)
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) { return $candidate.Trim() }
+    }
+    foreach ($name in @('DisplayName', 'Relationship')) {
+        $candidate = [string](Get-EAGovProperty $Row $name)
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) { return ('relationship ' + $candidate.Trim()) }
+    }
+    return 'unknown customer'
 }
 
 function Get-EAGovDirectoryRoleRisk {
@@ -1370,8 +1667,24 @@ function Invoke-Check-ExternalDelegation {
     $doc = 'https://learn.microsoft.com/graph/api/tenantrelationship-list-delegatedadminrelationships?view=graph-rest-1.0'
     $sponsorDoc = 'https://learn.microsoft.com/graph/api/user-list-sponsors?view=graph-rest-1.0'
     $guestDoc = 'https://learn.microsoft.com/graph/api/user-list?view=graph-rest-1.0'
+    $gdapGuideDoc = 'https://learn.microsoft.com/en-us/partner-center/customers/gdap-introduction'
+    $sponsorGuideDoc = 'https://learn.microsoft.com/en-us/entra/external-id/b2b-sponsors'
+    $guestReviewDoc = 'https://learn.microsoft.com/en-us/entra/id-governance/manage-guest-access-with-access-reviews'
+    $customerPartnerDoc = 'https://learn.microsoft.com/en-us/microsoft-365/commerce/manage-partners'
+    # Customer side: where this tenant sees and removes partners that manage it.
+    $partnerPath = 'Microsoft 365 admin center > Settings > Partner relationships'
+    # Partner side: where this tenant, as a partner, manages its access to customers.
+    $partnerCenterPath = 'Partner Center > Customers > [customer] > Admin relationships'
 
     # ------------------------- GDAP relationships -------------------------
+    # Direction matters. GET /tenantRelationships/delegatedAdminRelationships is the
+    # PARTNER-side API: it lists the relationships this tenant holds, as a Microsoft
+    # partner, with its customers, and the roles it can use in THEIR tenants. It returns
+    # nothing about partners that hold admin roles in this tenant, and Microsoft Graph has
+    # no read-only customer-side API for that. So every row below is outbound access
+    # (customer = the other tenant), and a separate note always tells the reader that
+    # inbound partner access must be checked by hand; an empty list never means "no
+    # partner has admin access to this tenant".
     $relationshipResult = Invoke-EAGovGraphCollection -Uri 'https://graph.microsoft.com/v1.0/tenantRelationships/delegatedAdminRelationships?$top=300'
     $relationships = @(if ($relationshipResult.Success) { @($relationshipResult.Rows) } else { @() })
 
@@ -1424,6 +1737,9 @@ function Invoke-Check-ExternalDelegation {
     $activeRelationshipsWithoutAssignments = New-Object System.Collections.Generic.List[object]
     foreach ($relationship in @($relationships | Where-Object { [string](Get-EAGovProperty $_ 'status') -ieq 'active' })) {
         $relationshipId = [string](Get-EAGovProperty $relationship 'id')
+        $customer = Get-EAGovProperty $relationship 'customer'
+        $customerTenantId = Get-EAGovProperty $customer 'tenantId'
+        $customerDisplayName = Get-EAGovProperty $customer 'displayName'
         if (-not $relationshipId) {
             $accessAssignmentErrors.Add([pscustomobject]@{ RelationshipId=$null; Relationship=(Get-EAGovProperty $relationship 'displayName'); Reason='active relationship has no id' }) | Out-Null
             continue
@@ -1438,6 +1754,7 @@ function Invoke-Check-ExternalDelegation {
         if ($activeAssignments.Count -eq 0) {
             $activeRelationshipsWithoutAssignments.Add([pscustomobject]@{
                 RelationshipId=$relationshipId; Relationship=(Get-EAGovProperty $relationship 'displayName')
+                CustomerTenantId=$customerTenantId; CustomerDisplayName=$customerDisplayName
                 EndDateTime=Get-EAGovProperty $relationship 'endDateTime'; ApprovedRoleCount=@(Get-EAGovProperty (Get-EAGovProperty $relationship 'accessDetails') 'unifiedRoles').Count
             }) | Out-Null
             continue
@@ -1458,6 +1775,8 @@ function Invoke-Check-ExternalDelegation {
                 $accessAssignmentRows.Add([pscustomobject]@{
                     RelationshipId=$relationshipId
                     DisplayName=Get-EAGovProperty $relationship 'displayName'
+                    CustomerTenantId=$customerTenantId
+                    CustomerDisplayName=$customerDisplayName
                     Status=Get-EAGovProperty $relationship 'status'
                     EndDateTime=Get-EAGovProperty $relationship 'endDateTime'
                     Duration=Get-EAGovProperty $relationship 'duration'
@@ -1480,35 +1799,44 @@ function Invoke-Check-ExternalDelegation {
     if (-not $relationshipResult.Success) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'External Access' -DataSource 'GDAP delegated admin relationships' `
             -Reason ([string]$relationshipResult.Error.Exception.Message) -RequiredScope 'DelegatedAdminRelationship.Read.All' `
-            -DocumentationUrl $doc -SourceFile $relationshipSrc
+            -DocumentationUrl $doc -SourceFile $relationshipSrc -Subject 'the list of customer tenants this tenant manages as a partner (GDAP)' `
+            -Impact 'This list only has data when this tenant is a Microsoft partner; admin roles this tenant holds in customer tenants were not checked. It never shows partners that hold admin roles in this tenant (see the note on partner access).' `
+            -RecommendedAction 'If this tenant is a Microsoft partner (for example a Cloud Solution Provider), give the audit account DelegatedAdminRelationship.Read.All and run the audit again; if it is not a partner, this list does not apply and nothing needs to be done'
     } elseif ($relationshipResult.Truncated) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'External Access' -DataSource 'GDAP delegated admin relationship pagination' `
             -Reason "pagination exceeded $($relationshipResult.Pages) pages." -RequiredScope 'DelegatedAdminRelationship.Read.All' `
-            -DocumentationUrl $doc -SourceFile $relationshipSrc
+            -DocumentationUrl $doc -SourceFile $relationshipSrc -Partial -Subject 'the list of customer tenants this tenant manages as a partner (GDAP)' `
+            -Impact 'Customer tenants beyond the part that was read are missing from this report.'
     }
     if (-not $roleDefinitionsKnown) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'External Access' -DataSource 'GDAP role definitions and effective role risk' `
-            -Reason $roleDefinitionError -RequiredScope 'RoleManagement.Read.Directory' -DocumentationUrl $doc -SourceFile $relationshipSrc
+            -Reason $roleDefinitionError -RequiredScope 'RoleManagement.Read.Directory' -DocumentationUrl $doc -SourceFile $relationshipSrc `
+            -Subject 'the admin role definitions used to rate roles in customer tenants' `
+            -Impact 'Roles in customer tenants other than the well-known top admin roles are shown as of unknown risk, so some privileged roles this tenant holds in customer tenants may be missing from this report.'
     }
     if ($accessAssignmentErrors.Count -gt 0) {
         $assignmentErrorSrc = Write-Evidence -BaseName 'external_delegated_admin_access_assignment_errors' -Rows $accessAssignmentErrors.ToArray() -Title 'GDAP Access Assignment Collection Gaps'
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'External Access' -DataSource 'Effective GDAP access assignments' `
-            -Reason ("{0} active relationship or assignment read(s) were incomplete." -f $accessAssignmentErrors.Count) `
-            -RequiredScope 'DelegatedAdminRelationship.Read.All' -DocumentationUrl $doc -SourceFile $assignmentErrorSrc
+            -Reason ((Format-EACount $accessAssignmentErrors.Count 'active relationship or assignment read was' 'active relationship or assignment reads were') + ' incomplete.') `
+            -RequiredScope 'DelegatedAdminRelationship.Read.All' -DocumentationUrl $doc -SourceFile $assignmentErrorSrc `
+            -Subject 'the list of staff groups that hold the approved customer roles' `
+            -Impact "Admin roles this tenant's staff can use in customer tenants today may be missing from this report."
     }
     if ($activeRelationshipsWithoutAssignments.Count -gt 0) {
         $noAssignmentSrc = Write-Evidence -BaseName 'external_delegated_admin_relationships_without_assignments' -Rows $activeRelationshipsWithoutAssignments.ToArray() -Title 'Active GDAP Relationships Without Active Access Assignments'
+        $unusedCustomers = @($activeRelationshipsWithoutAssignments | ForEach-Object { Get-EAGovGdapCustomerLabel $_ } | Select-Object -Unique)
         Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'External Access' `
-            -Title ("{0} active GDAP relationship(s) have no active access assignment" -f $activeRelationshipsWithoutAssignments.Count) `
-            -Evidence 'The relationships have approved accessDetails, but accessAssignments returned no active partner security-group binding; approved roles are not reported as effective grants.' `
-            -WhyItMatters 'Separating approved relationship roles from effective assignments prevents both false alarms and false assurance about who can administer the tenant.' `
-            -RecommendedAction 'Confirm the relationships are intentionally unassigned and terminate obsolete relationships rather than leaving dormant approvals' `
-            -DocumentationUrl $doc -SourceFile $noAssignmentSrc -ResultRows $activeRelationshipsWithoutAssignments.ToArray() -RuleId 'gdap-active-without-access-assignment'
+            -Title ((Format-EACount $activeRelationshipsWithoutAssignments.Count 'admin relationship with a customer tenant is' 'admin relationships with customer tenants are') + ' approved but not in use') `
+            -Evidence ("This tenant, as a Microsoft partner, has active Granular Delegated Admin Privileges (GDAP) relationships with approved roles, but no staff security group is assigned to use them (accessAssignments returned no active binding). Customers: {0}." -f ($unusedCustomers -join ', ')) `
+            -WhyItMatters "Nobody in this tenant uses these approved admin roles in the customers' tenants today, but staff can be given them at any time without asking the customer again." `
+            -RecommendedAction ("End the relationships that are no longer needed in {0}" -f $partnerCenterPath) `
+            -DocumentationUrl $gdapGuideDoc -SourceFile $noAssignmentSrc -ResultRows $activeRelationshipsWithoutAssignments.ToArray() -RuleId 'gdap-active-without-access-assignment'
     }
 
     $activeRows = @($accessAssignmentRows.ToArray())
     foreach ($group in @($activeRows | Group-Object RelationshipId)) {
         $relationship = @($group.Group)
+        $customerLabel = Get-EAGovGdapCustomerLabel $relationship[0]
         $critical = @($relationship | Where-Object { $_.RoleRisk -eq 'Critical' })
         $high = @($relationship | Where-Object { $_.RoleRisk -eq 'High' })
         $unknown = @($relationship | Where-Object { $_.RoleRisk -eq 'Unknown' -and $_.RoleDefinitionId })
@@ -1518,18 +1846,26 @@ function Invoke-Check-ExternalDelegation {
                 $_.RoleDisplayName ?? $_.RoleDefinitionId
             } | Select-Object -Unique)
             Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'External Access' `
-                -Title ("Active GDAP relationship grants privileged roles: {0}" -f $relationship[0].DisplayName) `
-                -Evidence ("Privileged roles: {0}; end={1}; autoExtend={2}." -f ($roleNames -join ', '),$relationship[0].EndDateTime,$relationship[0].AutoExtendDuration) `
-                -WhyItMatters 'A partner identity can exercise these tenant roles from outside the customer organization; tier-0 roles can lead to full tenant takeover.' `
-                -RecommendedAction 'Confirm the partner business need, minimize roles and duration, require partner MFA/CA, monitor activity, and terminate unused relationships' `
-                -DocumentationUrl $doc -SourceFile $assignmentSrc -ResultRows $relationship `
-                -AffectedPrincipal ([string]$relationship[0].DisplayName) -RuleId 'gdap-privileged-role' `
+                -Title ("This tenant (as a partner) holds admin roles in customer tenant: {0}" -f $customerLabel) `
+                -Evidence ("Customer tenant: {0} (tenant id {1}); relationship: {2}. Privileged roles in active GDAP access assignments: {3}; end={4}; autoExtend={5}." -f $customerLabel,$relationship[0].CustomerTenantId,$relationship[0].DisplayName,($roleNames -join ', '),$relationship[0].EndDateTime,$relationship[0].AutoExtendDuration) `
+                -WhyItMatters "Members of this tenant's partner staff groups can use these admin roles in the customer's tenant (Granular Delegated Admin Privileges, GDAP). Anyone who takes over one of those groups or staff accounts gets the same admin access to the customer, and top roles such as Global Administrator allow a full takeover of the customer tenant." `
+                -RecommendedAction ("In {0}, keep only the roles the customer's contract needs and end relationships you no longer use; keep the staff groups that hold these roles small and protected with phishing-resistant MFA" -f $partnerCenterPath) `
+                -DocumentationUrl $gdapGuideDoc -SourceFile $assignmentSrc -ResultRows $relationship `
+                -AffectedPrincipal $customerLabel -RuleId 'gdap-privileged-role' `
                 -ObjectType 'delegatedAdminRelationship' -ObjectId ([string]$relationship[0].RelationshipId)
         }
         if ($unknown.Count -gt 0) {
-            Add-EAGovCoverageFinding -CheckId $checkId -Category 'External Access' -DataSource ("GDAP role risk for relationship " + $relationship[0].DisplayName) `
-                -Reason ("{0} role definition(s) could not be resolved." -f $unknown.Count) `
-                -RequiredScope 'RoleManagement.Read.Directory' -DocumentationUrl $doc -SourceFile $assignmentSrc
+            # One rule for every relationship (the relationship is the object, not part of
+            # the rule id), so renaming a relationship never changes the finding id and all
+            # relationships with unresolved roles group under one "could not be read" card.
+            # One-time id change, part of the finding-id migration: the rule used to be
+            # coverage-gdap-role-risk-for-relationship-<relationship name> with no object.
+            Add-EAGovCoverageFinding -CheckId $checkId -Category 'External Access' -DataSource 'GDAP role risk for relationship' `
+                -Reason ("{0} in relationship {1} could not be resolved." -f (Format-EACount $unknown.Count 'role definition' 'role definitions'),$relationship[0].DisplayName) `
+                -RequiredScope 'RoleManagement.Read.Directory' -DocumentationUrl $doc -SourceFile $assignmentSrc `
+                -Subject ("the roles this tenant holds in customer tenant {0}" -f $customerLabel) `
+                -Impact 'Whether this tenant holds admin roles in this customer tenant was not fully checked.' `
+                -ObjectType 'delegatedAdminRelationship' -ObjectId ([string]$relationship[0].RelationshipId) -AffectedPrincipal $customerLabel
         }
     }
 
@@ -1540,11 +1876,11 @@ function Invoke-Check-ExternalDelegation {
     })
     if ($expiredActive.Count -gt 0) {
         Add-EAGovFinding -Severity 'High' -CheckId $checkId -Category 'External Access' `
-            -Title ("{0} active GDAP role grant(s) have passed their relationship end time" -f $expiredActive.Count) `
-            -Evidence 'The relationship status is active while EndDateTime is earlier than the audit time.' `
-            -WhyItMatters 'A relationship that remains active beyond its expected end can preserve unintended external administrative access.' `
-            -RecommendedAction 'Validate relationship state with the partner and Microsoft Partner Center, then terminate or correct expired access' `
-            -DocumentationUrl $doc -SourceFile $relationshipSrc -ResultRows $expiredActive -RuleId 'gdap-active-past-end'
+            -Title (Format-EACount $expiredActive.Count 'admin role grant in a customer tenant is still active after its end date' 'admin role grants in customer tenants are still active after their end date') `
+            -Evidence ("This tenant, as a Microsoft partner, has GDAP relationships whose status is active while EndDateTime is earlier than the audit time. Each row is one role in a relationship. Customers: {0}." -f (@($expiredActive | ForEach-Object { Get-EAGovGdapCustomerLabel $_ } | Select-Object -Unique) -join ', ')) `
+            -WhyItMatters "This tenant may still have admin access in the customers' tenants that should already have ended, and nobody is tracking it." `
+            -RecommendedAction ("Check these relationships in {0} and end any access that should have expired" -f $partnerCenterPath) `
+            -DocumentationUrl $gdapGuideDoc -SourceFile $relationshipSrc -ResultRows $expiredActive -RuleId 'gdap-active-past-end'
     }
 
     # Graph caps duration at P2Y (730 days), so "longer than two years" can never
@@ -1552,11 +1888,11 @@ function Invoke-Check-ExternalDelegation {
     $longLived = @($activeRows | Where-Object { $null -eq $_.EndDateTime -or ($null -ne $_.DurationDays -and $_.DurationDays -ge 730) })
     if ($longLived.Count -gt 0) {
         Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'External Access' `
-            -Title ("{0} active GDAP role grant(s) are very long-lived or have no readable end" -f $longLived.Count) `
-            -Evidence ("{0} relationship(s) use the maximum two-year duration or have no readable EndDateTime. Each row is one role in a relationship." -f @($longLived | Select-Object -ExpandProperty RelationshipId -Unique).Count) `
-            -WhyItMatters 'Long-lived partner administration increases the chance that obsolete access survives contract, personnel, or service changes.' `
-            -RecommendedAction 'Use the shortest practical GDAP duration and periodically reapprove partner roles against the active contract' `
-            -DocumentationUrl $doc -SourceFile $relationshipSrc -ResultRows $longLived -RuleId 'gdap-long-lived'
+            -Title (Format-EACount $longLived.Count 'admin role grant in a customer tenant lasts two years or has no readable end date' 'admin role grants in customer tenants last two years or have no readable end date') `
+            -Evidence ("{0} no readable EndDateTime. Each row is one role in a relationship. Customers: {1}." -f (Format-EACount @($longLived | Select-Object -ExpandProperty RelationshipId -Unique).Count 'GDAP relationship this tenant holds as a Microsoft partner uses the maximum two-year duration or has' 'GDAP relationships this tenant holds as a Microsoft partner use the maximum two-year duration or have'),(@($longLived | ForEach-Object { Get-EAGovGdapCustomerLabel $_ } | Select-Object -Unique) -join ', ')) `
+            -WhyItMatters 'The longer admin access to a customer lasts, the more likely it is to outlive the contract or the staff who needed it.' `
+            -RecommendedAction ("Use shorter relationships with each customer in {0}, and re-approve the roles regularly against the current contract" -f $partnerCenterPath) `
+            -DocumentationUrl $gdapGuideDoc -SourceFile $relationshipSrc -ResultRows $longLived -RuleId 'gdap-long-lived'
     }
 
     # autoExtendDuration (P0D/PT0S = off, P180D = on) is what makes a partner
@@ -1567,6 +1903,7 @@ function Invoke-Check-ExternalDelegation {
         $null -ne $days -and $days -gt 0
     } | Group-Object RelationshipId)) {
         $relationship = @($group.Group)
+        $customerLabel = Get-EAGovGdapCustomerLabel $relationship[0]
         $privilegedRoles = @($relationship | Where-Object { $_.RoleRisk -in @('Critical','High') })
         # A role whose definition could not be resolved may be privileged: keep the High
         # severity and say so, rather than reporting "none" for data that was never read.
@@ -1576,18 +1913,29 @@ function Invoke-Check-ExternalDelegation {
         $roleText = @(
             if ($roleNames.Count -gt 0) { $roleNames -join ', ' }
             if ($unknownRoles.Count -gt 0) {
-                "{0} role(s) of unknown risk (role definitions could not be resolved)" -f @($unknownRoles.RoleDefinitionId | Select-Object -Unique).Count
+                "{0} of unknown risk (role definitions could not be resolved)" -f (Format-EACount @($unknownRoles.RoleDefinitionId | Select-Object -Unique).Count 'role' 'roles')
             }
         )
         Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'External Access' `
-            -Title ("Active GDAP relationship renews itself automatically: {0}" -f $relationship[0].DisplayName) `
-            -Evidence ("autoExtendDuration={0}; current end={1}; privileged roles: {2}." -f $relationship[0].AutoExtendDuration,$relationship[0].EndDateTime,$(if ($roleText.Count -gt 0) { $roleText -join '; plus ' } else { 'none' })) `
-            -WhyItMatters 'The partner keeps admin access in your tenant with no end date. The relationship extends itself every time it reaches its end, so nobody has to re-approve it.' `
-            -RecommendedAction 'Ask the partner to turn off auto-extend, or terminate the relationship and create a new one with a fixed end date. Re-approve partner access on a regular schedule' `
-            -DocumentationUrl $doc -SourceFile $assignmentSrc -ResultRows $relationship `
-            -AffectedPrincipal ([string]$relationship[0].DisplayName) -RuleId 'gdap-auto-extend' `
+            -Title ("Admin access to a customer tenant renews itself automatically: {0}" -f $customerLabel) `
+            -Evidence ("Customer tenant: {0}; relationship: {1}. GDAP autoExtendDuration={2}; current end={3}; privileged roles: {4}." -f $customerLabel,$relationship[0].DisplayName,$relationship[0].AutoExtendDuration,$relationship[0].EndDateTime,$(if ($roleText.Count -gt 0) { $roleText -join '; plus ' } else { 'none' })) `
+            -WhyItMatters "This tenant's admin access to the customer has no real end date: the relationship extends itself by six months every time it reaches its end, so nobody has to re-approve it." `
+            -RecommendedAction ("Turn off auto extend for this relationship in {0}, or replace it with a relationship that has a fixed end date; re-approve customer access on a regular schedule" -f $partnerCenterPath) `
+            -DocumentationUrl $gdapGuideDoc -SourceFile $assignmentSrc -ResultRows $relationship `
+            -AffectedPrincipal $customerLabel -RuleId 'gdap-auto-extend' `
             -ObjectType 'delegatedAdminRelationship' -ObjectId ([string]$relationship[0].RelationshipId)
     }
+
+    # Partners that hold admin roles in THIS tenant cannot be listed through Microsoft
+    # Graph from the customer side, so this note is always added. It is an Information
+    # note, not a coverage gap: no permission can fix it, and a permanent gap would mark
+    # every run as incomplete. Its text states plainly that this part was not checked.
+    Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'External Access' `
+        -Title 'Partners with admin access to this tenant must be checked by hand' `
+        -Evidence 'Microsoft Graph has no read-only API that lists, from the customer side, the partners (GDAP or older DAP) that hold admin roles in this tenant. The GDAP list this check reads only shows the relationships this tenant holds as a partner with its own customers. Partner access to this tenant was therefore not checked; this is not a clean result.' `
+        -WhyItMatters 'A partner with admin roles in your tenant can make changes from outside your organization, and a breach at the partner can reach your tenant. The audit cannot see these partners.' `
+        -RecommendedAction ("Review every partner in {0}: remove admin roles a partner does not need (Remove roles), and ask partners you no longer work with to end the relationship" -f $partnerPath) `
+        -DocumentationUrl $customerPartnerDoc -SourceFile $relationshipSrc -RuleId 'gdap-inbound-not-readable'
 
     # ------------------------- Accepted guest lifecycle -------------------------
     $inactiveThreshold = 90
@@ -1595,10 +1943,39 @@ function Invoke-Check-ExternalDelegation {
     if ($thresholdVariable -and [int]$thresholdVariable.Value -gt 0) { $inactiveThreshold = [int]$thresholdVariable.Value }
     # Keep the base guest/sponsor read separate from signInActivity. A missing P1
     # license or AuditLog.Read.All must not prevent sponsor governance from running.
-    $guestBaseUri = "https://graph.microsoft.com/v1.0/users?`$filter=userType%20eq%20'Guest'&`$select=id,userPrincipalName,displayName,accountEnabled,userType,externalUserState,externalUserStateChangeDateTime,createdDateTime&`$top=999"
+    #
+    # Sponsors come with the guest list through $expand: one request per page of guests
+    # instead of one request per guest. Directory $expand returns at most 20 related
+    # objects and no nextLink, so a guest whose expanded sponsor list is missing or exactly
+    # at that cap is read again on its own. If the service refuses the expanded query, the
+    # plain guest list is read and every accepted guest's sponsors are read one by one:
+    # slower, but no guest is ever skipped, and every guest whose sponsors could not be
+    # read is listed in the sponsor coverage gap.
+    #
+    # Page safety limits are sized so every guest read covers about 500,000 guests: the
+    # plain list is served at up to 999 rows per page (500 pages), a directory list with
+    # $expand may be served at only 100 rows per page (5000 pages), and a list that selects
+    # signInActivity at up to 500 rows per page (1000 pages). A smaller limit on the
+    # expanded or activity read would mark large guest lists as partial and skip rules the
+    # plain read could still run.
+    $sponsorExpandCap = 20
+    $guestSelect = 'id,userPrincipalName,displayName,accountEnabled,userType,externalUserState,externalUserStateChangeDateTime,createdDateTime'
+    $guestBaseUri = "https://graph.microsoft.com/v1.0/users?`$filter=userType%20eq%20'Guest'&`$select=$guestSelect&`$top=999"
     $guestActivityUri = "https://graph.microsoft.com/v1.0/users?`$filter=userType%20eq%20'Guest'&`$select=id,signInActivity&`$top=999"
-    $guestResult = Invoke-EAGovGraphCollection -Uri $guestBaseUri
-    $guestActivityResult = Invoke-EAGovGraphCollection -Uri $guestActivityUri
+    $sponsorsExpanded = $false
+    $sponsorExpandErrors = New-Object System.Collections.Generic.List[string]
+    $guestResult = $null
+    foreach ($expandShape in @('sponsors($select=id,displayName,userPrincipalName)', 'sponsors')) {
+        $attempt = Invoke-EAGovGraphCollection -Uri ($guestBaseUri + '&$expand=' + $expandShape) -MaxPages 5000
+        if ($attempt.Success) { $guestResult = $attempt; $sponsorsExpanded = $true; break }
+        $sponsorExpandErrors.Add(('$expand={0}: {1}' -f $expandShape, [string]$attempt.Error.Exception.Message)) | Out-Null
+        # Only a rejected query (HTTP 400) is worth retrying in another shape; access
+        # denied, throttling or a service error would fail the same way again.
+        $queryRejected = $attempt.StatusCode -eq 400 -or ($null -eq $attempt.StatusCode -and (Test-EAPageSizeRejection $attempt.Error))
+        if (-not $queryRejected) { break }
+    }
+    if (-not $sponsorsExpanded) { $guestResult = Invoke-EAGovGraphCollection -Uri $guestBaseUri }
+    $guestActivityResult = Invoke-EAGovGraphCollection -Uri $guestActivityUri -MaxPages 1000
     $activityByGuestId = @{}
     $guestActivityComplete = $guestActivityResult.Success -and -not $guestActivityResult.Truncated
     if ($guestActivityComplete) {
@@ -1614,90 +1991,161 @@ function Invoke-Check-ExternalDelegation {
     }
     $guestRows = New-Object System.Collections.Generic.List[object]
     $sponsorErrors = New-Object System.Collections.Generic.List[object]
-    if ($guestResult.Success) {
-        foreach ($guest in @($guestResult.Rows | Where-Object { [string](Get-EAGovProperty $_ 'externalUserState') -ieq 'Accepted' })) {
-            $guestId = [string](Get-EAGovProperty $guest 'id')
-            $sponsorsKnown = $false
-            $sponsors = @()
-            if ($guestId) {
-                $sponsorResult = Invoke-EAGovGraphCollection -Uri ("https://graph.microsoft.com/v1.0/users/{0}/sponsors?`$select=id,displayName,userPrincipalName" -f [uri]::EscapeDataString($guestId))
-                if ($sponsorResult.Success -and -not $sponsorResult.Truncated) {
-                    $sponsorsKnown = $true
-                    $sponsors = @($sponsorResult.Rows)
-                } else {
-                    $reason = if ($sponsorResult.Success) { 'pagination limit reached' } else { [string]$sponsorResult.Error.Exception.Message }
-                    $sponsorErrors.Add([pscustomobject]@{ GuestId=$guestId; UserPrincipalName=(Get-EAGovProperty $guest 'userPrincipalName'); Reason=$reason }) | Out-Null
+    $acceptedGuests = @(if ($guestResult.Success) {
+        @($guestResult.Rows | Where-Object { [string](Get-EAGovProperty $_ 'externalUserState') -ieq 'Accepted' })
+    } else { @() })
+
+    # Decide up front which guests need their own sponsor read, so the console can show
+    # how many there are and report progress on long runs.
+    $needsOwnSponsorRead = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($guest in $acceptedGuests) {
+        $guestId = [string](Get-EAGovProperty $guest 'id')
+        if (-not $guestId) { continue }
+        $expandedPresent = $sponsorsExpanded -and (Test-EAGovPropertyPresent $guest 'sponsors')
+        $expandedCount = if ($expandedPresent) { @(Get-EAGovProperty $guest 'sponsors' | Where-Object { $null -ne $_ }).Count } else { 0 }
+        if (-not $expandedPresent -or $expandedCount -ge $sponsorExpandCap) { [void]$needsOwnSponsorRead.Add($guestId) }
+    }
+    if ($needsOwnSponsorRead.Count -gt 0) {
+        $whyOwnRead = if (-not $sponsorsExpanded) {
+            'the guest list could not include sponsors'
+        } else {
+            "their sponsors were missing from the guest list or may have been cut off at $sponsorExpandCap"
+        }
+        Write-Info ("  Reading sponsors one guest at a time for {0} of {1}, because {2}." -f $needsOwnSponsorRead.Count,(Format-EACount $acceptedGuests.Count 'accepted guest' 'accepted guests'),$whyOwnRead)
+    }
+
+    $ownReads = 0
+    $ownReadSucceeded = 0
+    $ownReadDenied = 0
+    $ownReadStopReason = $null
+    $expandedSponsorGuests = 0
+    foreach ($guest in $acceptedGuests) {
+        $guestId = [string](Get-EAGovProperty $guest 'id')
+        $sponsorsKnown = $false
+        $sponsors = @()
+        $sponsorSource = $null
+        if (-not $guestId) {
+            $sponsorErrors.Add([pscustomobject]@{ GuestId=$null; UserPrincipalName=(Get-EAGovProperty $guest 'userPrincipalName'); Reason='the guest record has no id, so its sponsors could not be read' }) | Out-Null
+        } elseif (-not $needsOwnSponsorRead.Contains($guestId)) {
+            $sponsorsKnown = $true
+            $sponsors = @(Get-EAGovProperty $guest 'sponsors' | Where-Object { $null -ne $_ })
+            $sponsorSource = 'GuestList'
+            $expandedSponsorGuests++
+        } elseif ($ownReadStopReason) {
+            $sponsorErrors.Add([pscustomobject]@{ GuestId=$guestId; UserPrincipalName=(Get-EAGovProperty $guest 'userPrincipalName'); Reason=$ownReadStopReason }) | Out-Null
+        } else {
+            $ownReads++
+            $sponsorResult = Invoke-EAGovGraphCollection -Uri ("https://graph.microsoft.com/v1.0/users/{0}/sponsors?`$select=id,displayName,userPrincipalName" -f [uri]::EscapeDataString($guestId))
+            if ($sponsorResult.Success -and -not $sponsorResult.Truncated) {
+                $sponsorsKnown = $true
+                $sponsors = @($sponsorResult.Rows)
+                $sponsorSource = 'PerGuest'
+                $ownReadSucceeded++
+            } else {
+                $reason = if ($sponsorResult.Success) { 'pagination limit reached' } else { [string]$sponsorResult.Error.Exception.Message }
+                $sponsorErrors.Add([pscustomobject]@{ GuestId=$guestId; UserPrincipalName=(Get-EAGovProperty $guest 'userPrincipalName'); Reason=$reason }) | Out-Null
+                if (-not $sponsorResult.Success -and ($sponsorResult.StatusCode -in @(401, 403) -or (Test-EAAccessDenied $sponsorResult.Error))) { $ownReadDenied++ }
+                # When the first reads are all refused, the rest would be refused too:
+                # stop sending thousands of doomed requests, but still list every guest.
+                if ($ownReadSucceeded -eq 0 -and $ownReadDenied -ge 5) {
+                    $ownReadStopReason = "not attempted: the first $ownReadDenied per-guest sponsor reads were refused (access denied)"
+                    Write-Warn2 ("  Guest sponsor reads are being refused (access denied); the remaining {0} reported as not checked." -f (Format-EACount ($needsOwnSponsorRead.Count - $ownReads) 'guest is' 'guests are'))
                 }
             }
-
-            $activityEnvelope = if ($activityByGuestId.ContainsKey($guestId)) { $activityByGuestId[$guestId] } else { $null }
-            $activityKnown = $guestActivityComplete -and $activityEnvelope -and $activityEnvelope.Present
-            $signIn = if ($activityKnown) { $activityEnvelope.Value } else { $null }
-            $lastSuccessful = ConvertTo-EAGovDateTime (Get-EAGovProperty $signIn 'lastSuccessfulSignInDateTime')
-            $lastSignIn = ConvertTo-EAGovDateTime (Get-EAGovProperty $signIn 'lastSignInDateTime')
-            # A failed sign-in attempt can update lastSignInDateTime. It must not
-            # make a dormant guest look active (for example during password spray).
-            $lastActivity = $lastSuccessful
-            $accepted = ConvertTo-EAGovDateTime (Get-EAGovProperty $guest 'externalUserStateChangeDateTime')
-            if (-not $accepted) { $accepted = ConvertTo-EAGovDateTime (Get-EAGovProperty $guest 'createdDateTime') }
-
-            $guestRows.Add([pscustomobject]@{
-                Id                         = $guestId
-                UserPrincipalName          = Get-EAGovProperty $guest 'userPrincipalName'
-                DisplayName                = Get-EAGovProperty $guest 'displayName'
-                AccountEnabled             = Get-EAGovProperty $guest 'accountEnabled'
-                ExternalUserState          = Get-EAGovProperty $guest 'externalUserState'
-                AcceptedDateTime           = $accepted
-                LastSuccessfulSignInDateTime = $lastSuccessful
-                LastSignInDateTime         = $lastSignIn
-                LastActivityDateTime       = $lastActivity
-                ActivityKnown              = $activityKnown
-                SponsorsKnown              = $sponsorsKnown
-                SponsorCount               = if ($sponsorsKnown) { $sponsors.Count } else { $null }
-                Sponsors                   = (($sponsors | ForEach-Object {
-                    (Get-EAGovProperty $_ 'userPrincipalName') ?? (Get-EAGovProperty $_ 'displayName') ?? (Get-EAGovProperty $_ 'id')
-                }) -join '; ')
-            }) | Out-Null
+            if ($ownReads % 100 -eq 0) {
+                Write-Info ("  Guest sponsors read one by one: {0} of {1}." -f $ownReads,$needsOwnSponsorRead.Count)
+            }
         }
+
+        $activityEnvelope = if ($activityByGuestId.ContainsKey($guestId)) { $activityByGuestId[$guestId] } else { $null }
+        $activityKnown = $guestActivityComplete -and $activityEnvelope -and $activityEnvelope.Present
+        $signIn = if ($activityKnown) { $activityEnvelope.Value } else { $null }
+        $lastSuccessful = ConvertTo-EAGovDateTime (Get-EAGovProperty $signIn 'lastSuccessfulSignInDateTime')
+        $lastSignIn = ConvertTo-EAGovDateTime (Get-EAGovProperty $signIn 'lastSignInDateTime')
+        # A failed sign-in attempt can update lastSignInDateTime. It must not
+        # make a dormant guest look active (for example during password spray).
+        $lastActivity = $lastSuccessful
+        $accepted = ConvertTo-EAGovDateTime (Get-EAGovProperty $guest 'externalUserStateChangeDateTime')
+        if (-not $accepted) { $accepted = ConvertTo-EAGovDateTime (Get-EAGovProperty $guest 'createdDateTime') }
+
+        $guestRows.Add([pscustomobject]@{
+            Id                         = $guestId
+            UserPrincipalName          = Get-EAGovProperty $guest 'userPrincipalName'
+            DisplayName                = Get-EAGovProperty $guest 'displayName'
+            AccountEnabled             = Get-EAGovProperty $guest 'accountEnabled'
+            ExternalUserState          = Get-EAGovProperty $guest 'externalUserState'
+            AcceptedDateTime           = $accepted
+            LastSuccessfulSignInDateTime = $lastSuccessful
+            LastSignInDateTime         = $lastSignIn
+            LastActivityDateTime       = $lastActivity
+            ActivityKnown              = $activityKnown
+            SponsorsKnown              = $sponsorsKnown
+            SponsorCount               = if ($sponsorsKnown) { $sponsors.Count } else { $null }
+            SponsorSource              = $sponsorSource
+            Sponsors                   = (($sponsors | ForEach-Object {
+                (Get-EAGovProperty $_ 'userPrincipalName') ?? (Get-EAGovProperty $_ 'displayName') ?? (Get-EAGovProperty $_ 'id')
+            }) -join '; ')
+        }) | Out-Null
+    }
+    if ($ownReads -ge 100 -and $ownReads % 100 -ne 0) {
+        Write-Info ("  Guest sponsors read one by one: {0} of {1}." -f $ownReads,$needsOwnSponsorRead.Count)
+    }
+
+    $sponsorReadNote = if (-not $guestResult.Success) {
+        'Sponsors: not read, because the guest list itself could not be read.'
+    } elseif ($sponsorsExpanded) {
+        "Sponsors: read with the guest list for {0} (SponsorSource=GuestList) and one guest at a time for {1} (SponsorSource=PerGuest; expanded list missing or at the {2}-item limit)." -f (Format-EACount $expandedSponsorGuests 'guest' 'guests'),(Format-EACount $ownReadSucceeded 'guest' 'guests'),$sponsorExpandCap
+    } else {
+        "Sponsors: the guest list could not include sponsors ({0}), so they were read one guest at a time (SponsorSource=PerGuest) for {1}." -f ($sponsorExpandErrors -join ' | '),(Format-EACount $ownReadSucceeded 'guest' 'guests')
     }
     $guestSrc = Write-Evidence -BaseName 'accepted_guest_lifecycle' -Rows $guestRows.ToArray() `
         -Title 'Accepted Guest Activity and Sponsor Governance' `
-        -Notes @(("Inactive threshold: {0} days. Only LastSuccessfulSignInDateTime establishes activity; failed attempts in LastSignInDateTime do not reset the inactivity clock." -f $inactiveThreshold))
+        -Notes @(
+            ("Inactive threshold: {0} days. Only LastSuccessfulSignInDateTime establishes activity; failed attempts in LastSignInDateTime do not reset the inactivity clock." -f $inactiveThreshold),
+            $sponsorReadNote,
+            'SponsorsKnown=False means the sponsors of that guest could not be read (see guest_sponsor_collection_errors); it never means the guest has no sponsor.'
+        )
 
     if (-not $guestResult.Success) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'External Access' -DataSource 'Accepted guest inventory and sponsor population' `
             -Reason ([string]$guestResult.Error.Exception.Message) -RequiredScope 'User.Read.All' `
-            -DocumentationUrl $guestDoc -SourceFile $guestSrc
+            -DocumentationUrl $guestDoc -SourceFile $guestSrc -Subject 'the list of guest users' `
+            -Impact 'Guests without a sponsor and guests who no longer sign in were not checked.'
     } elseif ($guestResult.Truncated) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'External Access' -DataSource 'Accepted guest pagination' `
             -Reason "pagination exceeded $($guestResult.Pages) pages." -RequiredScope 'User.Read.All' `
-            -DocumentationUrl $guestDoc -SourceFile $guestSrc
+            -DocumentationUrl $guestDoc -SourceFile $guestSrc -Partial -Subject 'the list of guest users' `
+            -Impact 'Guests beyond the part that was read were not checked for a sponsor or for recent sign-ins.'
     }
     if (-not $guestActivityResult.Success) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'External Access' -DataSource 'Accepted guest sign-in activity' `
             -Reason ([string]$guestActivityResult.Error.Exception.Message) -RequiredScope 'AuditLog.Read.All plus Entra ID P1 or P2' `
-            -DocumentationUrl $guestDoc -SourceFile $guestSrc
+            -DocumentationUrl $guestDoc -SourceFile $guestSrc -Subject 'the sign-in activity of guest users' `
+            -Impact 'Guests who no longer sign in were not identified.'
     } elseif ($guestActivityResult.Truncated) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'External Access' -DataSource 'Accepted guest sign-in activity pagination' `
             -Reason "pagination exceeded $($guestActivityResult.Pages) pages." -RequiredScope 'AuditLog.Read.All plus Entra ID P1 or P2' `
-            -DocumentationUrl $guestDoc -SourceFile $guestSrc
+            -DocumentationUrl $guestDoc -SourceFile $guestSrc -Partial -Subject 'the sign-in activity of guest users' `
+            -Impact 'Guests who no longer sign in were not identified.'
     }
     if ($sponsorErrors.Count -gt 0) {
         $sponsorErrSrc = Write-Evidence -BaseName 'guest_sponsor_collection_errors' -Rows $sponsorErrors.ToArray() -Title 'Guest Sponsor Collection Gaps'
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'External Access' -DataSource 'Accepted guest sponsors' `
-            -Reason ("sponsor enumeration failed or truncated for {0} accepted guest(s)." -f $sponsorErrors.Count) `
-            -RequiredScope 'User.Read.All plus a supported sponsor-reader directory role' `
-            -DocumentationUrl $sponsorDoc -SourceFile $sponsorErrSrc
+            -Reason ("sponsor enumeration failed or truncated for {0}." -f (Format-EACount $sponsorErrors.Count 'accepted guest' 'accepted guests')) `
+            -RequiredScope 'User.Read.All (a delegated sign-in also needs a role such as Directory Readers or Guest Inviter)' `
+            -DocumentationUrl $sponsorDoc -SourceFile $sponsorErrSrc -Subject 'the sponsors of some guest users' `
+            -Impact 'Guests without a sponsor may be missing from this report.' `
+            -RecommendedAction 'Give the audit account User.Read.All and, when it signs in as a user, a role that can read sponsors (Directory Readers, Guest Inviter, Directory Writers or User Administrator), then run the audit again; if the evidence shows a different error, such as throttling, simply run it again'
     }
 
     $missingSponsors = @($guestRows | Where-Object { $_.SponsorsKnown -and $_.SponsorCount -eq 0 })
     if ($missingSponsors.Count -gt 0) {
         Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'External Access' `
-            -Title ("{0} accepted guest(s) have no sponsor" -f $missingSponsors.Count) `
-            -Evidence 'Sponsor enumeration succeeded and returned zero sponsors for these accepted guests.' `
-            -WhyItMatters 'Without an accountable sponsor, no internal owner is responsible for periodically validating the guest business need and access.' `
-            -RecommendedAction 'Assign an accountable user or group sponsor and include sponsor accountability in guest access reviews and lifecycle workflows' `
-            -DocumentationUrl $sponsorDoc -SourceFile $guestSrc -ResultRows $missingSponsors -RuleId 'accepted-guests-no-sponsor'
+            -Title (Format-EACount $missingSponsors.Count 'guest has no sponsor' 'guests have no sponsor') `
+            -Evidence 'Accepted guests: sponsor enumeration succeeded and returned zero sponsors for these guests.' `
+            -WhyItMatters 'A sponsor is the person or group inside your organization who answers for a guest. Without one, nobody checks whether the guest still needs access when the project or contract ends.' `
+            -RecommendedAction 'Add a sponsor to each listed guest (Entra admin center > Entra ID > Users > [guest] > Properties > Job information > Sponsors), and make sponsors the reviewers in guest access reviews' `
+            -DocumentationUrl $sponsorGuideDoc -SourceFile $guestSrc -ResultRows $missingSponsors -RuleId 'accepted-guests-no-sponsor'
     }
 
     if ($guestResult.Success -and -not $guestResult.Truncated -and $guestActivityComplete) {
@@ -1711,21 +2159,31 @@ function Invoke-Check-ExternalDelegation {
         })
         if ($inactiveGuests.Count -gt 0) {
             Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'External Access' `
-                -Title ("{0} enabled, accepted guest(s) are inactive for more than {1} days" -f $inactiveGuests.Count,$inactiveThreshold) `
+                -Title ("{0} not signed in for more than {1} days" -f (Format-EACount $inactiveGuests.Count 'guest has' 'guests have'),$inactiveThreshold) `
                 -Evidence 'Guests are accepted and enabled, and their last successful sign-in is older than the threshold; never-successfully-signed-in guests are flagged only after the accepted/created date exceeds the threshold. Failed attempts do not count as activity.' `
-                -WhyItMatters 'Accepted guest accounts can retain group, application, and collaboration access after the external relationship ends.' `
-                -RecommendedAction 'Have sponsors validate business need, review effective access, then disable or remove stale guests through the approved lifecycle process' `
-                -DocumentationUrl $guestDoc -SourceFile $guestSrc -ResultRows $inactiveGuests -RuleId 'accepted-guests-inactive'
+                -WhyItMatters "Guest accounts nobody uses still have access to your groups, apps and files. If the guest's own account is taken over, an attacker can use that access without anyone noticing." `
+                -RecommendedAction 'Ask each sponsor whether the guest still needs access, then block sign-in for or delete guests that do not; an access review of inactive guests can do this regularly' `
+                -DocumentationUrl $guestReviewDoc -SourceFile $guestSrc -ResultRows $inactiveGuests -RuleId 'accepted-guests-inactive'
         }
     }
 
+    # Counts come from the read results: a list that could not be read says so instead of
+    # showing 0, and a partial list shows "N+".
+    $customerCountText = if (-not $relationshipResult.Success) { 'customer tenants managed as partner not read' }
+        elseif ($relationshipResult.Truncated) { '{0}+ customer tenants managed as partner' -f $relationships.Count }
+        else { '{0} managed as partner' -f (Format-EACount $relationships.Count 'customer tenant' 'customer tenants') }
+    $guestCountText = if (-not $guestResult.Success) { 'guests not read' }
+        elseif ($guestResult.Truncated) { '{0}+ accepted guests' -f $guestRows.Count }
+        else { Format-EACount $guestRows.Count 'accepted guest' 'accepted guests' }
+    $relationshipEvidence = if ($relationshipResult.Success) { [string]$relationships.Count + $(if ($relationshipResult.Truncated) { ' (partial list)' } else { '' }) } else { 'not read' }
+    $guestEvidence = if ($guestResult.Success) { [string]$guestRows.Count + $(if ($guestResult.Truncated) { ' (partial list)' } else { '' }) } else { 'not read' }
     Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'External Access' `
-        -Title 'External delegation and accepted-guest inventory captured' `
-        -Evidence ("GDAP relationships={0}; active GDAP role rows={1}; accepted guests={2}; sponsor read errors={3}." -f `
-            $relationships.Count,$activeRows.Count,$guestRows.Count,$sponsorErrors.Count) `
-        -WhyItMatters 'Partner administration and guest accounts are separate external-access paths and need explicit owners, time limits, and review.' `
-        -RecommendedAction 'Reconcile partner and guest access with contracts, sponsors, Conditional Access, monitoring, and recurring access reviews' `
-        -DocumentationUrl $doc -SourceFile $relationshipSrc -ResultRows $relationshipRows.ToArray() -RuleId 'external-delegation-inventory'
+        -Title ("External access recorded ({0}, {1})" -f $guestCountText,$customerCountText) `
+        -Evidence ("Accepted guests={0}; sponsor read errors={1}; customer tenants this tenant manages as a Microsoft partner through GDAP={2}; active GDAP role rows={3}. Partners that hold admin roles in this tenant are not in these numbers: Microsoft Graph cannot list them (see 'Partners with admin access to this tenant must be checked by hand')." -f `
+            $guestEvidence,$sponsorErrors.Count,$relationshipEvidence,$activeRows.Count) `
+        -WhyItMatters 'Guest accounts and partner admin relationships are the two main ways outsiders get into a tenant. Each needs an owner, an end date and a regular review.' `
+        -RecommendedAction ("Compare guest access with current sponsors and contracts, check partner access to this tenant in {0}, and review both on a regular schedule" -f $partnerPath) `
+        -DocumentationUrl $gdapGuideDoc -SourceFile $relationshipSrc -ResultRows $relationshipRows.ToArray() -RuleId 'external-delegation-inventory'
 }
 
 function ConvertFrom-EAGovSigningCertificate {
@@ -1761,6 +2219,8 @@ function Invoke-Check-FederationHealth {
     $checkId = 'federationhealth'
     $doc = 'https://learn.microsoft.com/graph/api/domain-list-federationconfiguration?view=graph-rest-1.0'
     $domainDoc = 'https://learn.microsoft.com/graph/api/domain-list?view=graph-rest-1.0'
+    $certGuideDoc = 'https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/how-to-connect-fed-o365-certs'
+    $domainGuideDoc = 'https://learn.microsoft.com/en-us/entra/identity/users/domains-manage'
     $domainResult = Invoke-EAGovGraphCollection -Uri 'https://graph.microsoft.com/v1.0/domains?$select=id,authenticationType,isVerified,isDefault,isAdminManaged,supportedServices,availabilityStatus'
     if (-not $domainResult.Success) { throw $domainResult.Error }
 
@@ -1838,37 +2298,38 @@ function Invoke-Check-FederationHealth {
     if ($domainResult.Truncated) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Federation' -DataSource 'Domain inventory pagination' `
             -Reason "pagination exceeded $($domainResult.Pages) pages." -RequiredScope 'Domain.Read.All' `
-            -DocumentationUrl $domainDoc -SourceFile $src
+            -DocumentationUrl $domainDoc -SourceFile $src -Partial -Subject 'the list of domains' `
+            -Impact 'Federated domains beyond the part that was read were not checked.'
     }
     if ($configErrors.Count -gt 0) {
         $errorSrc = Write-Evidence -BaseName 'federation_configuration_errors' -Rows $configErrors.ToArray() -Title 'Federation Configuration Collection Gaps'
         Add-EAGovFinding -Severity 'High' -CheckId $checkId -Category 'Federation' `
-            -Title ("Federation configuration is unknown for {0} federated domain(s)" -f $configErrors.Count) `
+            -Title ("Federation settings could not be read for {0}" -f (Format-EACount $configErrors.Count 'federated domain' 'federated domains')) `
             -Evidence 'The domain is marked Federated, but its federation configuration could not be read or was absent. This is unknown coverage, not a healthy result.' `
-            -WhyItMatters 'Without the federation configuration, signing-certificate expiry, issuer, protocol, and MFA-claim behavior cannot be validated.' `
-            -RecommendedAction 'Grant Domain-InternalFederation.Read.All, confirm a supported reader role, and repair any federated domain that has no configuration' `
+            -WhyItMatters 'Sign-in for these domains is handed to another system, such as Active Directory Federation Services (AD FS). Without its settings the audit cannot warn you before its signing certificate expires, which would stop users of the domain from signing in.' `
+            -RecommendedAction 'Give the audit account Domain-InternalFederation.Read.All and a supported reader role, then run the audit again; fix any federated domain that has no federation settings' `
             -DocumentationUrl $doc -SourceFile $errorSrc -ResultRows $configErrors.ToArray() -RuleId 'federation-config-unknown' -CoverageGap
     }
 
     $unverifiedFederated = @($rows | Where-Object { $_.AuthenticationType -eq 'Federated' -and $_.IsVerified -ne $true })
     if ($unverifiedFederated.Count -gt 0) {
         Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Federation' `
-            -Title ("{0} federated domain(s) are not verified" -f $unverifiedFederated.Count) `
+            -Title (Format-EACount $unverifiedFederated.Count 'federated domain is not verified' 'federated domains are not verified') `
             -Evidence 'AuthenticationType=Federated while IsVerified is not true.' `
-            -WhyItMatters 'An unverified or transitional federated namespace can indicate incomplete domain/federation lifecycle state and unreliable sign-in routing.' `
-            -RecommendedAction 'Validate DNS ownership and federation intent, then verify or remove obsolete domains through the approved domain lifecycle process' `
-            -DocumentationUrl $domainDoc -SourceFile $src -ResultRows $unverifiedFederated -RuleId 'federated-domain-unverified'
+            -WhyItMatters 'A federated domain that is not verified points to an unfinished or abandoned setup, and sign-ins for it may not go where you expect.' `
+            -RecommendedAction 'Confirm who owns each domain and whether it should still be federated, then verify it or remove it in Entra admin center > Entra ID > Domain names' `
+            -DocumentationUrl $domainGuideDoc -SourceFile $src -ResultRows $unverifiedFederated -RuleId 'federated-domain-unverified'
     }
 
     $now = [datetimeoffset]::UtcNow
     $expired = @($rows | Where-Object { $_.ConfigRead -eq 'Complete' -and $_.SigningNotAfter -and (ConvertTo-EAGovDateTime $_.SigningNotAfter) -lt $now })
     if ($expired.Count -gt 0) {
         Add-EAGovFinding -Severity 'Critical' -CheckId $checkId -Category 'Federation' `
-            -Title ("{0} federation signing certificate(s) are expired" -f $expired.Count) `
+            -Title (Format-EACount $expired.Count 'federation signing certificate has expired' 'federation signing certificates have expired') `
             -Evidence 'The parsed signing-certificate NotAfter timestamp is earlier than the audit time.' `
-            -WhyItMatters 'Expired federation signing certificates can disrupt authentication and may indicate an unmanaged federation trust.' `
-            -RecommendedAction 'Validate the identity-provider rollover immediately, update metadata/certificates through the approved federation process, and test sign-in' `
-            -DocumentationUrl $doc -SourceFile $src -ResultRows $expired -RuleId 'federation-signing-cert-expired'
+            -WhyItMatters 'When the certificate that signs sign-ins for a federated domain has expired, users of that domain can be unable to sign in to Microsoft 365 at all. It can also mean nobody is looking after the federation setup.' `
+            -RecommendedAction 'Renew the token-signing certificate at the identity provider (for example AD FS) now, update it in Microsoft Entra, and test sign-in' `
+            -DocumentationUrl $certGuideDoc -SourceFile $src -ResultRows $expired -RuleId 'federation-signing-cert-expired'
     }
     $expiring30 = @($rows | Where-Object {
         $date = ConvertTo-EAGovDateTime $_.SigningNotAfter
@@ -1878,11 +2339,11 @@ function Invoke-Check-FederationHealth {
         $noReadyNext = @($expiring30 | Where-Object { -not $_.NextSigningNotAfter -or (ConvertTo-EAGovDateTime $_.NextSigningNotAfter) -le $now })
         $severity = if ($noReadyNext.Count -gt 0) { 'High' } else { 'Medium' }
         Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'Federation' `
-            -Title ("{0} federation signing certificate(s) expire within 30 days" -f $expiring30.Count) `
-            -Evidence ("{0} do not have a parsed, currently valid next signing certificate." -f $noReadyNext.Count) `
-            -WhyItMatters 'Federation certificate rollover failures can cause tenant-wide authentication outages or emergency trust changes.' `
-            -RecommendedAction 'Complete and test certificate rollover before expiry; confirm metadata-based automatic rollover where supported' `
-            -DocumentationUrl $doc -SourceFile $src -ResultRows $expiring30 -RuleId 'federation-signing-cert-expiring-30d'
+            -Title (Format-EACount $expiring30.Count 'federation signing certificate expires within 30 days' 'federation signing certificates expire within 30 days') `
+            -Evidence ("{0} a parsed, currently valid next signing certificate." -f (Format-EACount $noReadyNext.Count 'does not have' 'do not have')) `
+            -WhyItMatters 'If the certificate expires before it is replaced, users of the federated domain cannot sign in.' `
+            -RecommendedAction 'Replace the certificate now (automatic renewal through federation metadata where possible) and test sign-in before the expiry date' `
+            -DocumentationUrl $certGuideDoc -SourceFile $src -ResultRows $expiring30 -RuleId 'federation-signing-cert-expiring-30d'
     }
     $expiring90 = @($rows | Where-Object {
         $date = ConvertTo-EAGovDateTime $_.SigningNotAfter
@@ -1890,30 +2351,30 @@ function Invoke-Check-FederationHealth {
     })
     if ($expiring90.Count -gt 0) {
         Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Federation' `
-            -Title ("{0} federation signing certificate(s) expire within 90 days" -f $expiring90.Count) `
+            -Title (Format-EACount $expiring90.Count 'federation signing certificate expires within 90 days' 'federation signing certificates expire within 90 days') `
             -Evidence 'Parsed certificate NotAfter is between 31 and 90 days from the audit time.' `
-            -WhyItMatters 'Federation rollover needs planning, change control, and sign-in testing before the current certificate expires.' `
-            -RecommendedAction 'Schedule rollover, validate the next certificate and metadata endpoint, and monitor the federation update status' `
-            -DocumentationUrl $doc -SourceFile $src -ResultRows $expiring90 -RuleId 'federation-signing-cert-expiring-90d'
+            -WhyItMatters 'Replacing the certificate needs planning and testing; leaving it late risks a sign-in outage for the domain.' `
+            -RecommendedAction 'Schedule the certificate replacement, check that the next certificate and the federation metadata address are ready, and watch that the update goes through' `
+            -DocumentationUrl $certGuideDoc -SourceFile $src -ResultRows $expiring90 -RuleId 'federation-signing-cert-expiring-90d'
     }
 
     $unparsed = @($rows | Where-Object { $_.ConfigRead -eq 'Complete' -and $_.SigningCertificateParsed -ne $true })
     if ($unparsed.Count -gt 0) {
         Add-EAGovFinding -Severity 'High' -CheckId $checkId -Category 'Federation' `
-            -Title ("Signing-certificate validity is unknown for {0} federation configuration(s)" -f $unparsed.Count) `
+            -Title ("Signing certificate could not be read for {0}" -f (Format-EACount $unparsed.Count 'federated domain setting' 'federated domain settings')) `
             -Evidence 'The signingCertificate property was absent or could not be parsed as a base64 DER X.509 certificate. This is not a healthy result.' `
-            -WhyItMatters 'Certificate expiry cannot be monitored when the current signing certificate is missing or malformed.' `
-            -RecommendedAction 'Validate the federation trust and signing certificate at the identity provider and in Entra, then rerun the audit' `
-            -DocumentationUrl $doc -SourceFile $src -ResultRows $unparsed -RuleId 'federation-signing-cert-unreadable' -CoverageGap
+            -WhyItMatters 'Without a readable certificate the audit cannot warn you before it expires, and an expired certificate stops users of that domain from signing in.' `
+            -RecommendedAction 'Check the federation trust and the token-signing certificate at the identity provider and in Microsoft Entra, then run the audit again' `
+            -DocumentationUrl $certGuideDoc -SourceFile $src -ResultRows $unparsed -RuleId 'federation-signing-cert-unreadable' -CoverageGap
     }
 
     $multipleConfigs = @($rows | Where-Object { $_.ConfigCount -gt 1 })
     if ($multipleConfigs.Count -gt 0) {
         Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Federation' `
-            -Title 'A federated domain returned multiple federation configurations' `
+            -Title 'A federated domain has more than one set of federation settings' `
             -Evidence 'The documented API normally returns one configuration per domain; multiple records require validation.' `
-            -WhyItMatters 'Unexpected duplicate trust data can make issuer, endpoint, and certificate assurance ambiguous.' `
-            -RecommendedAction 'Validate the domain federation state with Microsoft support or the approved federation tooling before changing it' `
+            -WhyItMatters 'Duplicate settings make it unclear which certificate and sign-in address are really used, so problems are easy to miss.' `
+            -RecommendedAction 'Check the federation settings of the listed domains with the team that runs the identity provider (or with Microsoft support) before changing anything' `
             -DocumentationUrl $doc -SourceFile $src -ResultRows $multipleConfigs -RuleId 'federation-multiple-configs'
     }
 
@@ -1923,11 +2384,11 @@ function Invoke-Check-FederationHealth {
     })
     if ($manualRolloverRisk.Count -gt 0) {
         Add-EAGovFinding -Severity 'High' -CheckId $checkId -Category 'Federation' `
-            -Title ("{0} federation trust(s) near certificate expiry have no metadata exchange URI" -f $manualRolloverRisk.Count) `
+            -Title ((Format-EACount $manualRolloverRisk.Count 'expiring federation certificate' 'expiring federation certificates') + ' cannot be renewed automatically') `
             -Evidence 'MetadataExchangeUri is empty and the current signing certificate expires within 90 days.' `
-            -WhyItMatters 'Without a working metadata exchange endpoint, certificate rollover is more likely to require a manual, outage-prone trust update.' `
-            -RecommendedAction 'Establish and validate metadata-based rollover or complete a controlled manual rollover well before expiry' `
-            -DocumentationUrl $doc -SourceFile $src -ResultRows $manualRolloverRisk -RuleId 'federation-no-metadata-near-expiry'
+            -WhyItMatters 'Without a federation metadata address, Microsoft Entra cannot pick up the new certificate by itself, so someone must update it by hand before expiry or sign-in stops.' `
+            -RecommendedAction 'Set up automatic renewal through federation metadata, or plan a manual certificate update well before the expiry date' `
+            -DocumentationUrl $certGuideDoc -SourceFile $src -ResultRows $manualRolloverRisk -RuleId 'federation-no-metadata-near-expiry'
     }
 
     # federatedIdpMfaBehavior supersedes SupportsMfa. Microsoft explicitly
@@ -1939,65 +2400,81 @@ function Invoke-Check-FederationHealth {
     })
     if ($unsignedSaml.Count -gt 0) {
         Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Federation' `
-            -Title ("{0} SAML federation trust(s) do not require signed authentication requests" -f $unsignedSaml.Count) `
+            -Title ((Format-EACount $unsignedSaml.Count 'SAML federation does not' 'SAML federations do not') + ' require signed sign-in requests') `
             -Evidence 'The preferred protocol is SAML and isSignedAuthenticationRequestRequired=false.' `
-            -WhyItMatters 'Signed authentication requests provide stronger request integrity when the federated identity provider supports and validates them.' `
-            -RecommendedAction 'Confirm IdP support and require signed authentication requests where compatible; document any interoperability exception' `
+            -WhyItMatters 'Signed requests let the identity provider check that a sign-in request really came from Microsoft Entra. For these Security Assertion Markup Language (SAML) federations that check is off; this is a hardening step rather than an urgent gap.' `
+            -RecommendedAction 'Check whether your identity provider supports signed requests, require them where it does, and record any exception' `
             -DocumentationUrl $doc -SourceFile $src -ResultRows $unsignedSaml -RuleId 'federation-unsigned-saml-requests'
     }
 
     # Hybrid synchronization health affects federation recovery and identity
     # continuity even though it is stored outside the domain-federation object.
     $syncDoc = 'https://learn.microsoft.com/graph/api/resources/onpremisesdirectorysynchronization?view=graph-rest-1.0'
+    $syncSchedulerDoc = 'https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/how-to-connect-sync-feature-scheduler'
+    $deleteProtectionDoc = 'https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/how-to-connect-sync-feature-prevent-accidental-deletes'
     $orgResult = Invoke-EAGovGraphCollection -Uri 'https://graph.microsoft.com/v1.0/organization?$select=id,onPremisesSyncEnabled,onPremisesLastSyncDateTime'
     if (-not $orgResult.Success -or $orgResult.Truncated) {
         $reason = if ($orgResult.Success) { 'organization pagination limit reached' } else { [string]$orgResult.Error.Exception.Message }
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Federation' -DataSource 'Hybrid directory synchronization status' `
-            -Reason $reason -RequiredScope 'Organization.Read.All' -DocumentationUrl $syncDoc -SourceFile $src
+            -Reason $reason -RequiredScope 'Organization.Read.All' -DocumentationUrl $syncDoc -SourceFile $src `
+            -Subject 'the directory sync status' `
+            -Impact 'Whether sync from on-premises Active Directory is running, and its protection against mass deletion, were not checked.'
     } else {
         $hybridOrg = @($orgResult.Rows | Where-Object { (Get-EAGovProperty $_ 'onPremisesSyncEnabled') -eq $true } | Select-Object -First 1)
         if ($hybridOrg.Count -gt 0) {
             $lastSync = ConvertTo-EAGovDateTime (Get-EAGovProperty $hybridOrg[0] 'onPremisesLastSyncDateTime')
             if (-not $lastSync) {
                 Add-EAGovCoverageFinding -CheckId $checkId -Category 'Federation' -DataSource 'Last on-premises directory synchronization time' `
-                    -Reason 'onPremisesSyncEnabled=true but onPremisesLastSyncDateTime is absent or invalid.' `
-                    -RequiredScope 'Organization.Read.All' -DocumentationUrl $syncDoc -SourceFile $src
+                    -Reason "onPremisesSyncEnabled=true but onPremisesLastSyncDateTime is absent or invalid. Related: the 'Directory-Sync / PHS Health' check (tenanthealth) reports the same gap as rule tenanthealth-last-sync-unknown." `
+                    -RequiredScope 'Organization.Read.All' -DocumentationUrl $syncDoc -SourceFile $src `
+                    -Subject 'the time of the last directory sync' `
+                    -Impact 'Whether changes made in on-premises Active Directory, such as disabled leavers, still reach the cloud was not checked.' `
+                    -RecommendedAction 'Check the last sync time in Entra admin center > Entra ID > Entra Connect'
             } elseif ($lastSync -lt $now.AddHours(-24)) {
                 Add-EAGovFinding -Severity 'High' -CheckId $checkId -Category 'Federation' `
-                    -Title 'On-premises directory synchronization is older than 24 hours' `
-                    -Evidence ("Last tenant sync={0:u}; age hours={1}." -f $lastSync,[math]::Round(($now - $lastSync).TotalHours,1)) `
-                    -WhyItMatters 'Stale synchronization delays account disablement, credential changes, group membership updates, and hybrid incident response.' `
-                    -RecommendedAction 'Investigate Microsoft Entra Connect or Cloud Sync service/agent health, connector errors, staging state, and export backlog' `
-                    -DocumentationUrl $syncDoc -SourceFile $src -RuleId 'hybrid-directory-sync-stale'
+                    -Title 'Directory sync from on-premises Active Directory has been stopped for over 24 hours' `
+                    -Evidence ("Last tenant sync={0:u}; age hours={1}. Related: the 'Directory-Sync / PHS Health' check (tenanthealth) flags the same sync age from 3 hours on (rule tenanthealth-sync-stale); this finding marks an outage of more than a day. One fix resolves both." -f $lastSync,[math]::Round(($now - $lastSync).TotalHours,1)) `
+                    -WhyItMatters 'While sync is stopped, accounts disabled in on-premises Active Directory (AD) stay active in the cloud, and password and group changes do not arrive, so leavers can keep signing in to Microsoft 365.' `
+                    -RecommendedAction 'Check the Microsoft Entra Connect server or Cloud Sync agents, fix the errors they report, and confirm sync runs again (Entra admin center > Entra ID > Entra Connect)' `
+                    -DocumentationUrl $syncSchedulerDoc -SourceFile $src -RuleId 'hybrid-directory-sync-stale'
             }
 
-            $syncResult = Invoke-EAGovGraphObject -Uri 'https://graph.microsoft.com/v1.0/directory/onPremisesSynchronization'
-            if (-not $syncResult.Success) {
+            $syncResult = Get-EAGovOnPremisesSyncObject
+            $syncAccess = Get-EAGovOnPremSyncAccess
+            $deletionThresholdAction = 'check the deletion threshold on the Microsoft Entra Connect server (Get-ADSyncExportDeletionThreshold) or in the Cloud Sync configuration'
+            if (-not $syncResult.Success -or $null -eq $syncResult.Object) {
+                $syncReason = if ($syncResult.Success) { 'Graph returned no on-premises synchronization object.' } else { [string]$syncResult.Error.Exception.Message }
                 Add-EAGovCoverageFinding -CheckId $checkId -Category 'Federation' -DataSource 'On-premises synchronization safeguards' `
-                    -Reason ([string]$syncResult.Error.Exception.Message) -RequiredScope 'OnPremDirectorySynchronization.Read.All' `
-                    -DocumentationUrl $syncDoc -SourceFile $src
+                    -Reason ($syncReason + $syncAccess.Note) -RequiredScope $syncAccess.Scope `
+                    -DocumentationUrl $syncDoc -SourceFile $src -Subject 'the directory sync safety settings' `
+                    -Impact 'Whether sync is protected against deleting many accounts at once was not checked.' `
+                    -RecommendedAction ("Run the audit signed in as a Global Administrator with OnPremDirectorySynchronization.Read.All (app-only sign-in is not supported for this setting), or {0}" -f $deletionThresholdAction)
             } else {
-                $prevention = Get-EAGovProperty (Get-EAGovProperty $syncResult.Value 'configuration') 'accidentalDeletionPrevention'
+                $syncObject = $syncResult.Object
+                $prevention = Get-EAGovProperty (Get-EAGovProperty $syncObject 'configuration') 'accidentalDeletionPrevention'
                 $preventionType = [string](Get-EAGovProperty $prevention 'synchronizationPreventionType')
                 $threshold = Get-EAGovProperty $prevention 'alertThreshold'
                 $syncRows = @([pscustomobject]@{
                     OnPremisesLastSyncDateTime=$lastSync
+                    SyncObjectsReturned=$syncResult.Count
                     AccidentalDeletionPrevention=$preventionType
                     AccidentalDeletionAlertThreshold=$threshold
-                    Features=ConvertTo-EAGovCompactJson (Get-EAGovProperty $syncResult.Value 'features')
+                    Features=ConvertTo-EAGovCompactJson (Get-EAGovProperty $syncObject 'features')
                 })
                 $syncSrc = Write-Evidence -BaseName 'federation_hybrid_sync_health' -Rows $syncRows -Title 'Hybrid Directory Synchronization Health and Safeguards'
                 if ([string]::IsNullOrWhiteSpace($preventionType)) {
                     Add-EAGovCoverageFinding -CheckId $checkId -Category 'Federation' -DataSource 'Accidental deletion prevention state' `
-                        -Reason 'synchronizationPreventionType was absent.' -RequiredScope 'OnPremDirectorySynchronization.Read.All' `
-                        -DocumentationUrl $syncDoc -SourceFile $syncSrc
+                        -Reason 'the sync settings were read, but configuration.accidentalDeletionPrevention.synchronizationPreventionType was absent.' -RequiredScope $syncAccess.Scope `
+                        -DocumentationUrl $syncDoc -SourceFile $syncSrc -Subject 'the accidental-deletion protection setting' `
+                        -Impact 'Whether sync is protected against deleting many accounts at once was not checked.' `
+                        -RecommendedAction 'Check the deletion threshold on the Microsoft Entra Connect server (Get-ADSyncExportDeletionThreshold) or in the Cloud Sync configuration'
                 } elseif ($preventionType -match '^(disabled|unknownFutureValue)$') {
                     Add-EAGovFinding -Severity 'High' -CheckId $checkId -Category 'Federation' `
-                        -Title 'Accidental deletion prevention is not enabled for directory synchronization' `
+                        -Title 'Directory sync has no protection against deleting many accounts at once' `
                         -Evidence ("synchronizationPreventionType={0}; alertThreshold={1}." -f $preventionType,$threshold) `
-                        -WhyItMatters 'A bad scoping or source-directory change can otherwise export a large deletion set to Microsoft Entra ID without a configured stop threshold.' `
-                        -RecommendedAction 'Enable count- or percentage-based accidental deletion prevention and test the operational alert/unblock process' `
-                        -DocumentationUrl $syncDoc -SourceFile $syncSrc -RuleId 'hybrid-sync-accidental-delete-protection-disabled'
+                        -WhyItMatters 'One wrong filter or mistake in on-premises Active Directory (AD) could delete many cloud accounts in a single sync run, cutting people off from email, files and apps.' `
+                        -RecommendedAction 'Turn on accidental-deletion prevention with a threshold (the Microsoft Entra Connect default is 500 objects, set with Enable-ADSyncExportDeletionThreshold) and test the alert and unblock process' `
+                        -DocumentationUrl $deleteProtectionDoc -SourceFile $syncSrc -RuleId 'hybrid-sync-accidental-delete-protection-disabled'
                 }
             }
         }
@@ -2005,17 +2482,17 @@ function Invoke-Check-FederationHealth {
 
     if ($federatedDomains.Count -eq 0 -and -not $domainResult.Truncated) {
         Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Federation' `
-            -Title 'No federated domains are configured' `
-            -Evidence ("{0} domain(s) were read; all use managed or another non-federated authentication type." -f @($domainResult.Rows).Count) `
-            -WhyItMatters 'With no federated domains, external federation signing-certificate and IdP endpoint risks are not applicable.' `
-            -RecommendedAction 'Continue monitoring domain authentication-type changes and protect domain/federation administration roles' `
+            -Title 'No federated domains: Microsoft Entra handles sign-in for every domain' `
+            -Evidence ((Format-EACount @($domainResult.Rows).Count 'domain was' 'domains were') + ' read; all use managed or another non-federated authentication type.') `
+            -WhyItMatters 'Risks from an outside identity provider, such as an expired signing certificate, do not apply to this tenant.' `
+            -RecommendedAction 'Keep an eye out for domains being switched to federated sign-in, and limit who holds the roles that can do it' `
             -DocumentationUrl $domainDoc -SourceFile $src -ResultRows $rows.ToArray() -RuleId 'federation-none'
     } else {
         Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Federation' `
-            -Title 'Federation configuration inventory captured' `
+            -Title ("Federation settings recorded for {0}" -f (Format-EACount $federatedDomains.Count 'federated domain' 'federated domains')) `
             -Evidence ("Federated domains={0}; configuration read failures={1}; certificate metadata is exported without certificate bodies." -f $federatedDomains.Count,$configErrors.Count) `
-            -WhyItMatters 'Issuer, endpoint, certificate, protocol, and MFA-claim settings collectively determine federation availability and trust behavior.' `
-            -RecommendedAction 'Monitor certificate rollover and restrict/alert on federation configuration changes' `
+            -WhyItMatters "Federated sign-in depends on the outside identity provider's certificate, addresses and settings; this record is the baseline for spotting changes." `
+            -RecommendedAction 'Watch certificate renewal dates and set up alerts for changes to federation settings' `
             -DocumentationUrl $doc -SourceFile $src -ResultRows $rows.ToArray() -RuleId 'federation-inventory'
     }
 }
@@ -2030,6 +2507,15 @@ function Invoke-Check-IdentityGovernance {
     $agreementDoc = 'https://learn.microsoft.com/graph/api/termsofusecontainer-list-agreements?view=graph-rest-1.0'
     $pimDoc = 'https://learn.microsoft.com/graph/api/privilegedaccessgroup-list-eligibilityscheduleinstances?view=graph-rest-1.0'
     $pimPolicyDoc = 'https://learn.microsoft.com/graph/api/policyroot-list-rolemanagementpolicyassignments?view=graph-rest-1.0'
+    $requestPolicyDoc = 'https://learn.microsoft.com/en-us/entra/id-governance/entitlement-management-access-package-request-policy'
+    $packageLifecycleDoc = 'https://learn.microsoft.com/en-us/entra/id-governance/entitlement-management-access-package-lifecycle-policy'
+    $workflowGuideDoc = 'https://learn.microsoft.com/en-us/entra/id-governance/manage-workflow-properties'
+    $workflowOverviewDoc = 'https://learn.microsoft.com/en-us/entra/id-governance/what-are-lifecycle-workflows'
+    $termsGuideDoc = 'https://learn.microsoft.com/en-us/entra/identity/conditional-access/terms-of-use'
+    $pimGroupSettingsDoc = 'https://learn.microsoft.com/en-us/entra/id-governance/privileged-identity-management/groups-role-settings'
+    $pimGroupAssignDoc = 'https://learn.microsoft.com/en-us/entra/id-governance/privileged-identity-management/groups-assign-member-owner'
+    $packagesPath = 'Entra admin center > ID Governance > Entitlement management > Access packages'
+    $pimGroupsPath = 'Entra admin center > ID Governance > Privileged Identity Management > Groups'
 
     # ------------------------- Entitlement Management -------------------------
     $catalogResult = Invoke-EAGovGraphCollection -Uri 'https://graph.microsoft.com/v1.0/identityGovernance/entitlementManagement/catalogs?$select=id,displayName,description,catalogType,state,isExternallyVisible,createdDateTime,modifiedDateTime&$top=999'
@@ -2113,18 +2599,20 @@ function Invoke-Check-IdentityGovernance {
     $packageSrc = Write-Evidence -BaseName 'governance_access_packages' -Rows $packageRows -Title 'Entitlement Management - Access Packages'
 
     foreach ($entry in @(
-        @{ Result=$catalogResult; Name='Access package catalogs'; File=$catalogSrc },
-        @{ Result=$packageResult; Name='Access packages'; File=$packageSrc },
-        @{ Result=$policyResult; Name='Access package assignment policies'; File=$policySrc }
+        @{ Result=$catalogResult; Name='Access package catalogs'; File=$catalogSrc; Subject='the access package catalogs' },
+        @{ Result=$packageResult; Name='Access packages'; File=$packageSrc; Subject='the list of access packages' },
+        @{ Result=$policyResult; Name='Access package assignment policies'; File=$policySrc; Subject='the access package request policies' }
     )) {
         if (-not $entry.Result.Success) {
             Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource $entry.Name `
                 -Reason ([string]$entry.Result.Error.Exception.Message) -RequiredScope 'EntitlementManagement.Read.All' `
-                -DocumentationUrl $entitlementDoc -SourceFile $entry.File
+                -DocumentationUrl $entitlementDoc -SourceFile $entry.File -Subject $entry.Subject `
+                -Impact 'Access packages that grant access too easily or for too long may be missing from this report.'
         } elseif ($entry.Result.Truncated) {
             Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource ($entry.Name + ' pagination') `
                 -Reason "pagination exceeded $($entry.Result.Pages) pages." -RequiredScope 'EntitlementManagement.Read.All' `
-                -DocumentationUrl $entitlementDoc -SourceFile $entry.File
+                -DocumentationUrl $entitlementDoc -SourceFile $entry.File -Partial -Subject $entry.Subject `
+                -Impact 'Access packages beyond the part that was read were not checked.'
         }
     }
 
@@ -2137,21 +2625,21 @@ function Invoke-Check-IdentityGovernance {
             $external = @($broadNoApproval | Where-Object { [string]$_.AllowedTargetScope -match '(?i)(external|connectedorganization)' })
             $severity = if ($external.Count -gt 0) { 'High' } else { 'Medium' }
             Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'Identity Governance' `
-                -Title ("{0} broad access-package request policy/policies do not require approval" -f $broadNoApproval.Count) `
-                -Evidence ("Self-service add is accepted for a broad target scope without add approval; {0} policy/policies include external/connected-organization targets." -f $external.Count) `
-                -WhyItMatters 'Broad self-service assignment without approval can grant governed resources without a resource owner or sponsor validating business need.' `
-                -RecommendedAction 'Require appropriate approval for broad requestor scopes, use least-privilege packages, and test reviewer/fallback reviewer resolution' `
-                -DocumentationUrl $entitlementDoc -SourceFile $policySrc -ResultRows $broadNoApproval -RuleId 'access-package-broad-no-approval'
+                -Title ((Format-EACount $broadNoApproval.Count 'access package policy lets' 'access package policies let') + ' a broad audience get access without approval') `
+                -Evidence ("Self-service add is accepted for a broad target scope without add approval; {0} external/connected-organization targets." -f (Format-EACount $external.Count 'policy includes' 'policies include')) `
+                -WhyItMatters "Large groups of users, and in some cases outside users, can give themselves access to the package's groups, apps and sites without anyone checking the business need." `
+                -RecommendedAction ("Require approval in each listed policy ({0} > [package] > Policies), and keep packages small so each gives only what one role needs" -f $packagesPath) `
+                -DocumentationUrl $requestPolicyDoc -SourceFile $policySrc -ResultRows $broadNoApproval -RuleId 'access-package-broad-no-approval'
         }
 
         $noExpiration = @($policyRows | Where-Object { [string]$_.ExpirationType -ieq 'noExpiration' })
         if ($noExpiration.Count -gt 0) {
             Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Identity Governance' `
-                -Title ("{0} access-package assignment policy/policies allow no-expiration access" -f $noExpiration.Count) `
+                -Title (Format-EACount $noExpiration.Count 'access package policy gives access that never expires' 'access package policies give access that never expires') `
                 -Evidence 'Expiration.Type=noExpiration. Access reviews can be compensating evidence but do not make indefinite assignment automatically low risk.' `
-                -WhyItMatters 'Indefinite assignments can survive job, project, sponsor, and partner lifecycle changes.' `
-                -RecommendedAction 'Use time-bound assignments appropriate to the business process, with renewal approval and recurring access review where needed' `
-                -DocumentationUrl $entitlementDoc -SourceFile $policySrc -ResultRows $noExpiration -RuleId 'access-package-no-expiration'
+                -WhyItMatters 'Access that never expires stays after people change jobs or projects end, unless someone removes it by hand.' `
+                -RecommendedAction ("Set an expiry (for example 180 or 365 days, renewable on request) in the Lifecycle settings of each listed policy ({0})" -f $packagesPath) `
+                -DocumentationUrl $packageLifecycleDoc -SourceFile $policySrc -ResultRows $noExpiration -RuleId 'access-package-no-expiration'
         }
 
         $externalNoReview = @($policyRows | Where-Object {
@@ -2159,11 +2647,11 @@ function Invoke-Check-IdentityGovernance {
         })
         if ($externalNoReview.Count -gt 0) {
             Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Identity Governance' `
-                -Title ("{0} external access-package policy/policies have no embedded access review" -f $externalNoReview.Count) `
+                -Title (Format-EACount $externalNoReview.Count 'access package policy for external users has no access review' 'access package policies for external users have no access review') `
                 -Evidence 'The target scope includes external/connected-organization users and reviewSettings.isEnabled is not true.' `
-                -WhyItMatters 'External assignments need periodic recertification because partner employment and sponsor relationships change outside the tenant.' `
-                -RecommendedAction 'Add recurring review with sponsor/resource-owner reviewers, fallback reviewers, and automatic application or a monitored manual process' `
-                -DocumentationUrl $entitlementDoc -SourceFile $policySrc -ResultRows $externalNoReview -RuleId 'access-package-external-no-review'
+                -WhyItMatters "External users' jobs and contracts change outside your view, so without a regular review they keep access after they no longer need it." `
+                -RecommendedAction 'Turn on access reviews in the Lifecycle settings of each listed policy, with sponsors or resource owners as reviewers and a fallback reviewer' `
+                -DocumentationUrl $packageLifecycleDoc -SourceFile $policySrc -ResultRows $externalNoReview -RuleId 'access-package-external-no-review'
         }
 
 
@@ -2172,11 +2660,11 @@ function Invoke-Check-IdentityGovernance {
         })
         if ($reviewKeepsAccess.Count -gt 0) {
             Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Identity Governance' `
-                -Title ("{0} access-package review policy/policies keep access when a review is unanswered" -f $reviewKeepsAccess.Count) `
+                -Title ((Format-EACount $reviewKeepsAccess.Count 'access package review keeps' 'access package reviews keep') + ' access when reviewers do not answer') `
                 -Evidence 'reviewSettings.isEnabled=true and expirationBehavior=keepAccess.' `
-                -WhyItMatters 'An unanswered review preserves access, weakening removal when reviewers or sponsors are unavailable.' `
-                -RecommendedAction 'Use removeAccess or an appropriate recommendation behavior, and configure accountable primary and fallback reviewers' `
-                -DocumentationUrl $entitlementDoc -SourceFile $policySrc -ResultRows $reviewKeepsAccess -RuleId 'access-package-review-keeps-access'
+                -WhyItMatters 'If the reviewer does not respond, the access stays, so the review cannot remove access that nobody vouches for.' `
+                -RecommendedAction 'Set these reviews to remove access (or take recommendations) when reviewers do not respond, and name backup reviewers' `
+                -DocumentationUrl $packageLifecycleDoc -SourceFile $policySrc -ResultRows $reviewKeepsAccess -RuleId 'access-package-review-keeps-access'
         }
 
         $reviewNoFallback = @($policyRows | Where-Object {
@@ -2184,11 +2672,11 @@ function Invoke-Check-IdentityGovernance {
         })
         if ($reviewNoFallback.Count -gt 0) {
             Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Identity Governance' `
-                -Title ("{0} access-package review policy/policies have no fallback reviewer" -f $reviewNoFallback.Count) `
+                -Title (Format-EACount $reviewNoFallback.Count 'access package review has no backup reviewer' 'access package reviews have no backup reviewer') `
                 -Evidence 'Access reviews are enabled and primary reviewers exist, but fallbackReviewers is empty.' `
-                -WhyItMatters 'Reviews can stall or default when every primary reviewer is unavailable or no longer resolves.' `
-                -RecommendedAction 'Configure a governed fallback reviewer population and test reviewer resolution' `
-                -DocumentationUrl $entitlementDoc -SourceFile $policySrc -ResultRows $reviewNoFallback -RuleId 'access-package-review-no-fallback'
+                -WhyItMatters 'If the main reviewer has left or is away, the review stalls and access is kept or removed without a real decision.' `
+                -RecommendedAction 'Add a fallback reviewer to the access review settings of each listed policy' `
+                -DocumentationUrl $packageLifecycleDoc -SourceFile $policySrc -ResultRows $reviewNoFallback -RuleId 'access-package-review-no-fallback'
         }
     }
 
@@ -2196,11 +2684,11 @@ function Invoke-Check-IdentityGovernance {
         $packagesWithoutPolicies = @($packageRows | Where-Object { $_.AssignmentPolicyCount -eq 0 })
         if ($packagesWithoutPolicies.Count -gt 0) {
             Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Identity Governance' `
-                -Title ("{0} access package(s) have no assignment policy" -f $packagesWithoutPolicies.Count) `
+                -Title (Format-EACount $packagesWithoutPolicies.Count 'access package has no policy, so nobody can request it' 'access packages have no policy, so nobody can request them') `
                 -Evidence 'The packages exist but have no returned assignment policy. They are not assumed to grant access.' `
-                -WhyItMatters 'Unused packages add governance inventory and can indicate abandoned design work, but do not by themselves create assignments.' `
-                -RecommendedAction 'Confirm whether each package is intentionally staged; retire obsolete packages through normal change control' `
-                -DocumentationUrl $entitlementDoc -SourceFile $packageSrc -ResultRows $packagesWithoutPolicies -RuleId 'access-packages-no-policy'
+                -WhyItMatters 'These packages give nobody new access today; they may be unfinished or abandoned, and they clutter the list people choose from.' `
+                -RecommendedAction 'Confirm whether each package is still being built, and delete the ones that are no longer needed' `
+                -DocumentationUrl $requestPolicyDoc -SourceFile $packageSrc -ResultRows $packagesWithoutPolicies -RuleId 'access-packages-no-policy'
         }
     }
 
@@ -2245,18 +2733,20 @@ function Invoke-Check-IdentityGovernance {
     if (-not $workflowResult.Success) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Lifecycle workflows' `
             -Reason ([string]$workflowResult.Error.Exception.Message) -RequiredScope 'LifecycleWorkflows.Read.All' `
-            -DocumentationUrl $workflowDoc -SourceFile $workflowSrc
+            -DocumentationUrl $workflowDoc -SourceFile $workflowSrc -Subject 'the lifecycle workflows' `
+            -Impact 'Whether the workflow that removes access for leavers is running was not checked.'
     } elseif ($workflowResult.Truncated) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Lifecycle workflow pagination' `
             -Reason "pagination exceeded $($workflowResult.Pages) pages." -RequiredScope 'LifecycleWorkflows.Read.All' `
-            -DocumentationUrl $workflowDoc -SourceFile $workflowSrc
+            -DocumentationUrl $workflowDoc -SourceFile $workflowSrc -Partial -Subject 'the lifecycle workflows' `
+            -Impact 'Workflows beyond the part that was read were not checked.'
     } elseif ($workflowRows.Count -eq 0) {
         Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Identity Governance' `
-            -Title 'No Lifecycle Workflows are configured' `
+            -Title 'No lifecycle workflows are set up' `
             -Evidence 'The workflow API returned zero records. Feature absence is context, not automatically a control failure.' `
-            -WhyItMatters 'Lifecycle Workflows can automate joiner, mover, and leaver tasks, but organizations may use another governed identity lifecycle system.' `
-            -RecommendedAction 'Document the authoritative joiner/mover/leaver process and consider Lifecycle Workflows where it improves timely deprovisioning' `
-            -DocumentationUrl $workflowDoc -SourceFile $workflowSrc -RuleId 'lifecycle-workflows-none'
+            -WhyItMatters 'Lifecycle workflows can automate joiner, mover and leaver tasks, such as removing access when someone leaves. You may already do this in another system, for example an HR-driven process.' `
+            -RecommendedAction 'Document how leavers lose their access today, and consider lifecycle workflows if that process is slow or manual' `
+            -DocumentationUrl $workflowOverviewDoc -SourceFile $workflowSrc -RuleId 'lifecycle-workflows-none'
     } else {
         # Scheduled workflows must be enabled and scheduled; on-demand workflows can never
         # be scheduled, so they are judged on IsEnabled only. An unknown trigger type
@@ -2265,37 +2755,40 @@ function Invoke-Check-IdentityGovernance {
         $unknownTriggerNote = {
             param($flagged)
             $count = @($flagged | Where-Object { $_.IsEnabled -eq $true -and $null -eq $_.IsOnDemand }).Count
-            if ($count -gt 0) { " For {0} of them the trigger type (scheduled or on-demand) could not be read, so they were treated as scheduled." -f $count } else { '' }
+            if ($count -gt 0) { " For {0} of them the trigger type (scheduled or on-demand) could not be read, so {1} treated as scheduled." -f $count,$(if ($count -eq 1) { 'it was' } else { 'they were' }) } else { '' }
         }
         $disabledLeavers = @($workflowRows | Where-Object {
             [string]$_.Category -ieq 'leaver' -and (& $inactiveWorkflow $_)
         })
         if ($disabledLeavers.Count -gt 0) {
             Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Identity Governance' `
-                -Title ("{0} configured leaver workflow(s) are disabled or not scheduled" -f $disabledLeavers.Count) `
+                -Title ((Format-EACount $disabledLeavers.Count 'leaver workflow is' 'leaver workflows are') + ' turned off or not scheduled') `
                 -Evidence ('The workflow category is leaver, but it is disabled, or it is a scheduled workflow whose scheduling is turned off. On-demand workflows (such as real-time termination) are checked for IsEnabled only.' + (& $unknownTriggerNote $disabledLeavers)) `
-                -WhyItMatters 'A configured but inactive leaver workflow can create false assurance while terminated-user cleanup tasks do not run.' `
-                -RecommendedAction 'Validate execution conditions and task ownership, enable scheduling, and test the complete leaver path with a controlled account' `
-                -DocumentationUrl $workflowDoc -SourceFile $workflowSrc -ResultRows $disabledLeavers -RuleId 'leaver-workflow-disabled'
+                -WhyItMatters 'The workflow meant to remove access when someone leaves is not running, so leavers may keep access while everyone assumes it is handled.' `
+                -RecommendedAction 'Open each listed workflow in Entra admin center > ID Governance > Lifecycle workflows > Workflows, turn it on (and turn on its schedule if it is a scheduled workflow), and test it with a test account' `
+                -DocumentationUrl $workflowGuideDoc -SourceFile $workflowSrc -ResultRows $disabledLeavers -RuleId 'leaver-workflow-disabled'
         }
         $otherDisabled = @($workflowRows | Where-Object {
             [string]$_.Category -ine 'leaver' -and (& $inactiveWorkflow $_)
         })
         if ($otherDisabled.Count -gt 0) {
             Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Identity Governance' `
-                -Title ("{0} lifecycle workflow(s) are disabled or not scheduled" -f $otherDisabled.Count) `
+                -Title ((Format-EACount $otherDisabled.Count 'lifecycle workflow is' 'lifecycle workflows are') + ' turned off or not scheduled') `
                 -Evidence ('These workflows are disabled, or are scheduled workflows whose scheduling is turned off. On-demand workflows are checked for IsEnabled only.' + (& $unknownTriggerNote $otherDisabled)) `
-                -WhyItMatters 'Disabled workflows can be intentional drafts, but stale workflow definitions create operational ambiguity.' `
-                -RecommendedAction 'Document staged workflows and retire obsolete definitions; enable and test workflows intended for production' `
-                -DocumentationUrl $workflowDoc -SourceFile $workflowSrc -ResultRows $otherDisabled -RuleId 'lifecycle-workflow-disabled'
+                -WhyItMatters 'Switched-off workflows can be drafts, but old ones make it unclear which automation is really running.' `
+                -RecommendedAction 'Turn on and test the workflows that are meant to be in use, and delete the ones that are no longer needed' `
+                -DocumentationUrl $workflowGuideDoc -SourceFile $workflowSrc -ResultRows $otherDisabled -RuleId 'lifecycle-workflow-disabled'
         }
     }
     if ($workflowConditionErrors.Count -gt 0) {
         $workflowConditionSrc = Write-Evidence -BaseName 'governance_lifecycle_workflow_condition_errors' -Rows $workflowConditionErrors.ToArray() `
             -Title 'Identity Governance - Lifecycle Workflow Trigger Type Gaps'
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Lifecycle workflow execution conditions' `
-            -Reason ("the trigger type (scheduled or on-demand) of {0} enabled workflow(s) with scheduling turned off could not be read, so they were treated as scheduled workflows." -f $workflowConditionErrors.Count) `
-            -RequiredScope 'LifecycleWorkflows.Read.All' -DocumentationUrl $workflowDoc -SourceFile $workflowConditionSrc
+            -Reason ("the trigger type (scheduled or on-demand) of {0}." -f (Format-EACount $workflowConditionErrors.Count 'enabled workflow with scheduling turned off could not be read, so it was treated as a scheduled workflow' 'enabled workflows with scheduling turned off could not be read, so they were treated as scheduled workflows')) `
+            -RequiredScope 'LifecycleWorkflows.Read.All' -DocumentationUrl $workflowDoc -SourceFile $workflowConditionSrc `
+            -Subject 'the trigger type of some lifecycle workflows' `
+            -Impact 'These workflows were judged as scheduled ones, so an on-demand workflow may be reported as not scheduled by mistake.' `
+            -RecommendedAction 'Open the listed workflows in Entra admin center > ID Governance > Lifecycle workflows > Workflows and check whether they run on a schedule or on demand'
     }
 
     # ------------------------- Terms of Use -------------------------
@@ -2317,37 +2810,41 @@ function Invoke-Check-IdentityGovernance {
     if (-not $agreementResult.Success) {
         $appOnlyNote = if ([string]$script:AuthType -eq 'AppOnly') { ' The list-agreements API may not support application access in the current Graph cloud/version.' } else { '' }
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Terms of Use agreements' `
-            -Reason (([string]$agreementResult.Error.Exception.Message) + $appOnlyNote) -RequiredScope 'Agreement.Read.All (delegated) and a supported reader role' `
-            -DocumentationUrl $agreementDoc -SourceFile $agreementSrc
+            -Reason (([string]$agreementResult.Error.Exception.Message) + $appOnlyNote) `
+            -RequiredScope 'Agreement.Read.All (delegated sign-in with a supported reader role, such as Security Reader or Global Reader)' `
+            -DocumentationUrl $agreementDoc -SourceFile $agreementSrc -Subject 'the terms of use' `
+            -Impact 'Whether terms of use are set up and actually enforced was not checked.' `
+            -RecommendedAction 'Sign in to the audit as a user who has Agreement.Read.All and the Security Reader or Global Reader role (an app-only sign-in cannot list terms of use), then run the audit again; if the evidence shows a different error, such as throttling, simply run it again'
     } elseif ($agreementResult.Truncated) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Terms of Use agreement pagination' `
             -Reason "pagination exceeded $($agreementResult.Pages) pages." -RequiredScope 'Agreement.Read.All' `
-            -DocumentationUrl $agreementDoc -SourceFile $agreementSrc
+            -DocumentationUrl $agreementDoc -SourceFile $agreementSrc -Partial -Subject 'the terms of use' `
+            -Impact 'Terms of use beyond the part that was read were not checked.'
     } elseif ($agreementRows.Count -eq 0) {
         Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Identity Governance' `
-            -Title 'No Terms of Use agreements are configured' `
+            -Title 'No terms of use are set up' `
             -Evidence 'The agreement API returned zero records. Absence is context because not every tenant requires a Terms of Use control.' `
-            -WhyItMatters 'Terms of Use can record explicit acceptance for populations such as guests or regulated-resource users when policy requires it.' `
-            -RecommendedAction 'Document whether legal/compliance policy requires Terms of Use; configure and enforce it through Conditional Access when required' `
-            -DocumentationUrl $agreementDoc -SourceFile $agreementSrc -RuleId 'terms-of-use-none'
+            -WhyItMatters 'Terms of use record that users, for example guests, accepted your rules before they could reach your data. Not every organization needs them.' `
+            -RecommendedAction 'Check whether your legal or compliance rules require terms of use; if they do, create them in Entra admin center > Entra ID > Conditional Access > Terms of use and require them with a Conditional Access policy' `
+            -DocumentationUrl $termsGuideDoc -SourceFile $agreementSrc -RuleId 'terms-of-use-none'
     } else {
         $notViewed = @($agreementRows | Where-Object { $_.IsViewingBeforeAcceptanceRequired -eq $false })
         if ($notViewed.Count -gt 0) {
             Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Identity Governance' `
-                -Title ("{0} Terms of Use agreement(s) do not require viewing before acceptance" -f $notViewed.Count) `
+                -Title (Format-EACount $notViewed.Count 'terms of use document can be accepted without opening it' 'terms of use documents can be accepted without opening them') `
                 -Evidence 'isViewingBeforeAcceptanceRequired=false.' `
-                -WhyItMatters 'Acceptance without opening the agreement weakens evidence that users were presented with the terms.' `
-                -RecommendedAction 'Require viewing before acceptance where legal/compliance requirements support it' `
-                -DocumentationUrl $agreementDoc -SourceFile $agreementSrc -ResultRows $notViewed -RuleId 'terms-not-viewed-before-acceptance'
+                -WhyItMatters 'Users can click Accept without seeing the text, which weakens your proof that they were shown the terms.' `
+                -RecommendedAction "Turn on 'Require users to expand the terms of use' for these terms where your legal rules support it" `
+                -DocumentationUrl $termsGuideDoc -SourceFile $agreementSrc -ResultRows $notViewed -RuleId 'terms-not-viewed-before-acceptance'
         }
         $noReaccept = @($agreementRows | Where-Object { [string]::IsNullOrWhiteSpace([string]$_.UserReacceptRequiredFrequency) })
         if ($noReaccept.Count -gt 0) {
             Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Identity Governance' `
-                -Title ("{0} Terms of Use agreement(s) do not require periodic reacceptance" -f $noReaccept.Count) `
+                -Title (Format-EACount $noReaccept.Count 'terms of use document never asks users to accept it again' 'terms of use documents never ask users to accept them again') `
                 -Evidence 'userReacceptRequiredFrequency is empty.' `
-                -WhyItMatters 'Long-lived access can outlast the user awareness or the policy version originally accepted.' `
-                -RecommendedAction 'Set a risk-appropriate reacceptance frequency when policy requires periodic acknowledgement; document permanent acceptance where intentional' `
-                -DocumentationUrl $agreementDoc -SourceFile $agreementSrc -ResultRows $noReaccept -RuleId 'terms-no-reacceptance'
+                -WhyItMatters 'Users accept once and are never reminded, even years later or after the terms change.' `
+                -RecommendedAction "Set 'Duration before re-acceptance required (days)' (for example 365) where your rules require regular acceptance, or record that one-time acceptance is intended" `
+                -DocumentationUrl $termsGuideDoc -SourceFile $agreementSrc -ResultRows $noReaccept -RuleId 'terms-no-reacceptance'
         }
 
         # A Terms of Use object is only effective when an enabled Conditional Access
@@ -2363,8 +2860,9 @@ function Invoke-Check-IdentityGovernance {
                 # If the grant operator is OR and another grant path exists, a
                 # user can satisfy that other path without accepting the terms.
                 $operator = [string](Get-EAGovProperty $grant 'operator')
-                $otherGrantCount = @(Get-EAGovProperty $grant 'builtInControls').Count +
-                    @(Get-EAGovProperty $grant 'customAuthenticationFactors').Count
+                # Drop nulls: an omitted list must not count as another grant path.
+                $otherGrantCount = @(Get-EAGovProperty $grant 'builtInControls' | Where-Object { $_ }).Count +
+                    @(Get-EAGovProperty $grant 'customAuthenticationFactors' | Where-Object { $_ }).Count
                 if ($null -ne (Get-EAGovProperty $grant 'authenticationStrength')) { $otherGrantCount++ }
                 if ($operator -ieq 'OR' -and $otherGrantCount -gt 0) { continue }
 
@@ -2375,7 +2873,13 @@ function Invoke-Check-IdentityGovernance {
                 $includeUsers = @(Get-EAGovProperty $users 'includeUsers')
                 $includeGroups = @(Get-EAGovProperty $users 'includeGroups')
                 $includeRoles = @(Get-EAGovProperty $users 'includeRoles')
-                $hasIncludedPopulation = $includeUsers.Count -gt 0 -or $includeGroups.Count -gt 0 -or $includeRoles.Count -gt 0
+                # The portal's "Guest or external users" selection (the usual guest terms of
+                # use policy) is a separate inclusion, includeGuestsOrExternalUsers, and
+                # leaves the three lists above empty.
+                $includeGuests = Get-EAGovProperty $users 'includeGuestsOrExternalUsers'
+                $guestTypes = [string](Get-EAGovProperty $includeGuests 'guestOrExternalUserTypes')
+                $hasGuestPopulation = -not [string]::IsNullOrWhiteSpace($guestTypes) -and $guestTypes.Trim() -ine 'none'
+                $hasIncludedPopulation = $includeUsers.Count -gt 0 -or $includeGroups.Count -gt 0 -or $includeRoles.Count -gt 0 -or $hasGuestPopulation
                 if (-not $hasIncludedPopulation) { continue }
                 $excludeUsers = @(Get-EAGovProperty $users 'excludeUsers')
                 if ($includeUsers -contains 'All' -and $excludeUsers -contains 'All' -and $includeGroups.Count -eq 0 -and $includeRoles.Count -eq 0) { continue }
@@ -2385,16 +2889,18 @@ function Invoke-Check-IdentityGovernance {
             $unenforced = @($agreementRows | Where-Object { -not $enforcedIds.Contains([string]$_.Id) })
             if ($unenforced.Count -gt 0) {
                 Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Identity Governance' `
-                    -Title ("{0} Terms of Use agreement(s) are not referenced by enabled Conditional Access" -f $unenforced.Count) `
-                    -Evidence 'No enabled Conditional Access policy grantControls.termsOfUse list contained these agreement IDs.' `
-                    -WhyItMatters 'An agreement object alone does not prompt users or enforce acceptance.' `
-                    -RecommendedAction 'Reference each required agreement from an enabled, correctly scoped Conditional Access policy and validate exclusions' `
-                    -DocumentationUrl $agreementDoc -SourceFile $agreementSrc -ResultRows $unenforced -RuleId 'terms-of-use-not-enforced'
+                    -Title ((Format-EACount $unenforced.Count 'terms of use document is' 'terms of use documents are') + ' not required by any enabled Conditional Access policy') `
+                    -Evidence 'No enabled Conditional Access policy grantControls.termsOfUse list contained these agreement IDs (policies where the terms can be bypassed through another OR grant, or that include no users, are not counted; users, groups, roles and guest or external user types all count as included users).' `
+                    -WhyItMatters 'Users only see terms of use when a Conditional Access policy requires them, so these terms are never actually shown or enforced.' `
+                    -RecommendedAction 'Require each needed terms of use in an enabled Conditional Access policy that covers the right users (Entra admin center > Entra ID > Conditional Access), and check its exclusions' `
+                    -DocumentationUrl $termsGuideDoc -SourceFile $agreementSrc -ResultRows $unenforced -RuleId 'terms-of-use-not-enforced'
             }
         } else {
             $reason = if ($caResult.Success) { 'pagination limit reached' } else { [string]$caResult.Error.Exception.Message }
             Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Terms of Use Conditional Access enforcement' `
-                -Reason $reason -RequiredScope 'Policy.Read.All' -DocumentationUrl $agreementDoc -SourceFile $agreementSrc
+                -Reason $reason -RequiredScope 'Policy.Read.All' -DocumentationUrl $agreementDoc -SourceFile $agreementSrc `
+                -Subject 'the Conditional Access policies that enforce the terms of use' `
+                -Impact 'Whether the terms of use are actually shown to users was not checked.'
         }
     }
 
@@ -2554,18 +3060,21 @@ function Invoke-Check-IdentityGovernance {
     if (-not $roleGroupResult.Success) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Role-assignable groups for PIM coverage' `
             -Reason ([string]$roleGroupResult.Error.Exception.Message) -RequiredScope 'Group.Read.All' `
-            -DocumentationUrl $pimDoc -SourceFile $pimSrc
+            -DocumentationUrl $pimDoc -SourceFile $pimSrc -Subject 'the list of groups that can hold admin roles' `
+            -Impact 'The Privileged Identity Management (PIM) settings of admin-role groups were not checked.'
     } elseif ($roleGroupResult.Truncated) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Role-assignable group pagination for PIM coverage' `
             -Reason "pagination exceeded $($roleGroupResult.Pages) pages." -RequiredScope 'Group.Read.All' `
-            -DocumentationUrl $pimDoc -SourceFile $pimSrc
+            -DocumentationUrl $pimDoc -SourceFile $pimSrc -Partial -Subject 'the list of groups that can hold admin roles' `
+            -Impact 'Admin-role groups beyond the part that was read were not checked.'
     }
     if ($pimErrors.Count -gt 0) {
         $pimErrorSrc = Write-Evidence -BaseName 'governance_pim_for_groups_errors' -Rows $pimErrors.ToArray() -Title 'PIM for Groups Collection Gaps'
         $scopeList = @($pimErrors | ForEach-Object { $_.RequiredScope } | Select-Object -Unique) -join ', '
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'PIM for Groups policy and schedule coverage' `
-            -Reason ("{0} group/data-source read(s) failed or truncated." -f $pimErrors.Count) -RequiredScope $scopeList `
-            -DocumentationUrl $pimPolicyDoc -SourceFile $pimErrorSrc
+            -Reason ((Format-EACount $pimErrors.Count 'group/data-source read' 'group/data-source reads') + ' failed or truncated.') -RequiredScope $scopeList `
+            -DocumentationUrl $pimPolicyDoc -SourceFile $pimErrorSrc -Subject 'the PIM settings and assignments of some admin-role groups' `
+            -Impact 'Permanent or unmanaged admin access through these groups may be missing from this report.'
     }
 
     $standingPrivileged = @($pimRows | Where-Object { $_.AssignmentKnown -and $_.PermanentAssignmentCount -gt 0 })
@@ -2573,11 +3082,11 @@ function Invoke-Check-IdentityGovernance {
         $ownerStanding = @($standingPrivileged | Where-Object { $_.PermanentOwnerCount -gt 0 })
         $severity = if ($ownerStanding.Count -gt 0) { 'High' } else { 'Medium' }
         Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'Identity Governance' `
-            -Title ("{0} role-assignable group(s) have permanent PIM assignment instances" -f $standingPrivileged.Count) `
-            -Evidence ("EndDateTime is absent on one or more assignment instances; {0} group(s) include permanent owner assignments." -f $ownerStanding.Count) `
-            -WhyItMatters 'Permanent membership or ownership in a role-assignable group creates standing privileged access instead of just-in-time activation.' `
-            -RecommendedAction 'Convert standing assignments to eligibility where operationally possible, and require MFA/approval/justification through PIM for Groups policy' `
-            -DocumentationUrl $pimDoc -SourceFile $pimSrc -ResultRows $standingPrivileged -RuleId 'pim-group-permanent-assignments'
+            -Title ((Format-EACount $standingPrivileged.Count 'admin-role group has' 'admin-role groups have') + ' permanent members or owners in PIM') `
+            -Evidence ("Role-assignable groups where EndDateTime is absent on one or more PIM assignment instances; {0} permanent owner assignments." -f (Format-EACount $ownerStanding.Count 'group includes' 'groups include')) `
+            -WhyItMatters 'Privileged Identity Management (PIM) is meant to give admin access only when needed and for a limited time. Permanent assignments mean these people hold that access all the time, so a stolen account can use it at once.' `
+            -RecommendedAction ("Change permanent assignments to eligible ones (switched on only when needed) in {0} > [group] > Assignments, and require MFA, approval and a reason to activate" -f $pimGroupsPath) `
+            -DocumentationUrl $pimGroupAssignDoc -SourceFile $pimSrc -ResultRows $standingPrivileged -RuleId 'pim-group-permanent-assignments'
     }
 
     $unscheduledDirect = @($pimRows | Where-Object {
@@ -2590,11 +3099,11 @@ function Invoke-Check-IdentityGovernance {
         $unscheduledOwnerTotal = ($unscheduledDirect | Measure-Object -Property UnscheduledOwnerCount -Sum).Sum
         $severity = if ($groupsWithUnscheduledOwners.Count -gt 0) { 'High' } else { 'Medium' }
         Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'Identity Governance' `
-            -Title ("{0} role-assignable group(s) contain direct principals without matching PIM schedules" -f $unscheduledDirect.Count) `
-            -Evidence ("Per-principal comparison found {0} direct member(s) and {1} direct owner(s) whose ids occur in neither an eligibility nor assignment schedule instance for the corresponding accessId." -f $unscheduledMemberTotal,$unscheduledOwnerTotal) `
-            -WhyItMatters 'A scheduled principal elsewhere in the same group does not protect a different direct member or owner; unmatched principals can retain standing privileged group access.' `
-            -RecommendedAction 'Remove unapproved direct assignments or represent every required privileged member/owner through PIM for Groups, then validate each principal activation path' `
-            -DocumentationUrl $pimDoc -SourceFile $pimSrc -ResultRows $unscheduledDirect -RuleId 'role-groups-direct-principals-without-pim'
+            -Title ((Format-EACount $unscheduledDirect.Count 'admin-role group has' 'admin-role groups have') + ' members or owners added outside PIM') `
+            -Evidence ("Per-principal comparison found {0} and {1} whose ids occur in neither an eligibility nor assignment schedule instance for the corresponding accessId." -f (Format-EACount $unscheduledMemberTotal 'direct member' 'direct members'),(Format-EACount $unscheduledOwnerTotal 'direct owner' 'direct owners')) `
+            -WhyItMatters 'People added directly to these groups hold admin access without going through Privileged Identity Management (PIM): no time limit, no approval and no activation record.' `
+            -RecommendedAction ("Remove direct members and owners who should not be there, and manage everyone else as eligible or time-limited assignments in {0}" -f $pimGroupsPath) `
+            -DocumentationUrl $pimGroupAssignDoc -SourceFile $pimSrc -ResultRows $unscheduledDirect -RuleId 'role-groups-direct-principals-without-pim'
     }
 
     $pimWithoutPolicies = @($pimRows | Where-Object {
@@ -2603,20 +3112,20 @@ function Invoke-Check-IdentityGovernance {
     })
     if ($pimWithoutPolicies.Count -gt 0) {
         Add-EAGovFinding -Severity 'High' -CheckId $checkId -Category 'Identity Governance' `
-            -Title ("{0} PIM-managed group(s) lack complete member/owner policy assignment evidence" -f $pimWithoutPolicies.Count) `
+            -Title ((Format-EACount $pimWithoutPolicies.Count 'PIM-managed group is' 'PIM-managed groups are') + ' missing member or owner activation settings') `
             -Evidence 'PIM schedule instances exist, but fewer than two role-management policy assignments (member and owner) were returned.' `
-            -WhyItMatters 'Without readable member and owner policies, activation requirements and assignment lifetime controls cannot be assured.' `
-            -RecommendedAction 'Validate both member and owner PIM for Groups policy assignments and their activation/expiration rules' `
-            -DocumentationUrl $pimPolicyDoc -SourceFile $pimSrc -ResultRows $pimWithoutPolicies -RuleId 'pim-group-policy-missing'
+            -WhyItMatters 'Without both settings there is no proof that switching on admin access in these groups requires multifactor authentication (MFA), approval or a time limit.' `
+            -RecommendedAction ("Open each listed group in {0} > [group] > Settings and check the Member and Owner role settings" -f $pimGroupsPath) `
+            -DocumentationUrl $pimGroupSettingsDoc -SourceFile $pimSrc -ResultRows $pimWithoutPolicies -RuleId 'pim-group-policy-missing'
     }
 
     $unknownPimPolicyRules = @($pimPolicyRows | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.UnknownFields) })
     if ($unknownPimPolicyRules.Count -gt 0) {
         Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Identity Governance' `
-            -Title 'PIM for Groups policy-rule coverage is incomplete' `
-            -Evidence ("{0} member/owner policy assignment(s) omitted or returned unreadable activation/expiration rule fields. This is unknown, not compliant." -f $unknownPimPolicyRules.Count) `
-            -WhyItMatters 'The existence of a policy assignment does not establish MFA, justification, approval, activation duration, or assignment-expiration requirements.' `
-            -RecommendedAction 'Confirm RoleManagementPolicy.Read.AzureADGroup access, inspect the affected expanded policy rules, and rerun the audit' `
+            -Title ("Some PIM activation settings could not be read for {0}" -f (Format-EACount $unknownPimPolicyRules.Count 'group setting' 'group settings')) `
+            -Evidence ((Format-EACount $unknownPimPolicyRules.Count 'member/owner policy assignment' 'member/owner policy assignments') + ' omitted or returned unreadable activation/expiration rule fields. This is unknown, not compliant.') `
+            -WhyItMatters 'The audit cannot confirm whether switching on admin access in these groups requires MFA, a reason, approval or a time limit.' `
+            -RecommendedAction ("Check the listed settings in {0} > [group] > Settings; confirm the audit account has RoleManagementPolicy.Read.AzureADGroup, then run the audit again" -f $pimGroupsPath) `
             -DocumentationUrl $pimPolicyDoc -SourceFile $pimPolicySrc -ResultRows $unknownPimPolicyRules `
             -RuleId 'pim-group-policy-rules-unknown' -CoverageGap
     }
@@ -2628,79 +3137,85 @@ function Invoke-Check-IdentityGovernance {
         $weakOwnerPolicies = @($weakActivationPolicies | Where-Object { [string]$_.PolicyKind -ieq 'owner' })
         $severity = if ($weakOwnerPolicies.Count -gt 0) { 'High' } else { 'Medium' }
         Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'Identity Governance' `
-            -Title ("{0} PIM for Groups policy assignment(s) do not require strong authentication on activation" -f $weakActivationPolicies.Count) `
+            -Title ((Format-EACount $weakActivationPolicies.Count 'PIM group setting lets' 'PIM group settings let') + ' people switch on admin access without MFA') `
             -Evidence ("MultiFactorAuthentication is absent from enabledRules and no enabled authentication-context rule was returned; affected owner policies={0}." -f $weakOwnerPolicies.Count) `
-            -WhyItMatters 'A compromised session or password can activate privileged group membership or ownership without a fresh strong-authentication control.' `
-            -RecommendedAction 'Require MFA on activation, or use an authentication context protected by correctly scoped Conditional Access and validate that enforcement end to end' `
-            -DocumentationUrl $pimPolicyDoc -SourceFile $pimPolicySrc -ResultRows $weakActivationPolicies -RuleId 'pim-group-activation-no-strong-auth'
+            -WhyItMatters 'Someone with a stolen password or session could switch on admin-level group membership or ownership without a fresh multifactor authentication (MFA) check.' `
+            -RecommendedAction ("Turn on 'On activation, require multifactor authentication' (or a Conditional Access authentication context) for these settings in {0} > [group] > Settings" -f $pimGroupsPath) `
+            -DocumentationUrl $pimGroupSettingsDoc -SourceFile $pimPolicySrc -ResultRows $weakActivationPolicies -RuleId 'pim-group-activation-no-strong-auth'
     }
 
     $authContextPolicies = @($pimPolicyRows | Where-Object { $_.AuthenticationContextEnabled -eq $true })
     if ($authContextPolicies.Count -gt 0) {
         Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Identity Governance' `
-            -Title 'PIM for Groups authentication-context enforcement requires Conditional Access validation' `
-            -Evidence ("{0} policy assignment(s) use an authentication context. The PIM rule alone does not prove that the referenced context is available and protected by enabled Conditional Access with mandatory MFA/authentication strength." -f $authContextPolicies.Count) `
-            -WhyItMatters 'A missing, disabled, narrowly scoped, or bypassable Conditional Access policy can make an authentication-context activation rule ineffective.' `
-            -RecommendedAction 'Verify every claimValue against an available authentication context and an enabled Conditional Access policy whose grant cannot be satisfied without MFA/authentication strength' `
-            -DocumentationUrl $pimPolicyDoc -SourceFile $pimPolicySrc -ResultRows $authContextPolicies `
+            -Title ((Format-EACount $authContextPolicies.Count 'PIM group setting relies' 'PIM group settings rely') + ' on Conditional Access that needs a manual check') `
+            -Evidence ("{0} an authentication context. The PIM rule alone does not prove that the referenced context is available and protected by enabled Conditional Access with mandatory MFA/authentication strength." -f (Format-EACount $authContextPolicies.Count 'policy assignment uses' 'policy assignments use')) `
+            -WhyItMatters 'Activation asks for an authentication context, but that only protects anything if an enabled Conditional Access policy requires MFA for it. A missing or narrow policy would leave activation unprotected.' `
+            -RecommendedAction 'For each listed claim value, check that the authentication context exists and that an enabled Conditional Access policy requires MFA or an authentication strength for it (Entra admin center > Entra ID > Conditional Access > Authentication contexts)' `
+            -DocumentationUrl $pimGroupSettingsDoc -SourceFile $pimPolicySrc -ResultRows $authContextPolicies `
             -RuleId 'pim-group-auth-context-validation' -CoverageGap
     }
 
     $noJustificationPolicies = @($pimPolicyRows | Where-Object { $_.JustificationRequired -eq $false })
     if ($noJustificationPolicies.Count -gt 0) {
         Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Identity Governance' `
-            -Title ("{0} PIM for Groups policy assignment(s) do not require activation justification" -f $noJustificationPolicies.Count) `
+            -Title ((Format-EACount $noJustificationPolicies.Count 'PIM group setting does not' 'PIM group settings do not') + ' ask for a reason when admin access is switched on') `
             -Evidence 'Justification is absent from the policy enabledRules list.' `
-            -WhyItMatters 'Unjustified privileged activations are harder to review, correlate to work, and challenge during incident response.' `
-            -RecommendedAction 'Require meaningful activation justification for privileged group member and owner policies' `
-            -DocumentationUrl $pimPolicyDoc -SourceFile $pimPolicySrc -ResultRows $noJustificationPolicies -RuleId 'pim-group-activation-no-justification'
+            -WhyItMatters 'Without a stated reason it is hard to check later, or during an incident, whether an admin activation was for real work.' `
+            -RecommendedAction ("Turn on 'Require justification on activation' for these member and owner settings in {0} > [group] > Settings" -f $pimGroupsPath) `
+            -DocumentationUrl $pimGroupSettingsDoc -SourceFile $pimPolicySrc -ResultRows $noJustificationPolicies -RuleId 'pim-group-activation-no-justification'
     }
 
     $ownerNoApprovalPolicies = @($pimPolicyRows | Where-Object { [string]$_.PolicyKind -ieq 'owner' -and $_.ApprovalRequired -eq $false })
     if ($ownerNoApprovalPolicies.Count -gt 0) {
         Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Identity Governance' `
-            -Title ("{0} PIM for Groups owner policy assignment(s) allow activation without approval" -f $ownerNoApprovalPolicies.Count) `
+            -Title ((Format-EACount $ownerNoApprovalPolicies.Count 'PIM group owner setting allows' 'PIM group owner settings allow') + ' owner access to be switched on without approval') `
             -Evidence 'The owner policy approval rule has isApprovalRequired=false.' `
-            -WhyItMatters 'Group owners can change privileged membership; approval provides separation of duties for that high-impact activation.' `
-            -RecommendedAction 'Require approval for owner activation on groups that convey privileged access, with resilient approver coverage' `
-            -DocumentationUrl $pimPolicyDoc -SourceFile $pimPolicySrc -ResultRows $ownerNoApprovalPolicies -RuleId 'pim-group-owner-activation-no-approval'
+            -WhyItMatters 'Group owners can change who is in an admin-role group. Requiring approval means a second person agrees before someone gets that power.' `
+            -RecommendedAction ("Turn on 'Require approval to activate' for the Owner setting of these groups in {0} > [group] > Settings, and name at least two approvers" -f $pimGroupsPath) `
+            -DocumentationUrl $pimGroupSettingsDoc -SourceFile $pimPolicySrc -ResultRows $ownerNoApprovalPolicies -RuleId 'pim-group-owner-activation-no-approval'
     }
 
     $longActivationPolicies = @($pimPolicyRows | Where-Object { $null -ne $_.MaximumActivationHours -and $_.MaximumActivationHours -gt 8 })
     if ($longActivationPolicies.Count -gt 0) {
         Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Identity Governance' `
-            -Title ("{0} PIM for Groups policy assignment(s) allow activation longer than eight hours" -f $longActivationPolicies.Count) `
+            -Title ((Format-EACount $longActivationPolicies.Count 'PIM group setting keeps' 'PIM group settings keep') + ' admin access switched on for more than 8 hours') `
             -Evidence 'maximumDuration parsed to more than eight hours. Eight hours is an audit review threshold, not a universal compliance boundary.' `
-            -WhyItMatters 'Long activation windows increase the time during which a stolen session or unattended workstation retains privileged group access.' `
-            -RecommendedAction 'Reduce maximum activation duration to the shortest operationally workable window and document justified exceptions' `
-            -DocumentationUrl $pimPolicyDoc -SourceFile $pimPolicySrc -ResultRows $longActivationPolicies -RuleId 'pim-group-activation-duration-long'
+            -WhyItMatters 'The longer admin access stays switched on, the longer a stolen session or an unlocked computer can be misused.' `
+            -RecommendedAction ("Lower 'Activation maximum duration (hours)' to the shortest workable value (8 hours or less) in {0} > [group] > Settings, and record any exceptions" -f $pimGroupsPath) `
+            -DocumentationUrl $pimGroupSettingsDoc -SourceFile $pimPolicySrc -ResultRows $longActivationPolicies -RuleId 'pim-group-activation-duration-long'
     }
 
     $permanentActivePolicies = @($pimPolicyRows | Where-Object { $_.PermanentActiveAllowed -eq $true })
     if ($permanentActivePolicies.Count -gt 0) {
         Add-EAGovFinding -Severity 'High' -CheckId $checkId -Category 'Identity Governance' `
-            -Title ("{0} PIM for Groups policy assignment(s) permit non-expiring active assignments" -f $permanentActivePolicies.Count) `
+            -Title ((Format-EACount $permanentActivePolicies.Count 'PIM group setting allows' 'PIM group settings allow') + ' permanent admin access') `
             -Evidence 'The active-assignment expiration rule has isExpirationRequired=false.' `
-            -WhyItMatters 'Even if no permanent instance exists today, the policy permits creation of standing privileged group access later.' `
-            -RecommendedAction 'Require expiration for active member and owner assignments and review existing permanent instances' `
-            -DocumentationUrl $pimPolicyDoc -SourceFile $pimPolicySrc -ResultRows $permanentActivePolicies -RuleId 'pim-group-policy-allows-permanent-active'
+            -WhyItMatters 'Even if nobody has it today, an admin can later give someone admin-level group access that never ends.' `
+            -RecommendedAction ("Turn off 'Allow permanent active assignment' for the member and owner settings in {0} > [group] > Settings, and review existing permanent assignments" -f $pimGroupsPath) `
+            -DocumentationUrl $pimGroupSettingsDoc -SourceFile $pimPolicySrc -ResultRows $permanentActivePolicies -RuleId 'pim-group-policy-allows-permanent-active'
     }
 
     $permanentEligiblePolicies = @($pimPolicyRows | Where-Object { $_.PermanentEligibleAllowed -eq $true })
     if ($permanentEligiblePolicies.Count -gt 0) {
         Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Identity Governance' `
-            -Title ("{0} PIM for Groups policy assignment(s) permit non-expiring eligibility" -f $permanentEligiblePolicies.Count) `
+            -Title ((Format-EACount $permanentEligiblePolicies.Count 'PIM group setting allows' 'PIM group settings allow') + ' eligibility for admin access that never expires') `
             -Evidence 'The eligible-assignment expiration rule has isExpirationRequired=false.' `
-            -WhyItMatters 'Permanent eligibility can outlast the business need unless periodic access reviews and ownership processes independently remove it.' `
-            -RecommendedAction 'Require eligibility expiration or document equivalent recurring recertification with accountable owners' `
-            -DocumentationUrl $pimPolicyDoc -SourceFile $pimPolicySrc -ResultRows $permanentEligiblePolicies -RuleId 'pim-group-policy-allows-permanent-eligibility'
+            -WhyItMatters 'People can stay able to switch on admin access long after they need it, unless a review removes them.' `
+            -RecommendedAction ("Turn off 'Allow permanent eligible assignment' in {0} > [group] > Settings, or run recurring access reviews of eligible members" -f $pimGroupsPath) `
+            -DocumentationUrl $pimGroupSettingsDoc -SourceFile $pimPolicySrc -ResultRows $permanentEligiblePolicies -RuleId 'pim-group-policy-allows-permanent-eligibility'
     }
 
+    # A list that could not be read says so instead of showing 0; a partial list shows "N+".
+    $countText = {
+        param($ReadResult, [int]$Count)
+        if (-not $ReadResult.Success) { 'not read' } elseif ($ReadResult.Truncated) { '{0}+ (partial list)' -f $Count } else { [string]$Count }
+    }
     Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Identity Governance' `
-        -Title 'Identity governance feature inventory captured' `
+        -Title 'Identity governance features recorded' `
         -Evidence ("Catalogs={0}; access packages={1}; assignment policies={2}; lifecycle workflows={3}; Terms of Use agreements={4}; role-assignable groups assessed for PIM={5}." -f `
-            $catalogRows.Count,$packageRows.Count,$policyRows.Count,$workflowRows.Count,$agreementRows.Count,$pimRows.Count) `
-        -WhyItMatters 'Entitlement management, automated lifecycle tasks, legal acknowledgement, and PIM for Groups address different stages of access creation, use, certification, and removal.' `
-        -RecommendedAction 'Map the available features to the organization identity lifecycle and document compensating controls for intentionally unused features' `
+            (& $countText $catalogResult $catalogRows.Count),(& $countText $packageResult $packageRows.Count),(& $countText $policyResult $policyRows.Count),
+            (& $countText $workflowResult $workflowRows.Count),(& $countText $agreementResult $agreementRows.Count),(& $countText $roleGroupResult $pimRows.Count)) `
+        -WhyItMatters 'Access packages, lifecycle workflows, terms of use and PIM for Groups each control a different stage of access: granting it, using it, reviewing it and removing it.' `
+        -RecommendedAction 'Check that each feature you rely on is set up, and document what you use instead for the features you do not use' `
         -DocumentationUrl $entitlementDoc -SourceFile $packageSrc -ResultRows $packageRows -RuleId 'identity-governance-inventory'
 }

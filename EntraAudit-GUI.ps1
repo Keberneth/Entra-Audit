@@ -8,7 +8,8 @@
       app registration, -DelegatedClientId) or app-only with a certificate
     - Choose the audit checks: run all and untick the ones to skip, or run only
       the ticked ones
-    - Configure options (inactivity thresholds, break-glass accounts, output)
+    - Configure options (inactivity and disabled-account thresholds, break-glass
+      accounts, output)
     - Preview and run the read-only audit command. The preview and the Run Audit
       button sit in a bar pinned to the bottom of the window, so they stay visible
       while the check list scrolls.
@@ -54,45 +55,48 @@ function Msg-Info([string]$Message) {
 }
 
 # -------------------------
-# Audit check definitions (mirrors EntraAudit-PS7.ps1 -switches and the README table)
+# Audit check definitions: one entry per check switch of EntraAudit-PS7.ps1 (the form emits
+# "-<key>"), with a plain-language description. Keep each description short enough for its
+# 734 px label (at most about 120 characters, roughly 650 px in Segoe UI 9 pt); longer text is
+# cut with "..." and shown in full on hover.
 # -------------------------
 $AuditChecks = [ordered]@{
-    tenantinfo     = "Tenant / organization overview, verified domains, licensing"
-    privroles      = "FLAGSHIP: privileged roles - permanent vs eligible (PIM) vs time-bound; works without P2, PIM eligibility detail needs P2"
-    directoryroles = "Global Admin count and privileged assignment volume"
-    accounts       = "Account hygiene (disabled-but-licensed, non-expiring passwords)"
-    staleusers     = "Stale / inactive / never-signed-in users (needs P1)"
-    guests         = "Guest / external user governance, privileged guests"
-    mfa            = "MFA capability and authentication method strength"
-    legacyauth     = "Legacy authentication usage (sign-in logs, needs P1)"
-    tenantposture  = "Security Defaults, authorization policy and consent settings"
-    capolicies     = "Conditional Access policy posture"
-    riskyusers     = "Identity Protection: risky users / detections (needs P2)"
-    riskyserviceprincipals = "Identity Protection: risky service principals (needs Workload ID Premium)"
-    apps           = "App / service principal hygiene, over-privilege, credentials"
-    appcredentials = "App registration secret/cert expiry - expired and expiring-soon credentials"
-    consentgrants  = "OAuth2 delegated consent grants (illicit consent risk)"
-    devices        = "Stale / unmanaged / non-compliant devices"
-    trusts         = "Cross-tenant access and B2B trust"
-    recentchanges  = "Recently created users/groups and directory audit"
-    tenanthealth   = "Directory-sync / Password Hash Sync platform health"
-    pimpolicies    = "PIM policy quality (activation MFA/approval/justification/duration) - needs P2"
-    breakglass     = "Emergency-access (break-glass) account health - enter the accounts under Step 4 Options"
-    authmethodpolicy = "Tenant authentication-methods policy (weak vs phishing-resistant)"
-    accesspaths    = "Effective-access / attack-path graph (duplicate & ownership privilege paths)"
-    staleapps      = "Stale / unused applications by service-principal sign-in activity - needs P1"
-    recommendations = "Microsoft Entra recommendations and unresolved high-impact actions"
-    securescore    = "Microsoft Identity Secure Score and incomplete control posture"
-    accessreviews  = "Access-review coverage, recurrence, reviewers and completion behavior"
-    identitygovernance = "Entitlement management, lifecycle workflows, Terms of Use and PIM for Groups"
-    authrecovery   = "SSPR/recovery readiness, registration campaign and system-preferred MFA"
-    groupgovernance = "Group ownership, role-assignable groups, dynamic rules and lifecycle settings"
-    externaldelegation = "External delegation, GDAP relationships and partner trust governance"
-    federationhealth = "Federated-domain certificate, endpoint and hybrid authentication health"
-    workloadcredentials = "Application and service-principal credentials, federated identities and policy enforcement"
-    enterpriseapps = "Enterprise-app ownership, assignment controls and high-impact permissions"
-    monitoring     = "Audit/sign-in visibility, diagnostic export and alert-rule/action-group inventory"
-    changemonitoring = "Recent security-sensitive directory, policy, role and application changes"
+    tenantinfo     = "Tenant overview: organization details, verified domains and licenses"
+    privroles      = "MAIN CHECK: who holds admin roles permanently vs only when activated (just-in-time roles need Entra ID P2)"
+    directoryroles = "How many Global Administrators and other admin-role holders the tenant has"
+    accounts       = "Account clean-up: disabled accounts that are old or still licensed, passwords that never expire, no manager"
+    staleusers     = "Users who have not signed in for a long time, or never (needs Entra ID P1)"
+    guests         = "Guest (external) users: who may invite them, invitations never accepted, guests with admin roles"
+    mfa            = "Multi-factor authentication (MFA): who has registered it and how strong the methods are, admins first"
+    legacyauth     = "Sign-ins with old protocols that cannot do MFA (legacy authentication; reads sign-in logs, needs P1)"
+    tenantposture  = "Tenant-wide settings: Security Defaults, and what ordinary users may do (register apps, approve app access)"
+    capolicies     = "Conditional Access sign-in rules (MFA, risk, locations) - enter break-glass accounts in Step 4 first"
+    riskyusers     = "Users Microsoft flags as risky (possibly compromised) and recent risk detections (needs Entra ID P2)"
+    riskyserviceprincipals = "Apps and service principals Microsoft flags as risky (needs a Workload Identities Premium license)"
+    apps           = "Apps with powerful permissions: who owns them, unverified publishers, apps with no owner"
+    appcredentials = "App registration secrets and certificates that have expired or expire soon"
+    consentgrants  = "Access that users or admins granted to apps (consent grants), high-impact grants first"
+    devices        = "Devices that have not signed in for a long time, are not managed, or are not compliant"
+    trusts         = "Trust in other organizations' Microsoft tenants: their MFA and device checks, guest access (cross-tenant access)"
+    recentchanges  = "Users and groups created recently, and recent admin-role changes (from the audit log)"
+    tenanthealth   = "Sync from on-premises Active Directory: last sync, Password Hash Sync, sync settings (hybrid only)"
+    pimpolicies    = "Rules for activating admin roles in Privileged Identity Management (PIM): MFA, approval, reason, time limit (needs P2)"
+    breakglass     = "Emergency-access (break-glass) admin accounts: are they set up and ready - enter them in Step 4"
+    authmethodpolicy = "Allowed sign-in methods: weak ones (text message, voice call) vs phishing-resistant (security keys)"
+    accesspaths    = "Hidden routes to admin rights: duplicate role paths, owners of groups and apps that grant admin rights"
+    staleapps      = "Apps nobody has used for a long time, especially ones that still have valid secrets (needs P1)"
+    recommendations = "Microsoft Entra recommendations that are still open, high-impact ones first"
+    securescore    = "Microsoft Identity Secure Score and the improvement actions not yet done"
+    accessreviews  = "Access reviews: what is reviewed, how often, by whom, and what happens to the results"
+    identitygovernance = "Access packages, lifecycle workflows, Terms of Use and PIM for Groups (may need extra licenses)"
+    authrecovery   = "Self-service password reset and account recovery, MFA registration campaign, system-preferred MFA"
+    groupgovernance = "Groups: missing owners, groups that can hold admin roles, dynamic membership rules, expiry settings"
+    externaldelegation = "Outside access: partner admin relationships (GDAP), guest sponsors and partner tenant settings"
+    federationhealth = "Federated domains: signing-certificate expiry, sign-in endpoints and hybrid sign-in settings"
+    workloadcredentials = "Secrets, certificates and federated credentials on apps and service principals, and credential policies"
+    enterpriseapps = "Enterprise apps: owners, who is allowed to use them, and high-impact permissions"
+    monitoring     = "Logging and alerting: are sign-in and audit logs kept and exported, and do alert rules exist"
+    changemonitoring = "Recent security-sensitive changes to users, roles, policies, apps, consent and federation"
 }
 
 # -------------------------
@@ -208,9 +212,25 @@ function Add-Separator {
     $sep.Size = New-Object System.Drawing.Size(940, 2)
     $Parent.Controls.Add($sep) | Out-Null; return $sep
 }
+# A WinForms ToolTip only wraps at the width of the screen, so a long tip becomes one very
+# wide line. Wrap it at about 90 characters (existing line breaks are kept) so it reads as a
+# short paragraph next to the control.
+function Format-TipText {
+    param([string]$Text, [int]$Width = 90)
+    $out = foreach ($para in ($Text -split "`r?`n")) {
+        $line = ''
+        foreach ($word in ($para -split ' ')) {
+            if ($line -and ($line.Length + 1 + $word.Length) -gt $Width) { $line; $line = $word }
+            elseif ($line) { $line += ' ' + $word }
+            else { $line = $word }
+        }
+        $line
+    }
+    return (@($out) -join [Environment]::NewLine)
+}
 function Add-Tip {
     param([object]$Control, [string]$Text)
-    $script:tips.SetToolTip($Control, $Text)
+    $script:tips.SetToolTip($Control, (Format-TipText $Text))
 }
 
 $y = 14
@@ -230,9 +250,11 @@ Add-Separator $y | Out-Null; $y += 12
 # === STEP 1: DEPENDENCIES ===
 Add-LabelBold "Step 1 - Install the Microsoft Graph modules (first time only)" $y | Out-Null
 $y += $rowHeight
-Add-Label "Microsoft Graph PowerShell SDK:" $y | Out-Null
+$lblInstall = Add-Label "Microsoft Graph modules:" $y
 $btnInstall = Add-Button "Install Graph Modules" $y 220 28
 Add-Hint "Opens a new PowerShell 7 window and installs for your user only." $y 440 ($leftInput + 236) | Out-Null
+$tipInstall = "Installs the Microsoft Graph PowerShell modules the audit needs (runs the audit script with -installdeps). They come from the PowerShell Gallery and are installed for your Windows user only, so no administrator rights are needed. Modules that are already installed are kept."
+Add-Tip $lblInstall $tipInstall; Add-Tip $btnInstall $tipInstall
 $y += 38
 Add-Separator $y | Out-Null; $y += 12
 
@@ -241,35 +263,36 @@ Add-LabelBold "Step 2 - Choose how to sign in (the audit only asks for read perm
 $y += $rowHeight
 $rdoInteractive = Add-Radio "Interactive: sign in with your own account" $y $true 330 $leftLabel
 $rdoAppOnly     = Add-Radio "App-only: app registration with a certificate" $y $false 330 ($leftLabel + 350)
-Add-Tip $rdoInteractive "A person signs in with their own account. Recommended for most audits. Give the account Global Reader + Security Reader; one check (federated identity credentials in workloadcredentials) needs app-only for full coverage - see PREREQUISITE.md."
-Add-Tip $rdoAppOnly "Unattended run as a dedicated read-only app registration that signs in with a certificate on this computer."
+Add-Tip $rdoInteractive "You sign in with your own account when the audit starts. Recommended for most audits. The account needs the Global Reader and Security Reader roles. One detail (federated credentials in the workloadcredentials check) is only fully covered by app-only sign-in - see PREREQUISITE.md."
+Add-Tip $rdoAppOnly "The audit signs in as a dedicated read-only app registration, using a certificate installed on this computer. Suited to repeated or scheduled audits. The app needs the read permissions listed in PREREQUISITE.md."
 $y += $rowHeight
 $chkDeviceCode = Add-Check "Sign in with a code on another device instead of a pop-up (-UseDeviceCode)" $y $false 600 $leftLabel
-Add-Tip $chkDeviceCode "Use this when no sign-in window can open here (remote session, server without a browser). You get a code to enter at microsoft.com/devicelogin."
+Add-Tip $chkDeviceCode "Use this when no sign-in window can open here, for example in a remote session or on a server without a browser. The audit window shows a code; enter it at microsoft.com/devicelogin on your phone or another computer."
 $y += $rowHeight + 2
 
 $lblTenant = Add-Label "Tenant ID or domain:" $y
 $txtTenant = Add-TextBox $y -Width 300
-Add-Hint "e.g. contoso.onmicrosoft.com (required for app-only)" $y 380 ($leftInput + 310) | Out-Null
-$tipTenant = "Which tenant to audit: its tenant ID (a GUID) or a verified domain. Optional for interactive sign-in (your home tenant is used), required for app-only."
+if ($txtTenant.PSObject.Properties['PlaceholderText']) { $txtTenant.PlaceholderText = "contoso.onmicrosoft.com or a tenant ID" }
+Add-Hint "Required for app-only and with your own sign-in app." $y 380 ($leftInput + 310) | Out-Null
+$tipTenant = "Which tenant to audit (passed as -TenantId): its tenant ID (a GUID) or a verified domain such as contoso.onmicrosoft.com. Required for app-only sign-in and when you use your own sign-in app. Otherwise optional: your account's home tenant is used."
 Add-Tip $lblTenant $tipTenant; Add-Tip $txtTenant $tipTenant
 $y += $rowHeight
 $lblDelegatedClientId = Add-Label "Own sign-in app ID (optional):" $y
 $txtDelegatedClientId = Add-TextBox $y -Width 300
 Add-Hint "Interactive only. Leave empty to use Microsoft's app." $y 380 ($leftInput + 310) | Out-Null
-$tipDelegated = "Optional, interactive sign-in only (passed as -DelegatedClientId). The Application (client) ID of your own read-only app registration, used instead of Microsoft's shared 'Microsoft Graph Command Line Tools' app. Use it when that shared app holds write permissions from earlier use, which makes the audit refuse to run. The app must be a public client (mobile and desktop) with redirect URI http://localhost; for device-code sign-in also set Authentication > 'Allow public client flows' to Yes."
+$tipDelegated = "Optional, interactive sign-in only (passed as -DelegatedClientId). The Application (client) ID of your own read-only app registration, used instead of Microsoft's shared 'Microsoft Graph Command Line Tools' app. Use it when the audit refuses to run because that shared app was given write permissions in the past. The Tenant ID or domain field above is then required, because app registrations are single-tenant by default. Set the app up as a public client (Mobile and desktop applications) with redirect URI http://localhost; for device-code sign-in also set Authentication > 'Allow public client flows' to Yes."
 Add-Tip $lblDelegatedClientId $tipDelegated; Add-Tip $txtDelegatedClientId $tipDelegated
 $y += $rowHeight
 $lblClientId = Add-Label "App (client) ID:" $y
 $txtClientId = Add-TextBox $y -Width 300
 Add-Hint "App-only. The app registration's Application (client) ID." $y 380 ($leftInput + 310) | Out-Null
-$tipClientId = "App-only sign-in (passed as -ClientId): the Application (client) ID of the read-only app registration. See PREREQUISITE.md for the exact permissions."
+$tipClientId = "App-only sign-in (passed as -ClientId): the Application (client) ID of the read-only app registration, shown on the app's Overview page in the Entra admin center. See PREREQUISITE.md for the exact permissions."
 Add-Tip $lblClientId $tipClientId; Add-Tip $txtClientId $tipClientId
 $y += $rowHeight
 $lblThumb = Add-Label "Certificate thumbprint:" $y
 $txtThumb = Add-TextBox $y -Width 300
 Add-Hint "App-only. 40-character thumbprint of a certificate on this PC." $y 380 ($leftInput + 310) | Out-Null
-$tipThumb = "App-only sign-in (passed as -CertificateThumbprint): the SHA-1 thumbprint of the app's certificate. The certificate and its private key must be installed on this computer (for example Cert:\CurrentUser\My)."
+$tipThumb = "App-only sign-in (passed as -CertificateThumbprint): the thumbprint (SHA-1 fingerprint) of the app's certificate. The certificate and its private key must be installed on this computer, for example in Cert:\CurrentUser\My, and the same certificate must be uploaded to the app registration."
 Add-Tip $lblThumb $tipThumb; Add-Tip $txtThumb $tipThumb
 $y += $rowHeight + 4
 Add-Separator $y | Out-Null; $y += 12
@@ -305,47 +328,68 @@ $y += 6; Add-Separator $y | Out-Null; $y += 12
 # === STEP 4: OPTIONS ===
 Add-LabelBold "Step 4 - Options (optional - the defaults suit most tenants)" $y | Out-Null
 $y += $rowHeight
-Add-Label "Inactive after (days):" $y | Out-Null
+# Day thresholds: each is passed to the audit only when it differs from the script's default.
+$lblInactive = Add-Label "Inactive after (days):" $y
 $txtInactive = Add-TextBox $y -Width 120
 $txtInactive.Text = "90"
-Add-Hint "Users and devices with no sign-in for this long are reported as stale. Default 90." $y 560 ($leftInput + 130) | Out-Null
+Add-Hint "Users and devices with no sign-in for this long are reported as inactive. Default 90." $y 560 ($leftInput + 130) | Out-Null
+$tipInactive = "Passed as -InactiveDays. Used by the staleusers and devices checks. Admin accounts are held to a stricter limit: this value or 45 days, whichever is shorter."
+Add-Tip $lblInactive $tipInactive; Add-Tip $txtInactive $tipInactive
 $y += $rowHeight
-Add-Label "Credential warning (days):" $y | Out-Null
+$lblDisabledDays = Add-Label "Disabled account age (days):" $y
+$txtDisabledDays = Add-TextBox $y -Width 120
+$txtDisabledDays.Text = "180"
+Add-Hint -Text "Disabled user accounts not used for this long are listed for clean-up. Default 180." -Top $y -Width 560 -X ($leftInput + 130) | Out-Null
+$tipDisabledDays = "Passed as -DisabledAccountDays. Used by the accounts check. Disabled user accounts with no successful sign-in for longer than this (or, when no sign-in is on record, created longer ago than this) are listed so they can be deleted: a forgotten disabled account can be switched back on and misused. Sign-in dates need Entra ID P1 and the AuditLog.Read.All permission; without them, disabled accounts created longer ago than this are listed with their age unknown."
+Add-Tip $lblDisabledDays $tipDisabledDays; Add-Tip $txtDisabledDays $tipDisabledDays
+$y += $rowHeight
+$lblExpiry = Add-Label "Expiry warning (days):" $y
 $txtExpiry = Add-TextBox $y -Width 120
 $txtExpiry.Text = "30"
 Add-Hint "Warn about app secrets and certificates that expire within this many days. Default 30." $y 560 ($leftInput + 130) | Out-Null
+$tipExpiry = "Passed as -ExpiringCredentialDays. Used by the appcredentials and workloadcredentials checks. Secrets and certificates that have already expired are always reported."
+Add-Tip $lblExpiry $tipExpiry; Add-Tip $txtExpiry $tipExpiry
 $y += $rowHeight
-Add-Label "Recent-change window (days):" $y | Out-Null
+$lblRecentDays = Add-Label "Recent changes (days):" $y
 $txtRecentDays = Add-TextBox $y -Width 120
 $txtRecentDays.Text = "30"
-Add-Hint "How far back to look for recently created or changed objects. Default 30." $y 560 ($leftInput + 130) | Out-Null
+Add-Hint "How many days back to look for new accounts and recent changes. Default 30." $y 560 ($leftInput + 130) | Out-Null
+$tipRecentDays = "Passed as -RecentChangeDays. Used by the recentchanges and changemonitoring checks. Microsoft keeps the audit log for 30 days with Entra ID P1 or P2 and 7 days without, so older changes may not be visible."
+Add-Tip $lblRecentDays $tipRecentDays; Add-Tip $txtRecentDays $tipRecentDays
 $y += $rowHeight
-Add-Label "Unused-app window (days):" $y | Out-Null
+$lblStaleApp = Add-Label "Apps unused after (days):" $y
 $txtStaleApp = Add-TextBox $y -Width 120
 $txtStaleApp.Text = "90"
-Add-Hint "Apps with no sign-in for this long are reported as unused. Default 90." $y 560 ($leftInput + 130) | Out-Null
+Add-Hint "Apps that have not signed in for this long are reported as unused. Default 90." $y 560 ($leftInput + 130) | Out-Null
+$tipStaleApp = "Passed as -StaleAppDays. Used by the staleapps and enterpriseapps checks. App sign-in activity needs Entra ID P1."
+Add-Tip $lblStaleApp $tipStaleApp; Add-Tip $txtStaleApp $tipStaleApp
 $y += $rowHeight
-$lblBreakGlass = Add-Label "Break-glass accounts (UPNs):" $y
+$lblBreakGlass = Add-Label "Break-glass (emergency) accounts:" $y
 $txtBreakGlass = Add-TextBox $y
 if ($txtBreakGlass.PSObject.Properties['PlaceholderText']) {
     $txtBreakGlass.PlaceholderText = "emergency1@contoso.onmicrosoft.com; emergency2@contoso.onmicrosoft.com"
 }
-$tipBreakGlass = "Your emergency-access (break-glass) admin accounts, separated by ';' (passed as -BreakGlassUpns). The audit checks their health and treats them as expected exceptions in the privileged-role, PIM and Conditional Access checks. Leave empty if you have none."
+$tipBreakGlass = "Your emergency-access (break-glass) admin accounts: their sign-in names, separated by ';' (passed as -BreakGlassUpns). The audit checks that they are set up and ready, and treats them as expected exceptions in the admin-role, PIM and Conditional Access checks. Without this list, users left out of Conditional Access MFA policies by name cannot be confirmed as emergency accounts and are reported as gaps to check. Leave empty if you have none."
 Add-Tip $lblBreakGlass $tipBreakGlass; Add-Tip $txtBreakGlass $tipBreakGlass
+# The hint sits on its own line under the full-width box (TextBox bottom is about $y + 20).
+$y += 24
+$lblBreakGlassHint = Add-Hint "Without this list, users excluded by name from MFA policies cannot be confirmed as emergency accounts." $y
+Add-Tip $lblBreakGlassHint $tipBreakGlass
 $y += $rowHeight
 $lblOutput = Add-Label "Report folder (optional):" $y
 $txtOutput = Add-TextBox $y -Width 560
 $btnBrowse = Add-Button "Browse..." $y 110 24 ($leftInput + 570)
-$tipOutput = "Where the report folder is created (passed as -OutputRoot). Empty = the folder this script is in. The reports contain sensitive security data: choose a folder only auditors can open."
+$tipOutput = "Where the report folder is created (passed as -OutputRoot). Leave empty to use the folder this script is in. The reports contain sensitive security data, so choose a folder that only auditors can open."
 Add-Tip $lblOutput $tipOutput; Add-Tip $txtOutput $tipOutput
 $y += $rowHeight
 $lblModules = Add-Label "Offline modules folder (optional):" $y
 $txtModulesPath = Add-TextBox $y -Width 560
 $btnBrowseModules = Add-Button "Browse..." $y 110 24 ($leftInput + 570)
-$tipModules = "Only for computers without internet access (passed as -ModulesPath): a folder with the Microsoft Graph modules saved by Save-Module. See PREREQUISITE.md."
+$tipModules = "Only for computers without internet access (passed as -ModulesPath): a folder with the Microsoft Graph modules, saved with Save-Module on a computer that has internet access. See PREREQUISITE.md."
 Add-Tip $lblModules $tipModules; Add-Tip $txtModulesPath $tipModules
 $y += $rowHeight
 $chkNoLaunch = Add-Check "Don't open the report automatically when the audit finishes (-NoLaunch)" $y $false 560 $leftLabel
+Add-Tip $chkNoLaunch "When the audit finishes, the report normally opens in your web browser, whichever sign-in you chose. Tick this to only save it; the audit window then shows where the report is. Runs without a desktop session, such as scheduled tasks, never open it."
 $y += $rowHeight + 6
 
 $panel.AutoScrollMinSize = [System.Drawing.Size]::new(0, ($y + 20))
@@ -365,6 +409,7 @@ $btnRun.ForeColor = [System.Drawing.Color]::White
 $btnRun.FlatStyle = 'Flat'; $btnRun.FlatAppearance.BorderSize = 0
 $btnClose = Add-Button "Close" 102 100 40 ($leftLabel + 230) -Parent $bottom
 $lblRunHint = Add-Hint "Runs in a new PowerShell 7 window - sign in there if asked." 112 560 ($leftLabel + 346) -Parent $bottom
+Add-Tip $txtPreview "This is exactly what Run Audit starts. You can copy it and run it again later in a PowerShell 7 window to repeat the same audit."
 
 # Stretch the separator, preview and hint with the window. Done in code rather than with
 # Anchor=Right, which captures the right-edge distance from the parent's size at the moment
@@ -397,13 +442,21 @@ function Test-IsGuid([string]$s) { $g = [guid]::Empty; return [guid]::TryParse((
 # fail validation with a misleading "must be 40 hex characters" error.
 function Test-IsThumbprint([string]$s) { return ((($s -replace '[\s\p{Cf}]','')) -match '^[0-9A-Fa-f]{40}$') }
 
-# Start-Process -ArgumentList joins array elements with spaces WITHOUT quoting, so any value
-# containing whitespace (e.g. the script path "C:\Users\Niclas Skarnes\..." or an -OutputRoot
-# with spaces) MUST be pre-quoted or it is split into separate tokens. ';' and ',' are also
-# quoted: pasted into a PowerShell console, an unquoted ';' terminates the statement and an
-# unquoted 'a,b' is parsed as an array and splatted into separate native arguments.
+# Quote each argument for the preview so the line can be pasted into a PowerShell 7 window and
+# runs with exactly the same arguments as Run Audit. A value made only of safe ASCII characters
+# (letters, digits and _ . : \ / = + -) is shown as is; a value that starts with '-' is shown
+# as is only when it is a plain switch name such as -all, because PowerShell splits a bare
+# '-a.b' or '-a:b' into two arguments. Anything else - spaces, ' " & ( ) $ ; , @ { } # or a
+# backtick, e.g. C:\Users\O'Brien\... or \\srv\audit$ - is put in single quotes, which
+# PowerShell reads literally (no variable expansion, no escapes, no command separators).
+# A single quote inside the value is doubled, including the typographic quotes U+2018/U+2019/
+# U+201A/U+201B that PowerShell also treats as single quotes. They are written as \u escapes
+# so the regex survives an ANSI read of this BOM-less file.
 function ConvertTo-ArgLine([string[]]$InputArgs) {
-    @($InputArgs | ForEach-Object { if ($_ -match '[\s";,]') { '"' + ($_ -replace '"','""') + '"' } else { $_ } })
+    @($InputArgs | ForEach-Object {
+        if ($_ -cmatch '^(-[A-Za-z]+|[A-Za-z0-9_.:\\/=+][A-Za-z0-9_.:\\/=+-]*)$') { $_ }
+        else { "'" + ($_ -replace "['\u2018\u2019\u201A\u201B]", '$0$0') + "'" }
+    })
 }
 
 # Launch pwsh via .NET ProcessStartInfo.ArgumentList: each element is passed as a distinct
@@ -449,6 +502,7 @@ function Build-LaunchArgs {
     }
     if ($script:txtTenant.Text.Trim()) { $a += @('-TenantId', $script:txtTenant.Text.Trim()) }
     if ($script:txtInactive.Text.Trim() -and $script:txtInactive.Text.Trim() -ne '90') { $a += @('-InactiveDays', $script:txtInactive.Text.Trim()) }
+    if ($script:txtDisabledDays.Text.Trim() -and $script:txtDisabledDays.Text.Trim() -ne '180') { $a += @('-DisabledAccountDays', $script:txtDisabledDays.Text.Trim()) }
     if ($script:txtExpiry.Text.Trim() -and $script:txtExpiry.Text.Trim() -ne '30')     { $a += @('-ExpiringCredentialDays', $script:txtExpiry.Text.Trim()) }
     if ($script:txtRecentDays.Text.Trim() -and $script:txtRecentDays.Text.Trim() -ne '30') { $a += @('-RecentChangeDays', $script:txtRecentDays.Text.Trim()) }
     if ($script:txtStaleApp.Text.Trim() -and $script:txtStaleApp.Text.Trim() -ne '90')     { $a += @('-StaleAppDays', $script:txtStaleApp.Text.Trim()) }
@@ -521,6 +575,7 @@ $txtDelegatedClientId.Add_TextChanged({ Update-Preview })
 $txtClientId.Add_TextChanged({ Update-Preview })
 $txtThumb.Add_TextChanged({ Update-Preview })
 $txtInactive.Add_TextChanged({ Update-Preview })
+$txtDisabledDays.Add_TextChanged({ Update-Preview })
 $txtExpiry.Add_TextChanged({ Update-Preview })
 $txtRecentDays.Add_TextChanged({ Update-Preview })
 $txtStaleApp.Add_TextChanged({ Update-Preview })
@@ -561,19 +616,26 @@ $btnRun.Add_Click({
         if ($delegatedId -and -not (Test-IsGuid $delegatedId)) {
             Msg-Error "'Own sign-in app ID' must be the Application (client) ID of your app registration (a GUID such as 11111111-2222-3333-4444-555555555555). Leave it empty to use Microsoft's app."; return
         }
+        # The audit script refuses -DelegatedClientId without -TenantId; say so here, before
+        # a new window opens only to stop with the same message.
+        if ($delegatedId -and -not $script:txtTenant.Text.Trim()) {
+            Msg-Error "Your own sign-in app also needs the tenant ID or domain (for example contoso.onmicrosoft.com), because app registrations are single-tenant by default."; return
+        }
     }
     $tenant = $script:txtTenant.Text.Trim()
     if ($tenant -and -not ((Test-IsGuid $tenant) -or ($tenant -match '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'))) {
         Msg-Error "The tenant must be a tenant ID (a GUID) or a domain such as contoso.onmicrosoft.com."; return
     }
     foreach ($pair in @(
-        @{ n='Inactive after'; t=$script:txtInactive }, @{ n='Credential warning'; t=$script:txtExpiry },
-        @{ n='Recent-change window'; t=$script:txtRecentDays }, @{ n='Unused-app window'; t=$script:txtStaleApp }
+        @{ n='Inactive after'; t=$script:txtInactive }, @{ n='Disabled account age'; t=$script:txtDisabledDays },
+        @{ n='Expiry warning'; t=$script:txtExpiry }, @{ n='Recent changes'; t=$script:txtRecentDays },
+        @{ n='Apps unused after'; t=$script:txtStaleApp }
     )) {
         $v = $pair.t.Text.Trim()
         # 1-3650 (mirrors the script's ValidateRange): 0 produces meaningless results and
         # an Int32-overflowing value would kill the launched pwsh at parameter binding.
-        if ($v -and ($v -notmatch '^\d{1,4}$' -or [int]$v -lt 1 -or [int]$v -gt 3650)) {
+        # [0-9], not \d: \d also matches other scripts' digits, which [int] cannot convert.
+        if ($v -and ($v -notmatch '^[0-9]{1,4}$' -or [int]$v -lt 1 -or [int]$v -gt 3650)) {
             Msg-Error ("'{0}' must be a whole number of days between 1 and 3650." -f $pair.n); return
         }
     }
