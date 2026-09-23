@@ -38,6 +38,23 @@ function Get-EAApplicationCheckValue {
     return $null
 }
 
+# Get-EAApplicationCheckValue returns collections comma-wrapped so an assignment keeps
+# an empty value[] distinct from a missing property (Get-EAReadOnlyGraphCollection relies
+# on that). Wrapping such a call directly in @() therefore yields ONE element - the whole
+# array. Use this enumerating companion wherever the elements are iterated or counted.
+function Get-EAApplicationCheckElement {
+    param(
+        [object]$Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    $value = Get-EAApplicationCheckValue -Object $Object -Name $Name
+    if ($null -eq $value) { return }
+    foreach ($item in @($value)) {
+        if ($null -ne $item) { $item }
+    }
+}
+
 function ConvertTo-EAApplicationCheckUtcDate {
     param([object]$Value)
 
@@ -106,6 +123,53 @@ function Get-EAReadOnlyGraphCollection {
     return @($rows.ToArray())
 }
 
+function Get-EAReportedElsewhereIndex {
+    # Some objects are inspected by both an older main-script check (apps, appcredentials,
+    # consentgrants) and a newer check in this file. Returns key -> highest severity rank
+    # (Critical=4 ... Low=1) of the risk findings that CheckId has ALREADY added in this
+    # run, keyed by $KeySelector over each finding's rows. A newer check skips an object
+    # only when it is already reported at the same or a higher severity, so it is scored
+    # once. Only reported rows are indexed: if the other check did not run, failed, or
+    # could not read an object, nothing is skipped. Coverage-gap findings are ignored.
+    param(
+        [Parameter(Mandatory)][string]$CheckId,
+        [Parameter(Mandatory)][scriptblock]$KeySelector
+    )
+
+    $rank = @{ Critical=4; High=3; Medium=2; Low=1 }
+    $index = @{}
+    # Enumerate directly: @() over the New-Object List that holds the findings throws
+    # "Argument types do not match" on PowerShell 7.4.
+    foreach ($finding in $script:Findings) {
+        if ($null -eq $finding -or [string](Get-EAApplicationCheckValue $finding 'CheckId') -ne $CheckId) { continue }
+        if ([bool](Get-EAApplicationCheckValue $finding 'CoverageGap')) { continue }
+        $severityRank = $rank[[string](Get-EAApplicationCheckValue $finding 'Severity')]
+        if (-not $severityRank) { continue }
+        foreach ($row in @(Get-EAApplicationCheckElement $finding 'ResultRows')) {
+            foreach ($key in @(& $KeySelector $row)) {
+                if ([string]::IsNullOrWhiteSpace([string]$key)) { continue }
+                $key = ([string]$key).ToLowerInvariant()
+                if (-not $index.ContainsKey($key) -or $index[$key] -lt $severityRank) { $index[$key] = $severityRank }
+            }
+        }
+    }
+    return $index
+}
+
+function Get-EAWorkloadCredentialFingerprint {
+    # Credentials created together for one certificate share customKeyIdentifier and the
+    # same validity window. Returns that shared part as text (dates to the second).
+    param([object]$Entry)
+
+    $identifier = Get-EAApplicationCheckValue $Entry 'CustomKeyIdentifier'
+    $identifierText = if ($identifier -is [byte[]]) { [Convert]::ToBase64String($identifier) } else { [string]$identifier }
+    $start = ConvertTo-EAApplicationCheckUtcDate (Get-EAApplicationCheckValue $Entry 'StartDateTime')
+    $end = ConvertTo-EAApplicationCheckUtcDate (Get-EAApplicationCheckValue $Entry 'EndDateTime')
+    return ('{0}|{1}|{2}' -f $identifierText,
+        $(if ($start) { $start.ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture) }),
+        $(if ($end) { $end.ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture) }))
+}
+
 function Get-EAWorkloadCredentialRows {
     param(
         [object[]]$Objects,
@@ -120,12 +184,42 @@ function Get-EAWorkloadCredentialRows {
         $objectId = [string](Get-EAApplicationCheckValue $object 'Id')
         $appId = [string](Get-EAApplicationCheckValue $object 'AppId')
 
+        # A SAML (token-signing) certificate on a service principal is stored as three
+        # entries: a private key (usage Sign), its public key (usage Verify), and a password
+        # that only protects the private key. All three share customKeyIdentifier and
+        # dates, and the password also shares the Sign key's keyId. Microsoft creates them
+        # with a three-year lifetime by default. Count the set once, as one token-signing
+        # certificate, instead of one long-lived secret plus two overlapping certificates.
+        $signKeyIds = @{}
+        $signFingerprints = @{}
+        if ($ObjectType -eq 'ServicePrincipal') {
+            foreach ($key in @(Get-EAApplicationCheckElement $object 'KeyCredentials')) {
+                if ([string](Get-EAApplicationCheckValue $key 'Usage') -ne 'Sign') { continue }
+                $signKeyId = [string](Get-EAApplicationCheckValue $key 'KeyId')
+                if ($signKeyId) { $signKeyIds[$signKeyId] = $true }
+                $signFingerprints[(Get-EAWorkloadCredentialFingerprint $key)] = $true
+            }
+        }
+
         foreach ($spec in @(
             [pscustomobject]@{ Property='PasswordCredentials'; Type='Secret'; LongDays=180 },
             [pscustomobject]@{ Property='KeyCredentials';      Type='Certificate'; LongDays=730 }
         )) {
-            foreach ($credential in @(Get-EAApplicationCheckValue $object $spec.Property)) {
+            foreach ($credential in @(Get-EAApplicationCheckElement $object $spec.Property)) {
                 if ($null -eq $credential) { continue }
+                $usage = [string](Get-EAApplicationCheckValue $credential 'Usage')
+                $credentialType = $spec.Type
+                $longDays = $spec.LongDays
+                if ($signFingerprints.Count -gt 0) {
+                    $isSigningSet = $signFingerprints.ContainsKey((Get-EAWorkloadCredentialFingerprint $credential))
+                    if ($spec.Type -eq 'Secret' -and ($isSigningSet -or $signKeyIds.ContainsKey([string](Get-EAApplicationCheckValue $credential 'KeyId')))) { continue }
+                    if ($usage -eq 'Verify' -and $isSigningSet) { continue }
+                    if ($usage -eq 'Sign') {
+                        $credentialType = 'Token-signing certificate'
+                        # Three calendar years, including a leap day.
+                        $longDays = 1096
+                    }
+                }
                 $start = ConvertTo-EAApplicationCheckUtcDate (Get-EAApplicationCheckValue $credential 'StartDateTime')
                 $end = ConvertTo-EAApplicationCheckUtcDate (Get-EAApplicationCheckValue $credential 'EndDateTime')
                 $noExpiry = ($null -eq $end)
@@ -133,13 +227,13 @@ function Get-EAWorkloadCredentialRows {
                 $daysLeft = if ($end) { [math]::Floor(($end - $Now).TotalDays) } else { $null }
                 $state = if ($noExpiry) { 'NoExpiry' } elseif ($end -lt $Now) { 'Expired' } elseif ($end -le $Now.AddDays($WarningDays)) { 'ExpiringSoon' } else { 'Valid' }
                 $active = ((-not $start) -or $start -le $Now) -and ($noExpiry -or $end -gt $Now)
-                $longLived = ($null -ne $lifetime -and $lifetime -gt $spec.LongDays)
+                $longLived = ($null -ne $lifetime -and $lifetime -gt $longDays)
                 $rows.Add([pscustomobject]@{
                     ObjectType       = $ObjectType
                     ObjectName       = $displayName
                     ObjectId         = $objectId
                     AppId            = $appId
-                    CredentialType   = $spec.Type
+                    CredentialType   = $credentialType
                     CredentialName   = [string](@(
                         Get-EAApplicationCheckValue $credential 'DisplayName'
                         Get-EAApplicationCheckValue $credential 'KeyId'
@@ -152,7 +246,8 @@ function Get-EAWorkloadCredentialRows {
                     State            = $state
                     ActiveNow        = [bool]$active
                     LongLived        = [bool]$longLived
-                    LongLifeLimitDays= $spec.LongDays
+                    LongLifeLimitDays= $longDays
+                    ReportedUnder    = ''
                 }) | Out-Null
             }
         }
@@ -236,7 +331,7 @@ function Get-EAAppManagementPolicyRows {
             [pscustomobject]@{ Property='passwordCredentials'; CredentialType='PasswordOrSymmetricKey' },
             [pscustomobject]@{ Property='keyCredentials'; CredentialType='Certificate' }
         )) {
-            foreach ($restriction in @(Get-EAApplicationCheckValue $config $kind.Property)) {
+            foreach ($restriction in @(Get-EAApplicationCheckElement $config $kind.Property)) {
                 if ($null -eq $restriction) { continue }
                 $added++
                 $maxLifetime = Get-EAApplicationCheckValue $restriction 'maxLifetime'
@@ -300,10 +395,26 @@ function Invoke-Check-WorkloadCredentials {
         ($ownerTenant -notin $microsoftOwnerTenants)
     })
     if ($servicePrincipalKnown) { $credentialRows += @(Get-EAWorkloadCredentialRows -Objects $credentialServicePrincipals -ObjectType ServicePrincipal -Now $now -WarningDays $warningDays) }
+    # The appcredentials check runs earlier and reports expired and expiring app
+    # registration credentials. The same credential is kept in the evidence here
+    # (ReportedUnder column) but not scored a second time.
+    $appCredentialIndex = Get-EAReportedElsewhereIndex -CheckId 'appcredentials' -KeySelector {
+        param($row)
+        $credentialAppId = [string](Get-EAApplicationCheckValue $row 'AppId')
+        $credentialName = [string](Get-EAApplicationCheckValue $row 'CredName')
+        $credentialKind = ([string](Get-EAApplicationCheckValue $row 'CredType') -split '/')[0]
+        if ($credentialAppId -and $credentialName) { "credential|$credentialAppId|$credentialName|$credentialKind" }
+    }
+    foreach ($credentialRow in @($credentialRows | Where-Object { $_.ObjectType -eq 'Application' -and $_.State -in @('Expired','ExpiringSoon') })) {
+        $neededRank = if ($credentialRow.State -eq 'Expired') { 2 } else { 1 }
+        $key = ("credential|{0}|{1}|{2}" -f $credentialRow.AppId, $credentialRow.CredentialName, $credentialRow.CredentialType).ToLowerInvariant()
+        if ($appCredentialIndex.ContainsKey($key) -and $appCredentialIndex[$key] -ge $neededRank) { $credentialRow.ReportedUnder = 'appcredentials' }
+    }
     $credentialSource = Write-Evidence -BaseName 'workload_credentials' -Rows $credentialRows `
         -Title 'Workload Identity Credentials (applications and service principals)' `
         -Notes @(
-            'Secret lifetime review threshold: 180 days; certificate lifetime review threshold: 730 days.',
+            'Secret lifetime review threshold: 180 days; certificate lifetime review threshold: 730 days; token-signing (SAML) certificate threshold: three years (the Microsoft default).',
+            'A token-signing certificate on a service principal is listed once: its matching public key (Verify) and the password that protects its private key are part of the same certificate.',
             ("Expiry warning window: {0} days." -f $warningDays),
             'Credential values are never returned by these Graph reads; only metadata is exported.',
             ("Excluded {0} Microsoft first-party, managed-identity, or other non-application service principal(s) whose credentials are not tenant-managed workload secrets." -f ($servicePrincipals.Count - $credentialServicePrincipals.Count))
@@ -322,8 +433,9 @@ function Invoke-Check-WorkloadCredentials {
             -SourceFile $coverageSource -ResultRows $coverageRows -RuleId 'workload-credential-coverage-unknown' -ObjectType 'tenant' -CoverageGap
     }
 
-    $expired = @($credentialRows | Where-Object { $_.State -eq 'Expired' })
-    $expiring = @($credentialRows | Where-Object { $_.State -eq 'ExpiringSoon' })
+    $expired = @($credentialRows | Where-Object { $_.State -eq 'Expired' -and -not $_.ReportedUnder })
+    $expiring = @($credentialRows | Where-Object { $_.State -eq 'ExpiringSoon' -and -not $_.ReportedUnder })
+    $credentialsReportedElsewhere = @($credentialRows | Where-Object { $_.ReportedUnder })
     $noExpiry = @($credentialRows | Where-Object { $_.State -eq 'NoExpiry' })
     $longLived = @($credentialRows | Where-Object { $_.LongLived })
     $overlaps = @(Get-EAWorkloadCredentialOverlapRows -CredentialRows $credentialRows)
@@ -356,10 +468,18 @@ function Invoke-Check-WorkloadCredentials {
     if ($longLived.Count -gt 0) {
         Add-EntraFinding -Severity 'Medium' -CheckId $checkId -Category $category `
             -Title ("{0} workload credential(s) exceed the lifetime review threshold" -f $longLived.Count) `
-            -Evidence 'Secrets longer than 180 days or certificates longer than 730 days were found.' `
+            -Evidence 'Secrets valid for more than 180 days, certificates valid for more than 730 days, or token-signing (SAML) certificates valid for more than three years were found.' `
             -WhyItMatters 'Long-lived credentials widen the period in which copied authentication material remains useful to an attacker and often indicate missing rotation automation.' `
             -RecommendedAction 'Shorten credential validity, automate rotation, and prefer workload identity federation where the external platform supports it.' `
             -SourceFile $credentialSource -ResultRows $longLived -RuleId 'workload-credential-long-lived' -ObjectType 'workloadIdentity'
+    }
+    if ($credentialsReportedElsewhere.Count -gt 0) {
+        Add-EntraFinding -Severity 'Information' -CheckId $checkId -Category $category `
+            -Title ("{0} expired or expiring app registration credential(s) are already reported by the appcredentials check" -f $credentialsReportedElsewhere.Count) `
+            -Evidence 'These credentials are listed here for completeness but not counted twice. Service-principal credentials, long lifetimes, missing expiry, and overlap are still reported by this check.' `
+            -WhyItMatters 'Counting the same expired or expiring credential in two checks would show one problem twice and inflate the risk score.' `
+            -RecommendedAction 'Review and rotate or remove these credentials using the appcredentials findings.' `
+            -SourceFile $credentialSource -ResultRows $credentialsReportedElsewhere -RuleId 'workload-credential-reported-elsewhere' -ObjectType 'tenant'
     }
     if ($overlaps.Count -gt 0) {
         Add-EntraFinding -Severity 'Medium' -CheckId $checkId -Category $category `
@@ -374,8 +494,11 @@ function Invoke-Check-WorkloadCredentials {
     # in the normal application collection. Enumerate each relationship with read-only GET.
     $ficRows = New-Object System.Collections.Generic.List[object]
     $ficErrors = New-Object System.Collections.Generic.List[object]
+    $stopFicReads = $false
+    $ficAttempted = 0
     if ($applicationKnown) {
         foreach ($application in $applications) {
+            $ficAttempted++
             $applicationId = [string](Get-EAApplicationCheckValue $application 'Id')
             if (-not $applicationId) { continue }
             # The beta representation is required to expose flexible FIC
@@ -415,20 +538,24 @@ function Invoke-Check-WorkloadCredentials {
                 }) | Out-Null
                 # A tenant-wide authorization failure will repeat for every object. Stop and
                 # record the remaining population as unknown rather than hammering Graph.
-                if ($status -in 401,403) { break }
+                if ($status -in 401,403) { $stopFicReads = $true; break }
             }
         }
     }
+    $ficNotAttempted = if ($stopFicReads) { [math]::Max(0, $applications.Count - $ficAttempted) } else { 0 }
     $ficSource = Write-Evidence -BaseName 'federated_identity_credentials' -Rows @($ficRows.ToArray()) `
         -Title 'Federated Identity Credential Trusts' `
         -Notes @('Issuer, subject, and audience are trust-boundary metadata. Secrets/tokens are not returned.')
     if ($ficErrors.Count -gt 0 -or -not $applicationKnown) {
         $ficErrorRows = @($ficErrors.ToArray())
         if (-not $applicationKnown) { $ficErrorRows += [pscustomobject]@{ Application='All applications'; ObjectId=''; StatusCode=''; Error='Application collection unavailable' } }
+        if ($ficNotAttempted -gt 0) {
+            $ficErrorRows += [pscustomobject]@{ Application=("Remaining {0} application(s)" -f $ficNotAttempted); ObjectId=''; StatusCode=''; Error='Not checked: federated credential reads stopped after an access-denied (HTTP 401/403) error.' }
+        }
         $ficErrorSource = Write-Evidence -BaseName 'federated_identity_credential_collection_gaps' -Rows $ficErrorRows -Title 'Federated Identity Credential Collection Gaps'
         Add-EntraFinding -Severity 'Medium' -CheckId $checkId -Category $category `
             -Title 'Federated identity credential coverage is incomplete' `
-            -Evidence ("{0} application relationship read(s) failed or could not be attempted; an empty trust inventory is not a clean result." -f $ficErrorRows.Count) `
+            -Evidence ("{0} application read(s) failed and {1} application(s) were not checked. An empty list of trusts here does not mean there are none." -f $ficErrors.Count, $(if (-not $applicationKnown) { 'all' } else { $ficNotAttempted })) `
             -WhyItMatters 'Unreviewed issuer, subject, or audience bindings can allow an external workload to exchange its token for an Entra application token.' `
             -RecommendedAction 'Confirm Application.Read.All and a supported directory role, resolve Graph errors, and re-run the check.' `
             -SourceFile $ficErrorSource -ResultRows $ficErrorRows -RuleId 'federated-credential-coverage-unknown' -ObjectType 'tenant' -CoverageGap
@@ -560,7 +687,7 @@ function Invoke-Check-WorkloadCredentials {
     $riskRows = @($credentialRows | Where-Object { $_.State -in @('Expired','ExpiringSoon','NoExpiry') -or $_.LongLived })
     $coverageComplete = ($applicationKnown -and $servicePrincipalKnown -and $ficErrors.Count -eq 0 -and $policyErrors.Count -eq 0)
     $riskFindings = @($script:Findings | Where-Object { $_.CheckId -eq $checkId -and $_.Severity -ne 'Information' })
-    if ($riskFindings.Count -eq 0 -and $coverageComplete) {
+    if ($riskFindings.Count -eq 0 -and $coverageComplete -and $credentialsReportedElsewhere.Count -eq 0) {
         Add-EntraFinding -Severity 'Information' -CheckId $checkId -Category $category `
             -Title 'Workload credential lifecycle and federation trusts reviewed' `
             -Evidence ("{0} credential(s), {1} federated trust(s), and {2} custom app-management policy/policies were reviewed without a flagged condition." -f $credentialRows.Count, $ficRows.Count, $customPolicies.Count) `
@@ -609,6 +736,55 @@ function Get-EAServicePrincipalSignInActivityState {
 function Get-EAApplicationPermissionRisk {
     param(
         [string]$PermissionValue,
+        [string]$ResourceName,
+        [ValidateSet('Application','Delegated')][string]$GrantType = 'Application',
+        [string]$ConsentType
+    )
+
+    $risk = Get-EAApplicationPermissionBaseRisk -PermissionValue $PermissionValue -ResourceName $ResourceName
+    if ($GrantType -ne 'Delegated') { return $risk }
+
+    # Delegated scopes act as the signed-in user, never tenant-wide on their own.
+    # User.ReadWrite only edits the signed-in user's own profile (the consentgrants check
+    # deliberately does not treat it as high-impact either).
+    if ($PermissionValue -eq 'User.ReadWrite') {
+        return [pscustomobject]@{ Risk='Other'; Reason="Delegated self-profile scope; acts only on the signed-in user's own profile." }
+    }
+    # Delegated directory reads return only what the signed-in user can already read
+    # (members can read the directory by default), so they are not high impact. The
+    # consentgrants check treats them the same way. Content and security reads (mail,
+    # files, chats, audit, risk, alerts) stay high: consent lets the app collect them.
+    if ($risk.Risk -eq 'HighImpactRead' -and
+        $PermissionValue -match '(?i)^(User|Directory|Group|GroupMember|Device|Domain|Organization|Application)\.Read(Basic)?\.All$') {
+        return [pscustomobject]@{ Risk='Other'; Reason='Delegated directory read; limited to what the signed-in user can already read.' }
+    }
+    $plainScope = if ($risk.Risk -eq 'WriteHigh') { 'can change or send data' } else { 'can read sensitive data' }
+    # A per-user (Principal) grant is bounded by that one user's own access, so it is
+    # reported separately from tenant-wide application/admin-consented access. Only a
+    # documented 'Principal' value downgrades; a missing or unrecognised consent type
+    # keeps the full severity. Tier0 scopes stay Tier0: they are takeover primitives
+    # whenever that user is privileged.
+    if ($risk.Risk -in @('WriteHigh','HighImpactRead')) {
+        if ($ConsentType -eq 'Principal') {
+            return [pscustomobject]@{
+                Risk='UserDelegatedSensitive'
+                Reason=("Delegated permission for one specific user; the app acts only as that user ({0})." -f $plainScope)
+            }
+        }
+        if ($ConsentType -ne 'AllPrincipals') {
+            $risk.Reason = ("Delegated permission whose consent type is missing or not recognised, so it is treated as applying to every user ({0})." -f $plainScope)
+            return $risk
+        }
+    }
+    if ($risk.Risk -eq 'HighImpactRead') {
+        $risk.Reason = ("Admin-consented delegated read of sensitive data or security/configuration on {0} for every user who signs in." -f ($ResourceName ?? 'resource API'))
+    }
+    return $risk
+}
+
+function Get-EAApplicationPermissionBaseRisk {
+    param(
+        [string]$PermissionValue,
         [string]$ResourceName
     )
 
@@ -629,10 +805,6 @@ function Get-EAApplicationPermissionRisk {
         return [pscustomobject]@{ Risk='Tier0'; Reason='Directory takeover, role grant, impersonation, or full-control application permission.' }
     }
 
-    if ($PermissionValue -match '(?i)(ReadWrite|\.Write(?:\.|$)|\.Send(?:\.|$)|Create|Delete|Update|Manage|Invite|AccessAsUser|Impersonat)') {
-        return [pscustomobject]@{ Risk='WriteHigh'; Reason='Write, send, management, or impersonation capability.' }
-    }
-
     $highImpactReadExact = @(
         'Directory.Read.All', 'RoleManagement.Read.Directory', 'Application.Read.All',
         'User.Read.All', 'Group.Read.All', 'GroupMember.Read.All', 'Device.Read.All',
@@ -645,10 +817,22 @@ function Get-EAApplicationPermissionRisk {
         'ChannelMessage.Read.All', 'CallRecords.Read.All', 'OnlineMeetingArtifact.Read.All',
         'DeviceManagementManagedDevices.Read.All', 'DeviceManagementConfiguration.Read.All'
     )
-    if ($PermissionValue -in $highImpactReadExact -or
-        $PermissionValue -match '(?i)^(Mail|Calendars|Contacts|Files|Sites|Chat|ChatMessage|ChannelMessage|CallRecords|OnlineMeetingArtifact)\.Read(?:\.All)?$' -or
+    $highImpactRead = [pscustomobject]@{ Risk='HighImpactRead'; Reason=("Tenant-wide sensitive-data or security/configuration read access on {0}." -f ($ResourceName ?? 'resource API')) }
+    # The exact read list is authoritative and is evaluated before the write pattern.
+    if ($PermissionValue -in $highImpactReadExact) { return $highImpactRead }
+
+    # Write verbs must START a permission-name segment (Mail.Send, Group.Create,
+    # User.DeleteRestore.All, user_impersonation). Unanchored substrings made read-only
+    # names such as RoleManagement.Read.Directory, EntitlementManagement.Read.All or
+    # WindowsUpdates.Read.All look like write access. "Managed" (ManagedTenants.Read.All)
+    # is not a write verb; PrivilegedOperations (device wipe/retire) is.
+    if ($PermissionValue -match '(?i)(^|[._])(ReadWrite|Write|Send|Create|Delete|Update|Manage(?!d)|Invite|AccessAsUser|Impersonat|PrivilegedOperations)\w*(?=[._]|$)') {
+        return [pscustomobject]@{ Risk='WriteHigh'; Reason='Write, send, management, or impersonation capability.' }
+    }
+
+    if ($PermissionValue -match '(?i)^(Mail|Calendars|Contacts|Files|Sites|Chat|ChatMessage|ChannelMessage|CallRecords|OnlineMeetingArtifact)\.Read(?:\.All)?$' -or
         $PermissionValue -match '(?i)^(Directory|RoleManagement|Application|User|Group|GroupMember|Device|Domain|Organization|CrossTenant|AuditLog|Reports|IdentityRisk|SecurityAlert|SecurityIncident).*\.Read\.All$') {
-        return [pscustomobject]@{ Risk='HighImpactRead'; Reason=("Tenant-wide sensitive-data or security/configuration read access on {0}." -f ($ResourceName ?? 'resource API')) }
+        return $highImpactRead
     }
 
     return [pscustomobject]@{ Risk='Other'; Reason='Resolved application permission; no high-impact pattern matched.' }
@@ -710,6 +894,7 @@ function Invoke-Check-EnterpriseAppGovernance {
 
     $activity = Get-EAServicePrincipalSignInActivityState
     $resourceById = @{}
+    $roleValueByResource = @{}
     foreach ($resourceSp in $servicePrincipals) {
         $resourceId = [string](Get-EAApplicationCheckValue $resourceSp 'id')
         if ($resourceId) { $resourceById[$resourceId] = $resourceSp }
@@ -799,11 +984,19 @@ function Invoke-Check-EnterpriseAppGovernance {
                     $appRoleId = [string](Get-EAApplicationCheckValue $grant 'appRoleId')
                     $resource = if ($resourceById.ContainsKey($resourceId)) { $resourceById[$resourceId] } else { $null }
                     $permissionValue = $null
-                    foreach ($role in @(Get-EAApplicationCheckValue $resource 'appRoles')) {
-                        if ([string](Get-EAApplicationCheckValue $role 'id') -eq $appRoleId) {
-                            $permissionValue = [string](Get-EAApplicationCheckValue $role 'value')
-                            break
+                    if ($resource) {
+                        # Index each resource's appRoles once (Microsoft Graph alone defines
+                        # hundreds) instead of scanning them for every grant.
+                        if (-not $roleValueByResource.ContainsKey($resourceId)) {
+                            $roleMap = @{}
+                            foreach ($role in @(Get-EAApplicationCheckElement $resource 'appRoles')) {
+                                $roleId = [string](Get-EAApplicationCheckValue $role 'id')
+                                if ($roleId) { $roleMap[$roleId] = [string](Get-EAApplicationCheckValue $role 'value') }
+                            }
+                            $roleValueByResource[$resourceId] = $roleMap
                         }
+                        $roleMap = $roleValueByResource[$resourceId]
+                        if ($roleMap.ContainsKey($appRoleId)) { $permissionValue = $roleMap[$appRoleId] }
                     }
                     $resourceName = [string](@(
                         Get-EAApplicationCheckValue $grant 'resourceDisplayName'
@@ -811,12 +1004,22 @@ function Invoke-Check-EnterpriseAppGovernance {
                         $resourceId
                     ) | Where-Object { $_ } | Select-Object -First 1)
                     $risk = Get-EAApplicationPermissionRisk -PermissionValue $permissionValue -ResourceName $resourceName
+                    if (-not $permissionValue -and $appRoleId -eq '00000000-0000-0000-0000-000000000000') {
+                        # Graph's documented default app role: the principal is assigned to
+                        # the resource app without any specific app role or permission.
+                        $permissionValue = '(default access)'
+                        $risk = [pscustomobject]@{ Risk='Other'; Reason='Default access to the resource app (no specific app role or permission).' }
+                    } elseif ($risk.Risk -eq 'Unknown') {
+                        $risk.Reason = if (-not $resource) { 'The resource service principal is not in the readable inventory, so the granted appRoleId could not be resolved.' } `
+                            else { 'The granted appRoleId is not defined in the resource service principal appRoles, so it could not be resolved to a permission value.' }
+                    }
                     $permissionRows.Add([pscustomobject]@{
                         EnterpriseApplication=$name; ServicePrincipalId=$spId; AppId=$appId; ServicePrincipalType=$servicePrincipalType
                         GrantType='Application'; ConsentType='Application'; PrincipalId=''
                         Permission=$permissionValue; AppRoleId=$appRoleId; Resource=$resourceName; ResourceId=$resourceId
                         Risk=$risk.Risk; RiskReason=$risk.Reason
                         GrantedDateTime=ConvertTo-EAApplicationCheckUtcDate (Get-EAApplicationCheckValue $grant 'createdDateTime')
+                        ReportedUnder=''
                     }) | Out-Null
                 }
             } catch {
@@ -842,7 +1045,7 @@ function Invoke-Check-EnterpriseAppGovernance {
         $enabledState = ConvertTo-EAApplicationCheckBoolean $enabledValue
         $assignmentRequiredValue = Get-EAApplicationCheckValue $sp 'appRoleAssignmentRequired'
         $assignmentRequiredKnown = ($null -ne $assignmentRequiredValue)
-        $hasCredentials = (@(Get-EAApplicationCheckValue $sp 'passwordCredentials').Count + @(Get-EAApplicationCheckValue $sp 'keyCredentials').Count) -gt 0
+        $hasCredentials = (@(Get-EAApplicationCheckElement $sp 'passwordCredentials').Count + @(Get-EAApplicationCheckElement $sp 'keyCredentials').Count) -gt 0
         $governanceRows.Add([pscustomobject]@{
             EnterpriseApplication=$name; ObjectId=$spId; AppId=$appId; ServicePrincipalType=$servicePrincipalType; OwnerClass=$ownerClass
             EnabledState=if ($null -eq $enabledState) { 'Unknown' } else { 'Known' }
@@ -876,16 +1079,66 @@ function Invoke-Check-EnterpriseAppGovernance {
             $resource = if ($resourceById.ContainsKey($resourceId)) { $resourceById[$resourceId] } else { $null }
             $resourceName = [string](@(Get-EAApplicationCheckValue $resource 'displayName'; $resourceId) | Where-Object { $_ } | Select-Object -First 1)
             $scopes = @(([string](Get-EAApplicationCheckValue $grant 'scope') -split '\s+') | Where-Object { $_ })
+            $consentType = [string](Get-EAApplicationCheckValue $grant 'consentType')
             foreach ($scope in $scopes) {
-                $risk = Get-EAApplicationPermissionRisk -PermissionValue $scope -ResourceName $resourceName
+                $risk = Get-EAApplicationPermissionRisk -PermissionValue $scope -ResourceName $resourceName -GrantType Delegated -ConsentType $consentType
                 $permissionRows.Add([pscustomobject]@{
                     EnterpriseApplication=$client.EnterpriseApplication; ServicePrincipalId=$clientId; AppId=$client.AppId; ServicePrincipalType=$client.ServicePrincipalType
-                    GrantType='Delegated'; ConsentType=[string](Get-EAApplicationCheckValue $grant 'consentType')
+                    GrantType='Delegated'; ConsentType=$consentType
                     PrincipalId=[string](Get-EAApplicationCheckValue $grant 'principalId')
                     Permission=$scope; AppRoleId=''; Resource=$resourceName; ResourceId=$resourceId
                     Risk=$risk.Risk; RiskReason=$risk.Reason
                     GrantedDateTime=$null
+                    ReportedUnder=''
                 }) | Out-Null
+            }
+        }
+    }
+
+    # The apps check (application permissions, over-privileged apps without an owner) and
+    # the consentgrants check (delegated grants) run earlier and inspect the same grants.
+    # A grant or missing owner they already reported at the same or a higher severity is
+    # kept in the evidence (ReportedUnder column) but not scored a second time here.
+    $appsIndex = Get-EAReportedElsewhereIndex -CheckId 'apps' -KeySelector {
+        param($row)
+        $spId = [string](Get-EAApplicationCheckValue $row 'SpId')
+        $permission = [string](Get-EAApplicationCheckValue $row 'Permission')
+        if ($spId -and $permission) { "permission|$spId|$permission" }
+        $ownerCount = Get-EAApplicationCheckValue $row 'OwnerCount'
+        $ownerAppId = [string](Get-EAApplicationCheckValue $row 'AppId')
+        if ($null -ne $ownerCount -and [string]$ownerCount -eq '0' -and $ownerAppId) { "owner|$ownerAppId" }
+    }
+    $consentIndex = Get-EAReportedElsewhereIndex -CheckId 'consentgrants' -KeySelector {
+        param($row)
+        $client = [string](Get-EAApplicationCheckValue $row 'Client')
+        $resource = [string](Get-EAApplicationCheckValue $row 'Resource')
+        $grantConsentType = [string](Get-EAApplicationCheckValue $row 'ConsentType')
+        foreach ($grantScope in @([string](Get-EAApplicationCheckValue $row 'Scope') -split '\s+' | Where-Object { $_ })) {
+            if ($client) { "grant|$client|$resource|$grantConsentType|$grantScope" }
+        }
+    }
+    $ownSeverityRank = @{ Tier0=4; WriteHigh=3; HighImpactRead=3; UserDelegatedSensitive=2 }
+    # consentgrants names clients by display name; a name shared by two apps is ambiguous,
+    # so such apps are matched only by object id.
+    $clientNameCount = @{}
+    foreach ($governanceRow in $governanceRows) {
+        $clientName = [string]$governanceRow.EnterpriseApplication
+        if ($clientName) { $clientNameCount[$clientName] = 1 + [int]$clientNameCount[$clientName] }
+    }
+    foreach ($permissionRow in $permissionRows) {
+        $neededRank = $ownSeverityRank[[string]$permissionRow.Risk]
+        if (-not $neededRank) { continue }
+        if ($permissionRow.GrantType -eq 'Application') {
+            $key = ("permission|{0}|{1}" -f $permissionRow.ServicePrincipalId, $permissionRow.Permission).ToLowerInvariant()
+            if ($appsIndex.ContainsKey($key) -and $appsIndex[$key] -ge $neededRank) { $permissionRow.ReportedUnder = 'apps' }
+            continue
+        }
+        $clientKeys = @($permissionRow.ServicePrincipalId)
+        if ($clientNameCount[[string]$permissionRow.EnterpriseApplication] -eq 1) { $clientKeys += $permissionRow.EnterpriseApplication }
+        foreach ($clientKey in $clientKeys) {
+            foreach ($resourceKey in @($permissionRow.Resource, $permissionRow.ResourceId)) {
+                $key = ("grant|{0}|{1}|{2}|{3}" -f $clientKey, $resourceKey, $permissionRow.ConsentType, $permissionRow.Permission).ToLowerInvariant()
+                if ($consentIndex.ContainsKey($key) -and $consentIndex[$key] -ge $neededRank) { $permissionRow.ReportedUnder = 'consentgrants' }
             }
         }
     }
@@ -929,9 +1182,12 @@ function Invoke-Check-EnterpriseAppGovernance {
             -SourceFile $coverageSource -ResultRows $coverageRows -RuleId 'enterprise-app-governance-coverage-unknown' -ObjectType 'tenant' -CoverageGap
     }
 
-    $ownerless = @($rows | Where-Object {
+    $ownerlessAll = @($rows | Where-Object {
         $_.Enabled -and $_.ServicePrincipalType -in @('Application','Legacy','') -and $_.OwnerReadState -eq 'Known' -and $_.OwnerCount -eq 0
     })
+    # The apps check reports high-permission apps without an owner as Critical.
+    $ownerlessReportedElsewhere = @($ownerlessAll | Where-Object { $_.AppId -and $appsIndex.ContainsKey(("owner|{0}" -f $_.AppId).ToLowerInvariant()) })
+    $ownerless = @($ownerlessAll | Where-Object { $_ -notin $ownerlessReportedElsewhere })
     if ($ownerless.Count -gt 0) {
         Add-EntraFinding -Severity 'Medium' -CheckId $checkId -Category $category `
             -Title ("{0} enabled enterprise application(s) have no tenant owner" -f $ownerless.Count) `
@@ -964,9 +1220,10 @@ function Invoke-Check-EnterpriseAppGovernance {
             -SourceFile $assignmentSource -ResultRows @($assignmentRows.ToArray() | Where-Object { $_.PrincipalType -eq 'Group' }) -RuleId 'enterprise-app-group-assignment' -ObjectType 'servicePrincipal'
     }
 
-    $tier0Permissions = @($permissionRows.ToArray() | Where-Object { $_.Risk -eq 'Tier0' })
-    $writePermissions = @($permissionRows.ToArray() | Where-Object { $_.Risk -eq 'WriteHigh' })
-    $highReadPermissions = @($permissionRows.ToArray() | Where-Object { $_.Risk -eq 'HighImpactRead' })
+    $tier0Permissions = @($permissionRows.ToArray() | Where-Object { $_.Risk -eq 'Tier0' -and -not $_.ReportedUnder })
+    $writePermissions = @($permissionRows.ToArray() | Where-Object { $_.Risk -eq 'WriteHigh' -and -not $_.ReportedUnder })
+    $highReadPermissions = @($permissionRows.ToArray() | Where-Object { $_.Risk -eq 'HighImpactRead' -and -not $_.ReportedUnder })
+    $userDelegatedPermissions = @($permissionRows.ToArray() | Where-Object { $_.Risk -eq 'UserDelegatedSensitive' -and -not $_.ReportedUnder })
     if ($tier0Permissions.Count -gt 0) {
         Add-EntraFinding -Severity 'Critical' -CheckId $checkId -Category $category `
             -Title ("{0} enterprise application grant(s) provide takeover or full-control capability" -f $tier0Permissions.Count) `
@@ -990,6 +1247,15 @@ function Invoke-Check-EnterpriseAppGovernance {
             -WhyItMatters 'Read-only does not mean low impact: application or delegated access to tenant-wide mail, files, chats, directory, audit, or security data enables large-scale confidential-data theft.' `
             -RecommendedAction 'Confirm every high-impact read grant is necessary, prefer resource-scoped controls where supported, and cover the app with owner/access/credential reviews.' `
             -SourceFile $permissionSource -ResultRows $highReadPermissions -RuleId 'enterprise-app-high-impact-read' -ObjectType 'servicePrincipal'
+    }
+    if ($userDelegatedPermissions.Count -gt 0) {
+        Add-EntraFinding -Severity 'Medium' -CheckId $checkId -Category $category `
+            -Title ("{0} app permission(s) granted for a single user allow write or sensitive-data access" -f $userDelegatedPermissions.Count) `
+            -Evidence ("{0} app(s) hold these permissions for one specific user each (usually because that user accepted a consent prompt). Each app can act only as that user, not for the whole tenant." -f @($userDelegatedPermissions.EnterpriseApplication | Select-Object -Unique).Count) `
+            -WhyItMatters 'Attackers trick users into accepting a malicious app (consent phishing). The app then keeps access to that user''s mail, files, or data until the permission is removed.' `
+            -RecommendedAction 'Check each app in the evidence list. Remove permissions for apps you do not recognise or no longer need, and limit user consent to verified publishers and low-risk permissions.' `
+            -DocumentationUrl 'https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/manage-application-permissions' `
+            -SourceFile $permissionSource -ResultRows $userDelegatedPermissions -RuleId 'enterprise-app-user-delegated-sensitive' -ObjectType 'servicePrincipal'
     }
 
     if ($activity.Known) {
@@ -1016,8 +1282,31 @@ function Invoke-Check-EnterpriseAppGovernance {
         }
     }
 
+    $reportedElsewhere = @(
+        foreach ($permissionRow in @($permissionRows.ToArray() | Where-Object { $_.ReportedUnder })) {
+            [pscustomobject]@{
+                EnterpriseApplication=$permissionRow.EnterpriseApplication; AppId=$permissionRow.AppId
+                Item=("{0} permission {1} on {2}" -f $permissionRow.GrantType, $permissionRow.Permission, $permissionRow.Resource)
+                ReportedUnder=$permissionRow.ReportedUnder
+            }
+        }
+        foreach ($ownerlessRow in $ownerlessReportedElsewhere) {
+            [pscustomobject]@{ EnterpriseApplication=$ownerlessRow.EnterpriseApplication; AppId=$ownerlessRow.AppId; Item='No owner'; ReportedUnder='apps' }
+        }
+    )
+    if ($reportedElsewhere.Count -gt 0) {
+        Add-EntraFinding -Severity 'Information' -CheckId $checkId -Category $category `
+            -Title ("{0} enterprise application item(s) are already reported by another check" -f $reportedElsewhere.Count) `
+            -Evidence ("These permissions or missing owners were already reported by the {0} at the same or a higher severity. They are listed here for completeness but not counted twice." -f $(
+                $otherChecks = @($reportedElsewhere.ReportedUnder | Select-Object -Unique)
+                if ($otherChecks.Count -eq 1) { "$($otherChecks[0]) check" } else { "{0} checks" -f ($otherChecks -join ' and ') })) `
+            -WhyItMatters 'Counting the same app permission or missing owner in two checks would show one problem twice and inflate the risk score.' `
+            -RecommendedAction 'Review and fix these items using the findings of the check named in the ReportedUnder column.' `
+            -SourceFile $permissionSource -ResultRows $reportedElsewhere -RuleId 'enterprise-app-reported-elsewhere' -ObjectType 'tenant'
+    }
+
     $riskFindings = @($script:Findings | Where-Object { $_.CheckId -eq $checkId -and $_.Severity -ne 'Information' })
-    if ($riskFindings.Count -eq 0) {
+    if ($riskFindings.Count -eq 0 -and $reportedElsewhere.Count -eq 0) {
         Add-EntraFinding -Severity 'Information' -CheckId $checkId -Category $category `
             -Title 'Enterprise application ownership, assignment, and activity reviewed' `
             -Evidence ("{0} non-Microsoft enterprise application(s), {1} direct access assignment(s), and {2} granted application/delegated permission entries were inventoried." -f $rows.Count, $assignmentRows.Count, $permissionRows.Count) `
@@ -1178,6 +1467,70 @@ function Invoke-EAReadOnlyAzRestCollection {
     return @($rows.ToArray())
 }
 
+function Get-EAAlertRuleClassifierText {
+    # Returns only the fields that describe WHAT an alert rule detects: its name, display
+    # name, description, scheduled-query text, and activity-log conditions. The resource
+    # id, resource group, location, tags, and managed-identity block are deliberately
+    # excluded so, for example, a CPU alert in "rg-identity" is not counted as an
+    # identity alert.
+    param([object]$Resource)
+
+    $pairs = New-Object System.Collections.Generic.List[object]
+    $add = {
+        param([string]$Field, [object]$Value)
+        foreach ($text in @($Value)) {
+            if ($null -ne $text -and -not [string]::IsNullOrWhiteSpace([string]$text)) {
+                $pairs.Add([pscustomobject]@{ Field=$Field; Text=[string]$text }) | Out-Null
+            }
+        }
+    }
+    $properties = Get-EAApplicationCheckValue $Resource 'properties'
+    & $add 'name' (Get-EAApplicationCheckValue $Resource 'name')
+    & $add 'displayName' (Get-EAApplicationCheckValue $properties 'displayName')
+    & $add 'description' (Get-EAApplicationCheckValue $properties 'description')
+    $index = 0
+    foreach ($criterion in @(Get-EAApplicationCheckElement (Get-EAApplicationCheckValue $properties 'criteria') 'allOf')) {
+        & $add ("criteria.allOf[{0}].query" -f $index) (Get-EAApplicationCheckValue $criterion 'query')
+        # "Split by dimensions" filters (for example UserPrincipalName Include <account>)
+        # narrow what the rule detects just like the query text. Excluded values describe
+        # what the rule ignores, so they are not used.
+        foreach ($dimension in @(Get-EAApplicationCheckElement $criterion 'dimensions')) {
+            if ([string](Get-EAApplicationCheckValue $dimension 'operator') -eq 'Exclude') { continue }
+            & $add ("criteria.allOf[{0}].dimensions.{1}" -f $index, [string](Get-EAApplicationCheckValue $dimension 'name')) @(Get-EAApplicationCheckElement $dimension 'values')
+        }
+        $index++
+    }
+    & $add 'source.query' (Get-EAApplicationCheckValue (Get-EAApplicationCheckValue $properties 'source') 'query')
+    $index = 0
+    foreach ($condition in @(Get-EAApplicationCheckElement (Get-EAApplicationCheckValue $properties 'condition') 'allOf')) {
+        $conditionName = "condition.allOf[{0}]" -f $index
+        & $add "$conditionName.field" (Get-EAApplicationCheckValue $condition 'field')
+        & $add "$conditionName.equals" (Get-EAApplicationCheckValue $condition 'equals')
+        & $add "$conditionName.containsAny" @(Get-EAApplicationCheckElement $condition 'containsAny')
+        $anyIndex = 0
+        foreach ($anyCondition in @(Get-EAApplicationCheckElement $condition 'anyOf')) {
+            $anyName = "$conditionName.anyOf[$anyIndex]"
+            & $add "$anyName.field" (Get-EAApplicationCheckValue $anyCondition 'field')
+            & $add "$anyName.equals" (Get-EAApplicationCheckValue $anyCondition 'equals')
+            & $add "$anyName.containsAny" @(Get-EAApplicationCheckElement $anyCondition 'containsAny')
+            $anyIndex++
+        }
+        $index++
+    }
+    return @($pairs.ToArray())
+}
+
+function Find-EAAlertRuleSignal {
+    # Returns a short "field contains 'token'" explanation for the first match, or $null.
+    param([object[]]$Texts, [Parameter(Mandatory)][string]$Pattern)
+
+    foreach ($pair in @($Texts)) {
+        $match = [regex]::Match([string]$pair.Text, $Pattern)
+        if ($match.Success) { return ("{0} contains '{1}'" -f $pair.Field, $match.Value) }
+    }
+    return $null
+}
+
 function Get-EAAzureMonitoringCoverage {
     param([string[]]$EmergencyAccessUpns)
 
@@ -1257,7 +1610,12 @@ function Get-EAAzureMonitoringCoverage {
         foreach ($setting in @(Invoke-EAReadOnlyAzRestCollection -Path $diagnosticPath -DefaultProfile $azContext)) {
             $properties = Get-EAApplicationCheckValue $setting 'properties'
             $enabledCategories = @()
-            foreach ($log in @(Get-EAApplicationCheckValue $properties 'logs')) {
+            if ($null -eq (Get-EAApplicationCheckValue $properties 'logs')) {
+                # Fail closed: a setting whose log list cannot be parsed must not be read
+                # as "no enabled export".
+                $errors.Add([pscustomobject]@{ Plane='Azure Resource Manager'; Scope='Tenant'; Control='Entra diagnostic settings'; Error=("Diagnostic setting '{0}' returned no readable logs list, so its exported categories are unknown." -f [string](Get-EAApplicationCheckValue $setting 'name')) }) | Out-Null
+            }
+            foreach ($log in @(Get-EAApplicationCheckElement $properties 'logs')) {
                 if ((ConvertTo-EAApplicationCheckBoolean (Get-EAApplicationCheckValue $log 'enabled')) -eq $true) {
                     $categoryName = [string](@(Get-EAApplicationCheckValue $log 'category'; Get-EAApplicationCheckValue $log 'categoryGroup') | Where-Object { $_ } | Select-Object -First 1)
                     if ($categoryName) { $enabledCategories += $categoryName }
@@ -1284,7 +1642,11 @@ function Get-EAAzureMonitoringCoverage {
         $errors.Add([pscustomobject]@{ Plane='Azure Resource Manager'; Scope='Tenant'; Control='Entra diagnostic settings'; Error=$_.Exception.Message }) | Out-Null
     }
 
-    $identityPattern = '(?i)(entra|azure.?ad|identity|sign.?in|audit|role|conditional.?access|authentication|credential|consent|federat|cross.?tenant)'
+    # Short tokens are word-bounded so unrelated text (for example SQL "auditingSettings",
+    # region names such as "centralus", "assigning", or "Azure Advisor") does not count,
+    # while Entra log tables, camel-case names (EntraIDRoleChange, UserSignInLogs), and
+    # role operations still match.
+    $identityPattern = '(?i)((?<![a-z])entra(?![a-z])|(?-i:Entra(?![a-z]))|azure.?ad(?!v)|\bAAD\w*|identity|(?<![a-z])sign.?ins?(logs?)?(?![a-z])|(?-i:Sign.?[Ii]n(s|Logs?)?(?![a-z]))|\baudit(logs?)?\b|\brole(s|management\w*|assignment\w*|definition\w*|eligibility\w*)?\b|conditional.?access|authentication|credential|consent|federat|cross.?tenant)'
     $emergencyPattern = '(?i)(break.?glass|emergency.?access)'
     foreach ($subscription in $subscriptions) {
         $subscriptionId = [string]$subscription.Id
@@ -1301,17 +1663,25 @@ function Get-EAAzureMonitoringCoverage {
                     $enabledValue = Get-EAApplicationCheckValue $properties 'enabled'
                     $parsedEnabled = ConvertTo-EAApplicationCheckBoolean $enabledValue
                     $enabled = if ($null -eq $enabledValue) { $true } elseif ($null -eq $parsedEnabled) { $false } else { $parsedEnabled }
-                    $serialized = ''
-                    try { $serialized = $resource | ConvertTo-Json -Compress -Depth 50 } catch {}
-                    $identitySignal = ($serialized -match $identityPattern)
-                    $emergencySignal = ($serialized -match $emergencyPattern)
-                    foreach ($upn in @($EmergencyAccessUpns | Where-Object { $_ })) {
-                        if ($serialized -match [regex]::Escape($upn)) { $emergencySignal = $true; break }
+                    $identityMatch = $null
+                    $emergencyMatch = $null
+                    if ($endpoint.Control -ne 'Action group') {
+                        $classifierTexts = @(Get-EAAlertRuleClassifierText -Resource $resource)
+                        $identityMatch = Find-EAAlertRuleSignal -Texts $classifierTexts -Pattern $identityPattern
+                        $emergencyMatch = Find-EAAlertRuleSignal -Texts $classifierTexts -Pattern $emergencyPattern
+                        if (-not $emergencyMatch) {
+                            foreach ($upn in @($EmergencyAccessUpns | Where-Object { $_ })) {
+                                $emergencyMatch = Find-EAAlertRuleSignal -Texts $classifierTexts -Pattern ('(?i)' + [regex]::Escape($upn))
+                                if ($emergencyMatch) { break }
+                            }
+                        }
                     }
+                    $identitySignal = [bool]$identityMatch
+                    $emergencySignal = [bool]$emergencyMatch
                     $actionGroupReferences = @()
                     if ($endpoint.Control -ne 'Action group') {
                         $actions = Get-EAApplicationCheckValue $properties 'actions'
-                        foreach ($reference in @(Get-EAApplicationCheckValue $actions 'actionGroups')) {
+                        foreach ($reference in @(Get-EAApplicationCheckElement $actions 'actionGroups')) {
                             $referenceId = if ($reference -is [string]) { [string]$reference } else { [string](Get-EAApplicationCheckValue $reference 'actionGroupId') }
                             if ($referenceId) { $actionGroupReferences += $referenceId.TrimEnd('/') }
                         }
@@ -1336,7 +1706,13 @@ function Get-EAAzureMonitoringCoverage {
                         Plane='Azure Resource Manager'; Scope=("{0} ({1})" -f $subscriptionName,$subscriptionId)
                         Control=$endpoint.Control; Name=[string](Get-EAApplicationCheckValue $resource 'name')
                         Enabled=$enabled; State='Known'
-                        Detail=if ($endpoint.Control -eq 'Action group') { 'Notification/action destination metadata read.' } else { 'Rule metadata, criteria, and action references read.' }
+                        Detail=if ($endpoint.Control -eq 'Action group') { 'Notification/action destination metadata read.' } `
+                            elseif ($identityMatch -or $emergencyMatch) {
+                                'Rule read. ' + (@(
+                                    if ($identityMatch) { "Identity match: $identityMatch." }
+                                    if ($emergencyMatch) { "Emergency-account match: $emergencyMatch." }
+                                ) -join ' ')
+                            } else { 'Rule read. No identity or emergency-account keyword in its name, description, query, or conditions.' }
                         IdentitySignal=$identitySignal; EmergencySignal=$emergencySignal
                         ActionGroupReferences=($actionGroupReferences -join ',')
                     }) | Out-Null
@@ -1437,9 +1813,11 @@ function Invoke-Check-Monitoring {
             -SourceFile $probeSource -ResultRows $staleCore -RuleId 'monitoring-core-log-stale' -ObjectType 'tenant'
     }
 
-    $breakGlassUpns = @()
-    try { $breakGlassUpns = @(Normalize-StringList -Values $BreakGlassUpns) } catch {}
-    $azureCoverage = Get-EAAzureMonitoringCoverage -EmergencyAccessUpns $breakGlassUpns
+    # Must not be named $breakGlassUpns: PowerShell variable names are case-insensitive, so
+    # a local of that name would hide the script's -BreakGlassUpns parameter.
+    $emergencyUpns = @()
+    try { $emergencyUpns = @(Normalize-StringList -Values $BreakGlassUpns) } catch {}
+    $azureCoverage = Get-EAAzureMonitoringCoverage -EmergencyAccessUpns $emergencyUpns
 
     $crossPlaneRows = @($azureCoverage.Rows.ToArray())
     foreach ($coverageError in @($azureCoverage.Errors.ToArray())) {
@@ -1519,7 +1897,7 @@ function Invoke-Check-Monitoring {
         }
     }
 
-    $emergencyRows = @(Get-EAEmergencyAccessMonitoringRows -UserPrincipalNames $breakGlassUpns)
+    $emergencyRows = @(Get-EAEmergencyAccessMonitoringRows -UserPrincipalNames $emergencyUpns)
     foreach ($row in $emergencyRows) {
         $row.AlertRuleState = if ($azureCoverage.State -ne 'Complete') { 'Unknown-CrossPlaneIncomplete' } `
             elseif ($azureCoverage.EmergencyAlertCandidateCount -eq 0) { 'Known-NoMatchingRuleCandidate' } `
@@ -1528,11 +1906,27 @@ function Invoke-Check-Monitoring {
     }
     $emergencySource = Write-Evidence -BaseName 'emergency_access_monitoring' -Rows $emergencyRows -Title 'Emergency-Access Sign-In Monitoring Coverage' `
         -Notes @('Graph sign-in visibility and configured alert-rule delivery are separate controls; this check does not infer one from the other.')
-    $unreadableEmergency = @($emergencyRows | Where-Object { $_.SignInLogState -like 'Unknown*' })
-    if ($unreadableEmergency.Count -gt 0) {
+    # Describe what was actually learned about Azure Monitor instead of always calling it unknown.
+    $azureAlertText = if ($azureCoverage.State -eq 'Complete') {
+        "Azure Monitor was read: {0} emergency-account alert rule candidate(s), {1} linked to an enabled action group." -f $azureCoverage.EmergencyAlertCandidateCount,$azureCoverage.EmergencyAlertWithActionCount
+    } else {
+        "Azure Monitor alert rules could not be fully read ({0})." -f $azureCoverage.State
+    }
+    $noAccountInput = @($emergencyRows | Where-Object { $_.SignInLogState -eq 'Unknown-NoAccountInput' })
+    $unreadableEmergency = @($emergencyRows | Where-Object { $_.SignInLogState -like 'Unknown*' -and $_.SignInLogState -ne 'Unknown-NoAccountInput' })
+    if ($noAccountInput.Count -gt 0) {
+        # A missing command-line value is not a tenant weakness; the breakglass check
+        # already reports undesignated emergency accounts. Record it without risk points.
+        Add-EntraFinding -Severity 'Information' -CheckId $checkId -Category $category `
+            -Title 'Emergency-account sign-in monitoring was not checked: no accounts were given' `
+            -Evidence ("No emergency (break-glass) accounts were supplied with -BreakGlassUpns, so their sign-in logs and alerts could not be tested. {0}" -f $azureAlertText) `
+            -WhyItMatters 'Emergency accounts skip some security controls, so every sign-in with one should raise an alert right away. This can only be verified when the audit knows which accounts they are.' `
+            -RecommendedAction 'Re-run with -BreakGlassUpns (or the emergency-accounts field in the GUI) listing your emergency accounts.' `
+            -SourceFile $emergencySource -ResultRows $emergencyRows -RuleId 'emergency-access-monitoring-no-account-input' -ObjectType 'tenant' -CoverageGap
+    } elseif ($unreadableEmergency.Count -gt 0) {
         Add-EntraFinding -Severity 'Medium' -CheckId $checkId -Category $category `
             -Title 'Emergency-access sign-in monitoring cannot be fully verified' `
-            -Evidence ("{0} emergency-account monitoring row(s) lack verifiable sign-in-log coverage; Azure Monitor alert-rule state is also cross-plane and unknown." -f $unreadableEmergency.Count) `
+            -Evidence ("Sign-in logs could not be read for {0} emergency account(s). {1}" -f $unreadableEmergency.Count,$azureAlertText) `
             -WhyItMatters 'Emergency accounts are deliberately exempt from some preventive controls; every use must therefore create an immediate, independently routed alert.' `
             -RecommendedAction 'Supply the designated accounts with -BreakGlassUpns, confirm their sign-in logs are readable, and manually verify an Azure Monitor/Sentinel alert plus tested notification routing for every emergency-account sign-in.' `
             -SourceFile $emergencySource -ResultRows $emergencyRows -RuleId 'emergency-access-monitoring-unknown' -ObjectType 'tenant' -CoverageGap
@@ -1584,9 +1978,34 @@ function Get-EAChangeMonitoringClassification {
         $reason = 'A Conditional Access policy, named location, or related enforcement object changed.'
         $highRisk = $true
     } elseif ($text -match '(?i)(authentication methods? policy|authenticationMethodsPolicy|authentication method|authentication strength|security info|temporary access pass|FIDO2|passkey|software OATH|passwordless|authenticator app|phone method|email method|windows hello|certificate-based authentication|strong authentication method)') {
-        $domain = 'Authentication method'
-        $reason = 'An authentication method, registration, or tenant authentication-method policy changed.'
-        $highRisk = $true
+        # A user managing their own sign-in methods (security info, passkeys, Windows Hello,
+        # phone sign-in, password-reset info) is routine self-service, not a control-plane
+        # change. Many such events match this branch only through loggedByService
+        # 'Authentication Methods', so that alone must not make them high risk. Admin
+        # actions ("Admin registered security info"), any event where the initiator is a
+        # different user than the target user, and tenant policy changes stay high risk.
+        $initiatorUser = Get-EAApplicationCheckValue (Get-EAApplicationCheckValue $AuditEvent 'initiatedBy') 'user'
+        $initiatorKeys = @(
+            [string](Get-EAApplicationCheckValue $initiatorUser 'id')
+            [string](Get-EAApplicationCheckValue $initiatorUser 'userPrincipalName')
+        ) | Where-Object { $_ }
+        $targetUserKeys = @(foreach ($target in @(Get-EAApplicationCheckElement $AuditEvent 'targetResources')) {
+            if ([string](Get-EAApplicationCheckValue $target 'type') -ne 'User') { continue }
+            [string](Get-EAApplicationCheckValue $target 'id')
+            [string](Get-EAApplicationCheckValue $target 'userPrincipalName')
+        }) | Where-Object { $_ }
+        $sameUser = @($initiatorKeys | Where-Object { $_ -in $targetUserKeys }).Count -gt 0
+        $otherUser = (@($initiatorKeys).Count -gt 0 -and @($targetUserKeys).Count -gt 0 -and -not $sameUser)
+        $selfServiceActivity = $activity -match '(?i)^User\b|self-service|^(Add|Delete|Remove|Update) (Passkey|Windows Hello for Business credential|passwordless phone sign-in credential|platform credential)|^Get passkey creation options|^(GET|POST|PUT|PATCH|DELETE) UserAuthMethod\.'
+        if ($activity -notmatch '(?i)^Admin\b' -and -not $otherUser -and ($sameUser -or $selfServiceActivity)) {
+            $domain = 'User authentication registration'
+            $reason = 'A user added, changed, or removed their own sign-in method (for example MFA, a passkey, Windows Hello, or password-reset info).'
+            $highRisk = $false
+        } else {
+            $domain = 'Authentication method'
+            $reason = 'An authentication method, registration, or tenant authentication-method policy changed.'
+            $highRisk = $true
+        }
     } elseif ($text -match '(?i)(cross[ -]?tenant|federat|domain authentication|external identity provider|B2B.*trust|inbound trust|outbound trust)') {
         $domain = 'Federation or cross-tenant trust'
         $reason = 'A federation, domain-authentication, identity-provider, or cross-tenant trust control changed.'
@@ -1690,7 +2109,7 @@ function Invoke-Check-ChangeMonitoring {
         $targets = @()
         $targetTypes = @()
         $modifiedNames = @()
-        foreach ($target in @(Get-EAApplicationCheckValue $event 'targetResources')) {
+        foreach ($target in @(Get-EAApplicationCheckElement $event 'targetResources')) {
             $targetName = [string](@(
                 Get-EAApplicationCheckValue $target 'userPrincipalName'
                 Get-EAApplicationCheckValue $target 'displayName'
@@ -1699,7 +2118,7 @@ function Invoke-Check-ChangeMonitoring {
             if ($targetName) { $targets += $targetName }
             $targetType = [string](Get-EAApplicationCheckValue $target 'type')
             if ($targetType) { $targetTypes += $targetType }
-            foreach ($property in @(Get-EAApplicationCheckValue $target 'modifiedProperties')) {
+            foreach ($property in @(Get-EAApplicationCheckElement $target 'modifiedProperties')) {
                 $propertyName = [string](Get-EAApplicationCheckValue $property 'displayName')
                 if ($propertyName) { $modifiedNames += $propertyName }
             }
@@ -1732,7 +2151,8 @@ function Invoke-Check-ChangeMonitoring {
         )
 
     $successfulHigh = @($resultRows | Where-Object { $_.ReviewPriority -eq 'High' })
-    $successfulStandard = @($resultRows | Where-Object { $_.ReviewPriority -eq 'Standard' -and $_.Result -match '^(?i:success)$' })
+    $successfulStandard = @($resultRows | Where-Object { $_.ReviewPriority -eq 'Standard' -and $_.Domain -eq 'Group owner or membership' -and $_.Result -match '^(?i:success)$' })
+    $userRegistrations = @($resultRows | Where-Object { $_.Domain -eq 'User authentication registration' })
     $attemptedHigh = @($resultRows | Where-Object { $_.ReviewPriority -eq 'AttemptedHigh' })
 
     if ($successfulHigh.Count -gt 0) {
@@ -1758,6 +2178,14 @@ function Invoke-Check-ChangeMonitoring {
             -WhyItMatters 'Repeated or unexpected failed administrative operations can signal discovery, misuse of stale automation, or an attempted persistence/control change.' `
             -RecommendedAction 'Review the initiator, failure reason, targets, and correlated events; tune alerts for unexpected application initiators and repeated failures.' `
             -SourceFile $source -ResultRows $attemptedHigh -RuleId 'attempted-high-risk-directory-change' -ObjectType 'auditEvent'
+    }
+    if ($userRegistrations.Count -gt 0) {
+        Add-EntraFinding -Severity 'Information' -CheckId $checkId -Category $category `
+            -Title ("{0} user self-service sign-in method (MFA) change(s) were recorded" -f $userRegistrations.Count) `
+            -Evidence ("{0} user(s) added, changed, or removed their own sign-in methods (for example MFA, passkeys, Windows Hello, or password-reset info). These are listed for reference and are not counted as high-risk changes." -f @($userRegistrations.Initiator | Select-Object -Unique).Count) `
+            -WhyItMatters 'Users normally register and update their own MFA methods. A method added by an attacker who already has a user''s password is a warning sign, so unexpected entries are worth a look.' `
+            -RecommendedAction 'Spot-check registrations for privileged users and for accounts with recent risky sign-ins. Ask the user to confirm any change they did not make.' `
+            -SourceFile $source -ResultRows $userRegistrations -RuleId 'recent-user-auth-method-registration' -ObjectType 'auditEvent'
     }
     if ($resultRows.Count -eq 0) {
         Add-EntraFinding -Severity 'Information' -CheckId $checkId -Category $category `

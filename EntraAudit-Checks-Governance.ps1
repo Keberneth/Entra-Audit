@@ -137,13 +137,16 @@ function Invoke-EAGovGraphCollection {
             $next = [string](Get-EAGovProperty -InputObject $response -Name '@odata.nextLink')
             $pages++
         }
-        if ($next) { throw "Microsoft Graph collection exceeded the $MaxPages-page safety limit; coverage is incomplete." }
+        # Hitting the page safety limit is a partial read, not a failure: return the
+        # rows read so far with Truncated=$true so callers emit their pagination
+        # coverage finding instead of treating the partial set as complete.
+        $truncated = [bool]$next
 
         return [pscustomobject]@{
             Success   = $true
             Rows      = $rows.ToArray()
             Pages     = $pages
-            Truncated = $false
+            Truncated = $truncated
             Error     = $null
             StatusCode = 200
         }
@@ -246,7 +249,11 @@ function Add-EAGovFinding {
         Title             = $Title
         Evidence          = $Evidence
         WhyItMatters      = $WhyItMatters
+        # The Microsoft reference also travels as its own field so report writers can
+        # render it as a link and exports can carry it as a column. Until every writer
+        # and export does, it stays in the text as well so no output loses it.
         RecommendedAction = (($RecommendedAction.TrimEnd('.')) + ". Microsoft source: $DocumentationUrl")
+        DocumentationUrl  = $DocumentationUrl
         SourceFile        = $SourceFile
     }
     if ($AffectedPrincipal) { $parameters.AffectedPrincipal = $AffectedPrincipal }
@@ -273,37 +280,10 @@ function Add-EAGovCoverageFinding {
         -Title "$DataSource coverage is unknown" `
         -Evidence "$DataSource could not be fully read: $Reason This is an unknown/partial result, not a clean result." `
         -WhyItMatters "Without $DataSource, this part of the control cannot be evaluated reliably." `
-        -RecommendedAction "Grant the read-only scope $RequiredScope, confirm the required reader role/license, and rerun the audit" `
+        -RecommendedAction "Grant the audit account read-only access ($RequiredScope), confirm it has the needed reader role and license, then run the audit again" `
         -DocumentationUrl $DocumentationUrl -SourceFile $SourceFile `
         -RuleId ("coverage-" + (($DataSource -replace '[^A-Za-z0-9]+','-').Trim('-').ToLowerInvariant())) `
         -CoverageGap
-}
-
-function Get-EAGovernanceCheckScopeManifest {
-    [CmdletBinding()]
-    param()
-
-    return [ordered]@{
-        'recommendations' = @('DirectoryRecommendations.Read.All')
-        'securescore'          = @('SecurityEvents.Read.All')
-        'accessreviews'        = @('AccessReview.Read.All','Group.Read.All')
-        'authrecovery'         = @(
-            'AuditLog.Read.All','Policy.Read.All',
-            'Directory.Read.All','OnPremDirectorySynchronization.Read.All','Organization.Read.All'
-        )
-        'groupgovernance'      = @('Group.Read.All','Reports.Read.All','Directory.Read.All')
-        'externaldelegation'   = @('DelegatedAdminRelationship.Read.All','RoleManagement.Read.Directory','User.Read.All','AuditLog.Read.All')
-        'federationhealth'     = @(
-            'Domain.Read.All','Domain-InternalFederation.Read.All',
-            'OnPremDirectorySynchronization.Read.All','Organization.Read.All'
-        )
-        'identitygovernance'   = @(
-            'EntitlementManagement.Read.All','LifecycleWorkflows.Read.All','Agreement.Read.All',
-            'Group.Read.All','PrivilegedAssignmentSchedule.Read.AzureADGroup',
-            'PrivilegedEligibilitySchedule.Read.AzureADGroup','RoleManagementPolicy.Read.AzureADGroup',
-            'Policy.Read.All'
-        )
-    }
 }
 
 function Invoke-Check-EntraRecommendations {
@@ -312,7 +292,11 @@ function Invoke-Check-EntraRecommendations {
 
     $checkId = 'recommendations'
     $doc = 'https://learn.microsoft.com/graph/api/directory-list-recommendation?view=graph-rest-beta'
-    $result = Invoke-EAGovGraphCollection -Uri 'https://graph.microsoft.com/beta/directory/recommendations?$expand=impactedResources'
+    # Prefer include-unknown-enum-members so evolvable status/type members (riskAccepted,
+    # needsMoreAction, longLivedCredentials, ...) arrive by name instead of collapsing to
+    # unknownFutureValue, which would make them unclassifiable and collide on one rule id.
+    $result = Invoke-EAGovGraphCollection -Uri 'https://graph.microsoft.com/beta/directory/recommendations?$expand=impactedResources' `
+        -Headers @{ Prefer = 'include-unknown-enum-members' }
     if (-not $result.Success) { throw $result.Error }
 
     $rows = foreach ($recommendation in @($result.Rows)) {
@@ -339,7 +323,7 @@ function Invoke-Check-EntraRecommendations {
     }
     $src = Write-Evidence -BaseName 'entra_recommendations' -Rows @($rows) `
         -Title 'Microsoft Entra Recommendations (beta, read-only)' `
-        -Notes @('The recommendations API is beta and can change. Only active recommendations become risk findings.')
+        -Notes @('The recommendations API is beta and can change. Only active and needsMoreAction recommendations become risk findings.')
 
     if ($result.Truncated) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Tenant Posture' -DataSource 'Entra recommendations pagination' `
@@ -347,7 +331,13 @@ function Invoke-Check-EntraRecommendations {
             -DocumentationUrl $doc -SourceFile $src
     }
 
-    $knownStatuses = @('active','completed','dismissed','postponed')
+    # Documented recommendationStatus members (beta). active and needsMoreAction are open
+    # (needsMoreAction = Microsoft re-verified that user-completed resources are still
+    # impacted); every other documented member is a resolved/triaged state. Anything else,
+    # including unknownFutureValue, stays a coverage gap rather than a clean result.
+    $openStatuses = @('active','needsMoreAction')
+    $knownStatuses = @($openStatuses) + @('completedBySystem','completedByUser','dismissed','postponed',
+        'riskAccepted','thirdParty','planned','alternateMitigation')
     $unknownStatusRows = @($result.Rows | Where-Object {
         $status = [string](Get-EAGovProperty $_ 'status')
         [string]::IsNullOrWhiteSpace($status) -or $status -notin $knownStatuses
@@ -358,10 +348,12 @@ function Invoke-Check-EntraRecommendations {
             -RequiredScope 'DirectoryRecommendations.Read.All' -DocumentationUrl $doc -SourceFile $src
     }
 
-    $active = @($result.Rows | Where-Object { [string](Get-EAGovProperty $_ 'status') -ieq 'active' })
+    $active = @($result.Rows | Where-Object { [string](Get-EAGovProperty $_ 'status') -in $openStatuses })
     foreach ($recommendation in $active) {
         $priority = [string](Get-EAGovProperty $recommendation 'priority')
+        $status = [string](Get-EAGovProperty $recommendation 'status')
         $severity = switch -Regex ($priority) {
+            '^critical$' { 'Critical'; break }
             '^high$'   { 'High'; break }
             '^medium$' { 'Medium'; break }
             '^low$'    { 'Low'; break }
@@ -370,15 +362,17 @@ function Invoke-Check-EntraRecommendations {
         $name = [string](Get-EAGovProperty $recommendation 'displayName')
         if ([string]::IsNullOrWhiteSpace($name)) { $name = [string](Get-EAGovProperty $recommendation 'recommendationType') }
         $steps = @(Get-EAGovProperty $recommendation 'actionSteps')
-        $firstStep = if ($steps.Count -gt 0) { [string](Get-EAGovProperty $steps[0] 'text') } else { 'Review the recommendation details and impacted resources in Microsoft Entra.' }
+        $firstStep = if ($steps.Count -gt 0) { [string](Get-EAGovProperty $steps[0] 'text') } else { '' }
+        # @(null) has Count 1, and a step can have no text; RecommendedAction is mandatory.
+        if ([string]::IsNullOrWhiteSpace($firstStep)) { $firstStep = 'Review the recommendation details and impacted resources in Microsoft Entra.' }
         $insights = [string](Get-EAGovProperty $recommendation 'insights')
         $resourceCount = @(Get-EAGovProperty $recommendation 'impactedResources').Count
         $id = [string](Get-EAGovProperty $recommendation 'id')
 
         Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'Tenant Posture' `
             -Title "Active Microsoft Entra recommendation: $name" `
-            -Evidence ("Priority={0}; impacted resources={1}; score={2}/{3}. {4}" -f $priority,$resourceCount,
-                (Get-EAGovProperty $recommendation 'currentScore'),(Get-EAGovProperty $recommendation 'maxScore'),$insights) `
+            -Evidence ("Status={5}; priority={0}; impacted resources={1}; score={2}/{3}. {4}" -f $priority,$resourceCount,
+                (Get-EAGovProperty $recommendation 'currentScore'),(Get-EAGovProperty $recommendation 'maxScore'),$insights,$status) `
             -WhyItMatters 'Microsoft computes these recommendations from tenant configuration and activity, providing a maintained backstop for controls that can evolve after this audit was released.' `
             -RecommendedAction $firstStep -DocumentationUrl $doc -SourceFile $src `
             -RuleId ("entra-recommendation-" + [string](Get-EAGovProperty $recommendation 'recommendationType')) `
@@ -388,7 +382,7 @@ function Invoke-Check-EntraRecommendations {
     if ($active.Count -eq 0 -and $unknownStatusRows.Count -eq 0 -and -not $result.Truncated) {
         Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Tenant Posture' `
             -Title 'Microsoft Entra recommendations reviewed' `
-            -Evidence ("{0} recommendation record(s) returned; none currently have status active." -f @($result.Rows).Count) `
+            -Evidence ("{0} recommendation record(s) returned; none currently have status active or needsMoreAction." -f @($result.Rows).Count) `
             -WhyItMatters 'The recommendation feed is a Microsoft-maintained signal for tenant-specific identity improvements.' `
             -RecommendedAction 'Continue reviewing the feed regularly and investigate newly active recommendations' `
             -DocumentationUrl $doc -SourceFile $src -ResultRows @($rows)
@@ -655,9 +649,9 @@ function Invoke-Check-AccessReviews {
     if ($rows.Count -eq 0) {
         Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Identity Governance' `
             -Title 'No access review definitions are configured' `
-            -Evidence 'The definitions API returned zero access reviews. This is a known empty result, not an API failure.' `
+            -Evidence 'The definitions API returned zero access reviews. This is a known empty result, not an API failure. Access reviews require Microsoft Entra ID P2, Microsoft Entra ID Governance or Microsoft Entra Suite licensing.' `
             -WhyItMatters 'Without recurring reviews, privileged, guest, group, and application access can persist after its business need ends.' `
-            -RecommendedAction 'Configure recurring access reviews for privileged roles, sensitive groups, guest access, and enterprise-application assignments' `
+            -RecommendedAction 'Configure recurring access reviews for privileged roles, sensitive groups, guest access, and enterprise-application assignments. If the tenant is not licensed for access reviews, document the equivalent recertification process you use instead' `
             -DocumentationUrl $doc -SourceFile $src -RuleId 'access-reviews-none'
         return
     }
@@ -740,6 +734,11 @@ function Invoke-Check-AccessReviews {
                 -RecommendedAction 'Create recurring reviews for role-assignable group membership and ownership, with automatic removal or a monitored apply process' `
                 -DocumentationUrl $doc -SourceFile $roleSrc -ResultRows $roleRows -RuleId 'access-review-role-groups-uncovered'
         }
+        if ($roleGroups.Truncated) {
+            Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Role-assignable group access-review coverage' `
+                -Reason "pagination exceeded $($roleGroups.Pages) pages; only the groups read were compared." -RequiredScope 'Group.Read.All' `
+                -DocumentationUrl $doc -SourceFile $src
+        }
     } else {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Role-assignable group access-review coverage' `
             -Reason ([string]$roleGroups.Error.Exception.Message) -RequiredScope 'Group.Read.All' `
@@ -762,7 +761,18 @@ function Invoke-Check-AuthRecovery {
     $doc = 'https://learn.microsoft.com/graph/api/authenticationmethodsroot-list-userregistrationdetails?view=graph-rest-1.0'
     $policyDoc = 'https://learn.microsoft.com/graph/api/authenticationmethodspolicy-get?view=graph-rest-1.0'
 
-    $registration = @(Get-EARegistrationDetails)
+    # authrecovery is registered as self-gating (Scopes=@()), so a missing
+    # AuditLog.Read.All must not abort the independent policy, password-protection and
+    # hybrid sub-controls below. Record the failure as a coverage gap instead.
+    $registrationKnown = $true
+    $registrationError = $null
+    try {
+        $registration = @(Get-EARegistrationDetails)
+    } catch {
+        $registration = @()
+        $registrationKnown = $false
+        $registrationError = [string]$_.Exception.Message
+    }
     $rows = @(foreach ($record in $registration) {
         [pscustomobject]@{
             Id                 = Get-EAGovProperty $record 'id'
@@ -785,12 +795,18 @@ function Invoke-Check-AuthRecovery {
     $src = Write-Evidence -BaseName 'authentication_recovery_registration' -Rows @($rows) `
         -Title 'Authentication Recovery, Passwordless, and System-Preferred Registration'
 
-    if ($rows.Count -eq 0) {
+    if (-not $registrationKnown) {
+        Add-EAGovCoverageFinding -CheckId $checkId -Category 'Authentication' -DataSource 'Authentication-method user registration details' `
+            -Reason ("the registration report read failed ({0}); SSPR, passwordless and system-preferred registration rules were not evaluated." -f $registrationError) `
+            -RequiredScope 'AuditLog.Read.All' -DocumentationUrl $doc -SourceFile $src
+    } elseif ($rows.Count -eq 0) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'Authentication' -DataSource 'Authentication-method user registration details' `
             -Reason 'the API returned no rows; disabled users are not represented by this API and tenant-wide recovery posture cannot be inferred.' `
             -RequiredScope 'AuditLog.Read.All' -DocumentationUrl $doc -SourceFile $src
-        return
     }
+    # Registration-derived rules run only on a successful, non-empty read. The policy,
+    # password-protection and hybrid sections below are independent and always run.
+    $registrationAvailable = $registrationKnown -and $rows.Count -gt 0
 
     $members = @($rows | Where-Object { [string]::IsNullOrWhiteSpace([string]$_.UserType) -or [string]$_.UserType -ieq 'member' })
     $admins = @($members | Where-Object { $_.IsAdmin -eq $true })
@@ -800,59 +816,61 @@ function Invoke-Check-AuthRecovery {
     $passwordlessAdmins = @($admins | Where-Object { $_.IsPasswordlessCapable -eq $true })
     $adminsWithoutPasswordless = @($admins | Where-Object { $_.IsPasswordlessCapable -ne $true })
 
-    if ($ssprEnabled.Count -eq 0) {
-        Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Authentication' `
-            -Title 'No member users are reported as enabled for self-service password reset' `
-            -Evidence ("The registration report contains {0} member user(s), with IsSsprEnabled=true for zero." -f $members.Count) `
-            -WhyItMatters 'Without governed self-service recovery, password resets depend on helpdesk intervention and are more exposed to social-engineering pressure.' `
-            -RecommendedAction 'Enable SSPR for an appropriate pilot and then broad user population, requiring strong recovery methods and monitoring reset events' `
-            -DocumentationUrl $doc -SourceFile $src -RuleId 'sspr-no-enabled-members'
-    } elseif ($ssprNotCapable.Count -gt 0) {
-        Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Authentication' `
-            -Title ("{0} SSPR-enabled member user(s) are not capable of self-service reset" -f $ssprNotCapable.Count) `
-            -Evidence 'These users are enabled by policy but do not have the required allowed recovery-method registration.' `
-            -WhyItMatters 'Users who cannot complete SSPR remain dependent on helpdesk resets and may be locked out during an incident.' `
-            -RecommendedAction 'Run a registration campaign and remediate method-policy or registration gaps for the affected users' `
-            -DocumentationUrl $doc -SourceFile $src -ResultRows $ssprNotCapable -RuleId 'sspr-enabled-not-capable'
-    }
-
-    if ($adminsWithoutPasswordless.Count -gt 0) {
-        Add-EAGovFinding -Severity 'High' -CheckId $checkId -Category 'Authentication' `
-            -Title ("{0} administrator(s) are not reported as passwordless capable" -f $adminsWithoutPasswordless.Count) `
-            -Evidence ("{0}/{1} administrator(s) have IsPasswordlessCapable=true; every remaining administrator is listed. Passwordless capability is not by itself proof that Conditional Access requires phishing-resistant authentication." -f $passwordlessAdmins.Count,$admins.Count) `
-            -WhyItMatters 'Privileged accounts that still depend on passwords have more exposure to password theft, replay, and helpdesk recovery attacks.' `
-            -RecommendedAction 'Register FIDO2/passkeys, Windows Hello for Business, or another allowed passwordless method for every administrator, then separately require phishing-resistant authentication strength through Conditional Access' `
-            -DocumentationUrl $doc -SourceFile $src -ResultRows $adminsWithoutPasswordless -RuleId 'passwordless-admins-not-capable'
-    }
-
-    if ($members.Count -gt 0) {
-        $passwordlessPercent = [math]::Round(($passwordless.Count * 100.0) / $members.Count, 1)
-        if ($passwordlessPercent -lt 25) {
-            Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Authentication' `
-                -Title ("Passwordless-capable adoption is {0}%" -f $passwordlessPercent) `
-                -Evidence ("{0}/{1} member users are reported as passwordless capable. The 25% threshold is an adoption-prioritization threshold, not a compliance requirement." -f $passwordless.Count,$members.Count) `
-                -WhyItMatters 'Low adoption limits the tenant population that can move away from phishable password-based authentication.' `
-                -RecommendedAction 'Expand registration and rollout of allowed passwordless methods, prioritizing privileged and high-risk populations' `
-                -DocumentationUrl $doc -SourceFile $src -RuleId 'passwordless-low-adoption'
+    if ($registrationAvailable) {
+        if ($ssprEnabled.Count -eq 0) {
+            Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Authentication' `
+                -Title 'No member users are reported as enabled for self-service password reset' `
+                -Evidence ("The registration report contains {0} member user(s), with IsSsprEnabled=true for zero." -f $members.Count) `
+                -WhyItMatters 'Without governed self-service recovery, password resets depend on helpdesk intervention and are more exposed to social-engineering pressure.' `
+                -RecommendedAction 'Enable SSPR for an appropriate pilot and then broad user population, requiring strong recovery methods and monitoring reset events' `
+                -DocumentationUrl $doc -SourceFile $src -RuleId 'sspr-no-enabled-members'
+        } elseif ($ssprNotCapable.Count -gt 0) {
+            Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Authentication' `
+                -Title ("{0} SSPR-enabled member user(s) are not capable of self-service reset" -f $ssprNotCapable.Count) `
+                -Evidence 'These users are enabled by policy but do not have the required allowed recovery-method registration.' `
+                -WhyItMatters 'Users who cannot complete SSPR remain dependent on helpdesk resets and may be locked out during an incident.' `
+                -RecommendedAction 'Run a registration campaign and remediate method-policy or registration gaps for the affected users' `
+                -DocumentationUrl $doc -SourceFile $src -ResultRows $ssprNotCapable -RuleId 'sspr-enabled-not-capable'
         }
-    }
 
-    $systemPreferredKnown = @($members | Where-Object { $null -ne $_.IsSystemPreferredAuthenticationMethodEnabled })
-    if ($systemPreferredKnown.Count -eq 0) {
-        Add-EAGovCoverageFinding -CheckId $checkId -Category 'Authentication' -DataSource 'System-preferred authentication status' `
-            -Reason 'the property was absent/null on every registration record.' -RequiredScope 'AuditLog.Read.All' `
-            -DocumentationUrl $doc -SourceFile $src
-    } else {
-        $memberSystemPreferredOff = @($members | Where-Object { $_.IsSystemPreferredAuthenticationMethodEnabled -eq $false })
-        if ($memberSystemPreferredOff.Count -gt 0) {
-            $adminSystemPreferredOff = @($memberSystemPreferredOff | Where-Object { $_.IsAdmin -eq $true })
-            $severity = if ($adminSystemPreferredOff.Count -gt 0) { 'Medium' } else { 'Low' }
-            Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'Authentication' `
-                -Title ("System-preferred authentication is disabled for {0} member registration record(s)" -f $memberSystemPreferredOff.Count) `
-                -Evidence ("IsSystemPreferredAuthenticationMethodEnabled=false; {0} affected record(s) are administrators. The report exposes effective per-user state, not a user choice." -f $adminSystemPreferredOff.Count) `
-                -WhyItMatters 'System-preferred MFA helps select the strongest registered method and reduces authentication-strength downgrade.' `
-                -RecommendedAction 'Enable system-preferred authentication tenant-wide after validating exception populations' `
-                -DocumentationUrl $doc -SourceFile $src -ResultRows $memberSystemPreferredOff -RuleId 'system-preferred-member-disabled'
+        if ($adminsWithoutPasswordless.Count -gt 0) {
+            Add-EAGovFinding -Severity 'High' -CheckId $checkId -Category 'Authentication' `
+                -Title ("{0} administrator(s) are not reported as passwordless capable" -f $adminsWithoutPasswordless.Count) `
+                -Evidence ("{0}/{1} administrator(s) have IsPasswordlessCapable=true; every remaining administrator is listed. Passwordless capability is not by itself proof that Conditional Access requires phishing-resistant authentication." -f $passwordlessAdmins.Count,$admins.Count) `
+                -WhyItMatters 'Privileged accounts that still depend on passwords have more exposure to password theft, replay, and helpdesk recovery attacks.' `
+                -RecommendedAction 'Register FIDO2/passkeys, Windows Hello for Business, or another allowed passwordless method for every administrator, then separately require phishing-resistant authentication strength through Conditional Access' `
+                -DocumentationUrl $doc -SourceFile $src -ResultRows $adminsWithoutPasswordless -RuleId 'passwordless-admins-not-capable'
+        }
+
+        if ($members.Count -gt 0) {
+            $passwordlessPercent = [math]::Round(($passwordless.Count * 100.0) / $members.Count, 1)
+            if ($passwordlessPercent -lt 25) {
+                Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Authentication' `
+                    -Title ("Passwordless-capable adoption is {0}%" -f $passwordlessPercent) `
+                    -Evidence ("{0}/{1} member users are reported as passwordless capable. The 25% threshold is an adoption-prioritization threshold, not a compliance requirement." -f $passwordless.Count,$members.Count) `
+                    -WhyItMatters 'Low adoption limits the tenant population that can move away from phishable password-based authentication.' `
+                    -RecommendedAction 'Expand registration and rollout of allowed passwordless methods, prioritizing privileged and high-risk populations' `
+                    -DocumentationUrl $doc -SourceFile $src -RuleId 'passwordless-low-adoption'
+            }
+        }
+
+        $systemPreferredKnown = @($members | Where-Object { $null -ne $_.IsSystemPreferredAuthenticationMethodEnabled })
+        if ($systemPreferredKnown.Count -eq 0) {
+            Add-EAGovCoverageFinding -CheckId $checkId -Category 'Authentication' -DataSource 'System-preferred authentication status' `
+                -Reason 'the property was absent/null on every registration record.' -RequiredScope 'AuditLog.Read.All' `
+                -DocumentationUrl $doc -SourceFile $src
+        } else {
+            $memberSystemPreferredOff = @($members | Where-Object { $_.IsSystemPreferredAuthenticationMethodEnabled -eq $false })
+            if ($memberSystemPreferredOff.Count -gt 0) {
+                $adminSystemPreferredOff = @($memberSystemPreferredOff | Where-Object { $_.IsAdmin -eq $true })
+                $severity = if ($adminSystemPreferredOff.Count -gt 0) { 'Medium' } else { 'Low' }
+                Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'Authentication' `
+                    -Title ("System-preferred authentication is disabled for {0} member registration record(s)" -f $memberSystemPreferredOff.Count) `
+                    -Evidence ("IsSystemPreferredAuthenticationMethodEnabled=false; {0} affected record(s) are administrators. The report exposes effective per-user state, not a user choice." -f $adminSystemPreferredOff.Count) `
+                    -WhyItMatters 'System-preferred MFA helps select the strongest registered method and reduces authentication-strength downgrade.' `
+                    -RecommendedAction 'Enable system-preferred authentication tenant-wide after validating exception populations' `
+                    -DocumentationUrl $doc -SourceFile $src -ResultRows $memberSystemPreferredOff -RuleId 'system-preferred-member-disabled'
+            }
         }
     }
 
@@ -892,8 +910,11 @@ function Invoke-Check-AuthRecovery {
                 -DocumentationUrl $policyDoc -SourceFile $policySrc
         }
 
+        # The main authmethodpolicy check already reports a disabled campaign on its own.
+        # This rule only adds the population that is not yet passwordless, so it needs
+        # registration data; without it the registration coverage finding above applies.
         $campaignState = [string](Get-EAGovProperty $campaign 'state')
-        if ($campaignState -notmatch '^enabled$' -and $members.Count -gt $passwordless.Count) {
+        if ($campaignState -notmatch '^enabled$' -and $registrationAvailable -and $members.Count -gt $passwordless.Count) {
             Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Authentication' `
                 -Title 'Authentication-method registration campaign is not enabled' `
                 -Evidence ("Campaign state={0}; {1} member user(s) are not passwordless capable." -f ($campaignState ?? 'unknown'),($members.Count - $passwordless.Count)) `
@@ -999,11 +1020,18 @@ function Invoke-Check-AuthRecovery {
             $onPremProtection = ConvertTo-EAGovBoolean $passwordMap['EnableBannedPasswordCheckOnPremises']
             $onPremMode = [string]$passwordMap['BannedPasswordCheckOnPremisesMode']
             if ($onPremProtection -ne $true -or $onPremMode -notmatch '^(Enforce|Enforced)$') {
+                # Same rule id either way (the exposure is identical), but tell the reader
+                # whether this is an explicit choice or the untouched Microsoft default.
+                $onPremSource = if ($null -ne $passwordSetting) {
+                    'explicit tenant Password Rule Settings object'
+                } else {
+                    'Microsoft template defaults - the tenant has never saved Password protection settings, so domain controller agents are probably not deployed'
+                }
                 Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Authentication' `
                     -Title 'On-premises Microsoft Entra Password Protection is not in enforced mode' `
-                    -Evidence ("EnableBannedPasswordCheckOnPremises={0}; mode={1}." -f $onPremProtection,$onPremMode) `
+                    -Evidence ("EnableBannedPasswordCheckOnPremises={0}; mode={1}; source={2}." -f $onPremProtection,$onPremMode,$onPremSource) `
                     -WhyItMatters "Synchronized and on-premises-only users don't receive the same banned-password control when the DC agents are disabled or audit-only." `
-                    -RecommendedAction 'Deploy healthy proxy/DC agents and enable enforced mode after reviewing audit results and licensing' `
+                    -RecommendedAction 'Deploy healthy proxy/DC agents and enable enforced mode after reviewing audit results and licensing (Microsoft Entra ID P1/P2 is required for synchronized users)' `
                     -DocumentationUrl $passwordProtectionDoc -SourceFile $passwordSrc -RuleId 'onprem-password-protection-not-enforced'
             }
         }
@@ -1013,6 +1041,7 @@ function Invoke-Check-AuthRecovery {
             -Reason $reason -RequiredScope 'Organization.Read.All' -DocumentationUrl $syncDoc -SourceFile $src
     }
 
+    if (-not $registrationAvailable) { return }
     Add-EAGovFinding -Severity 'Information' -CheckId $checkId -Category 'Authentication' `
         -Title 'Authentication recovery and passwordless baseline captured' `
         -Evidence ("Members={0}; SSPR enabled/registered/capable={1}/{2}/{3}; passwordless capable={4}; admins={5}." -f `
@@ -1315,34 +1344,22 @@ function ConvertFrom-EAGovDurationDays {
 }
 
 function Get-EAGovDirectoryRoleRisk {
-    param(
-        [AllowNull()][string]$RoleDefinitionId,
-        [AllowNull()]$RoleDefinition
-    )
+    # Classify a GDAP role through the main script's shared role model
+    # (Get-EARoleDefMap/Get-EARoleInfo) so partner roles are tiered exactly like
+    # directory roles elsewhere in the report: static fail-safe list, beta
+    # isPrivileged, and any-write-action for custom roles.
+    param([AllowNull()][string]$RoleDefinitionId)
 
-    $tierZero = @(
-        '62e90394-69f5-4237-9190-012177145e10', # Global Administrator
-        'e8611ab8-c189-46e8-94e1-60213ab1f814', # Privileged Role Administrator
-        '7be44c8a-adaf-4e2a-84d6-ab2649e08a13'  # Privileged Authentication Administrator
-    )
-    $templateId = [string](Get-EAGovProperty $RoleDefinition 'templateId')
-    if ($RoleDefinitionId -in $tierZero -or $templateId -in $tierZero) { return 'Critical' }
-
-    $isPrivileged = Get-EAGovProperty $RoleDefinition 'isPrivileged'
-    if ($isPrivileged -eq $true) { return 'High' }
-
-    $actions = New-Object System.Collections.Generic.List[string]
-    foreach ($permission in @(Get-EAGovProperty $RoleDefinition 'rolePermissions')) {
-        foreach ($action in @(Get-EAGovProperty $permission 'allowedResourceActions')) {
-            if ($action) { $actions.Add([string]$action) | Out-Null }
-        }
+    if ([string]::IsNullOrWhiteSpace($RoleDefinitionId)) {
+        return [pscustomobject]@{ Risk='Unknown'; Name=$null }
     }
-    $actionText = $actions -join ';'
-    if ($actionText -match '(?i)(roleAssignments/.*/allTasks|roles/.*/allTasks|users/authenticationMethods/.*/allTasks|users/password/update|conditionalAccessPolicies/.*/allTasks|servicePrincipals/credentials/update|applications/credentials/update|entitlementManagement/.*/allTasks)') {
-        return 'High'
-    }
-    if ($null -eq $RoleDefinition) { return 'Unknown' }
-    return 'Standard'
+    $info = Get-EARoleInfo -RoleDefinitionId $RoleDefinitionId
+    $unresolved = [string]$info.ClassificationSource -eq 'unresolved-fail-closed'
+    $risk = if ($info.IsTier0) { 'Critical' }
+            elseif ($unresolved) { 'Unknown' }
+            elseif ($info.IsPrivileged) { 'High' }
+            else { 'Standard' }
+    return [pscustomobject]@{ Risk=$risk; Name=$(if ($unresolved) { $null } else { [string]$info.Name }) }
 }
 
 function Invoke-Check-ExternalDelegation {
@@ -1358,21 +1375,15 @@ function Invoke-Check-ExternalDelegation {
     $relationshipResult = Invoke-EAGovGraphCollection -Uri 'https://graph.microsoft.com/v1.0/tenantRelationships/delegatedAdminRelationships?$top=300'
     $relationships = @(if ($relationshipResult.Success) { @($relationshipResult.Rows) } else { @() })
 
-    $roleMap = @{}
+    # Role definitions come from the main script's shared cache, and are only loaded
+    # when there is at least one relationship to classify. If the read fails,
+    # Get-EARoleInfo still recognises the static tier-0/privileged template ids and
+    # reports everything else as Unknown (with a coverage finding), never Standard.
     $roleDefinitionsKnown = $true
-    $roleDefinitionResult = Invoke-EAGovGraphCollection -Uri 'https://graph.microsoft.com/beta/roleManagement/directory/roleDefinitions?$select=id,displayName,templateId,isBuiltIn,isPrivileged,rolePermissions&$top=999'
-    if (-not $roleDefinitionResult.Success) {
-        $roleDefinitionResult = Invoke-EAGovGraphCollection -Uri 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions?$select=id,displayName,templateId,isBuiltIn,rolePermissions&$top=999'
-    }
-    if ($roleDefinitionResult.Success -and -not $roleDefinitionResult.Truncated) {
-        foreach ($role in @($roleDefinitionResult.Rows)) {
-            $id = [string](Get-EAGovProperty $role 'id')
-            if ($id) { $roleMap[$id] = $role }
-            $templateId = [string](Get-EAGovProperty $role 'templateId')
-            if ($templateId -and -not $roleMap.ContainsKey($templateId)) { $roleMap[$templateId] = $role }
-        }
-    } else {
-        $roleDefinitionsKnown = $false
+    $roleDefinitionError = $null
+    if ($relationships.Count -gt 0) {
+        try { Get-EARoleDefMap | Out-Null }
+        catch { $roleDefinitionsKnown = $false; $roleDefinitionError = [string]$_.Exception.Message }
     }
 
     $relationshipRows = New-Object System.Collections.Generic.List[object]
@@ -1382,7 +1393,7 @@ function Invoke-Check-ExternalDelegation {
         if ($roles.Count -eq 0) { $roles = @($null) }
         foreach ($roleRef in $roles) {
             $roleId = [string](Get-EAGovProperty $roleRef 'roleDefinitionId')
-            $definition = if ($roleId -and $roleMap.ContainsKey($roleId)) { $roleMap[$roleId] } else { $null }
+            $roleClass = Get-EAGovDirectoryRoleRisk -RoleDefinitionId $roleId
             $relationshipRows.Add([pscustomobject]@{
                 RelationshipId      = Get-EAGovProperty $relationship 'id'
                 DisplayName         = Get-EAGovProperty $relationship 'displayName'
@@ -1397,8 +1408,8 @@ function Invoke-Check-ExternalDelegation {
                 DurationDays        = ConvertFrom-EAGovDurationDays (Get-EAGovProperty $relationship 'duration')
                 AutoExtendDuration  = Get-EAGovProperty $relationship 'autoExtendDuration'
                 RoleDefinitionId    = $roleId
-                RoleDisplayName     = if ($definition) { Get-EAGovProperty $definition 'displayName' } else { $null }
-                RoleRisk            = Get-EAGovDirectoryRoleRisk -RoleDefinitionId $roleId -RoleDefinition $definition
+                RoleDisplayName     = $roleClass.Name
+                RoleRisk            = $roleClass.Risk
             }) | Out-Null
         }
     }
@@ -1443,7 +1454,7 @@ function Invoke-Check-ExternalDelegation {
             }
             foreach ($roleRef in $assignmentRoles) {
                 $roleId = [string](Get-EAGovProperty $roleRef 'roleDefinitionId')
-                $definition = if ($roleId -and $roleMap.ContainsKey($roleId)) { $roleMap[$roleId] } else { $null }
+                $roleClass = Get-EAGovDirectoryRoleRisk -RoleDefinitionId $roleId
                 $accessAssignmentRows.Add([pscustomobject]@{
                     RelationshipId=$relationshipId
                     DisplayName=Get-EAGovProperty $relationship 'displayName'
@@ -1457,8 +1468,8 @@ function Invoke-Check-ExternalDelegation {
                     AccessContainerId=Get-EAGovProperty $container 'accessContainerId'
                     AccessContainerType=Get-EAGovProperty $container 'accessContainerType'
                     RoleDefinitionId=$roleId
-                    RoleDisplayName=if ($definition) { Get-EAGovProperty $definition 'displayName' } else { $null }
-                    RoleRisk=Get-EAGovDirectoryRoleRisk -RoleDefinitionId $roleId -RoleDefinition $definition
+                    RoleDisplayName=$roleClass.Name
+                    RoleRisk=$roleClass.Risk
                 }) | Out-Null
             }
         }
@@ -1475,10 +1486,9 @@ function Invoke-Check-ExternalDelegation {
             -Reason "pagination exceeded $($relationshipResult.Pages) pages." -RequiredScope 'DelegatedAdminRelationship.Read.All' `
             -DocumentationUrl $doc -SourceFile $relationshipSrc
     }
-    if (-not $roleDefinitionsKnown -and $relationships.Count -gt 0) {
-        $reason = if ($roleDefinitionResult.Success) { 'pagination limit reached' } else { [string]$roleDefinitionResult.Error.Exception.Message }
+    if (-not $roleDefinitionsKnown) {
         Add-EAGovCoverageFinding -CheckId $checkId -Category 'External Access' -DataSource 'GDAP role definitions and effective role risk' `
-            -Reason $reason -RequiredScope 'RoleManagement.Read.Directory' -DocumentationUrl $doc -SourceFile $relationshipSrc
+            -Reason $roleDefinitionError -RequiredScope 'RoleManagement.Read.Directory' -DocumentationUrl $doc -SourceFile $relationshipSrc
     }
     if ($accessAssignmentErrors.Count -gt 0) {
         $assignmentErrorSrc = Write-Evidence -BaseName 'external_delegated_admin_access_assignment_errors' -Rows $accessAssignmentErrors.ToArray() -Title 'GDAP Access Assignment Collection Gaps'
@@ -1537,14 +1547,46 @@ function Invoke-Check-ExternalDelegation {
             -DocumentationUrl $doc -SourceFile $relationshipSrc -ResultRows $expiredActive -RuleId 'gdap-active-past-end'
     }
 
-    $longLived = @($activeRows | Where-Object { $null -eq $_.EndDateTime -or ($null -ne $_.DurationDays -and $_.DurationDays -gt 730) })
+    # Graph caps duration at P2Y (730 days), so "longer than two years" can never
+    # occur; flag relationships set to the two-year maximum or with no readable end.
+    $longLived = @($activeRows | Where-Object { $null -eq $_.EndDateTime -or ($null -ne $_.DurationDays -and $_.DurationDays -ge 730) })
     if ($longLived.Count -gt 0) {
         Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'External Access' `
             -Title ("{0} active GDAP role grant(s) are very long-lived or have no readable end" -f $longLived.Count) `
-            -Evidence 'The relationship duration exceeds two years or EndDateTime is absent. Duplicate rows represent individual roles in a relationship.' `
+            -Evidence ("{0} relationship(s) use the maximum two-year duration or have no readable EndDateTime. Each row is one role in a relationship." -f @($longLived | Select-Object -ExpandProperty RelationshipId -Unique).Count) `
             -WhyItMatters 'Long-lived partner administration increases the chance that obsolete access survives contract, personnel, or service changes.' `
             -RecommendedAction 'Use the shortest practical GDAP duration and periodically reapprove partner roles against the active contract' `
             -DocumentationUrl $doc -SourceFile $relationshipSrc -ResultRows $longLived -RuleId 'gdap-long-lived'
+    }
+
+    # autoExtendDuration (P0D/PT0S = off, P180D = on) is what makes a partner
+    # relationship effectively permanent: it renews itself every 180 days unless
+    # someone terminates it. Report once per relationship.
+    foreach ($group in @($activeRows | Where-Object {
+        $days = ConvertFrom-EAGovDurationDays $_.AutoExtendDuration
+        $null -ne $days -and $days -gt 0
+    } | Group-Object RelationshipId)) {
+        $relationship = @($group.Group)
+        $privilegedRoles = @($relationship | Where-Object { $_.RoleRisk -in @('Critical','High') })
+        # A role whose definition could not be resolved may be privileged: keep the High
+        # severity and say so, rather than reporting "none" for data that was never read.
+        $unknownRoles = @($relationship | Where-Object { $_.RoleRisk -eq 'Unknown' -and $_.RoleDefinitionId })
+        $severity = if ($privilegedRoles.Count -gt 0 -or $unknownRoles.Count -gt 0) { 'High' } else { 'Medium' }
+        $roleNames = @($privilegedRoles | ForEach-Object { $_.RoleDisplayName ?? $_.RoleDefinitionId } | Select-Object -Unique)
+        $roleText = @(
+            if ($roleNames.Count -gt 0) { $roleNames -join ', ' }
+            if ($unknownRoles.Count -gt 0) {
+                "{0} role(s) of unknown risk (role definitions could not be resolved)" -f @($unknownRoles.RoleDefinitionId | Select-Object -Unique).Count
+            }
+        )
+        Add-EAGovFinding -Severity $severity -CheckId $checkId -Category 'External Access' `
+            -Title ("Active GDAP relationship renews itself automatically: {0}" -f $relationship[0].DisplayName) `
+            -Evidence ("autoExtendDuration={0}; current end={1}; privileged roles: {2}." -f $relationship[0].AutoExtendDuration,$relationship[0].EndDateTime,$(if ($roleText.Count -gt 0) { $roleText -join '; plus ' } else { 'none' })) `
+            -WhyItMatters 'The partner keeps admin access in your tenant with no end date. The relationship extends itself every time it reaches its end, so nobody has to re-approve it.' `
+            -RecommendedAction 'Ask the partner to turn off auto-extend, or terminate the relationship and create a new one with a fixed end date. Re-approve partner access on a regular schedule' `
+            -DocumentationUrl $doc -SourceFile $assignmentSrc -ResultRows $relationship `
+            -AffectedPrincipal ([string]$relationship[0].DisplayName) -RuleId 'gdap-auto-extend' `
+            -ObjectType 'delegatedAdminRelationship' -ObjectId ([string]$relationship[0].RelationshipId)
     }
 
     # ------------------------- Accepted guest lifecycle -------------------------
@@ -1741,8 +1783,9 @@ function Invoke-Check-FederationHealth {
         }
 
         $configResult = Invoke-EAGovGraphCollection -Uri ("https://graph.microsoft.com/v1.0/domains/{0}/federationConfiguration" -f [uri]::EscapeDataString($domainId))
-        if (-not $configResult.Success) {
-            $configErrors.Add([pscustomobject]@{ Domain=$domainId; StatusCode=$configResult.StatusCode; Reason=[string]$configResult.Error.Exception.Message }) | Out-Null
+        if (-not $configResult.Success -or $configResult.Truncated) {
+            $configReason = if ($configResult.Success) { 'federationConfiguration pagination limit reached' } else { [string]$configResult.Error.Exception.Message }
+            $configErrors.Add([pscustomobject]@{ Domain=$domainId; StatusCode=$configResult.StatusCode; Reason=$configReason }) | Out-Null
             $rows.Add([pscustomobject]@{
                 Domain=$domainId; AuthenticationType='Federated'; IsVerified=(Get-EAGovProperty $domain 'isVerified')
                 IsDefault=(Get-EAGovProperty $domain 'isDefault'); ConfigRead='Failed'; ConfigCount=0; DisplayName=$null
@@ -2163,13 +2206,38 @@ function Invoke-Check-IdentityGovernance {
 
     # ------------------------- Lifecycle Workflows -------------------------
     $workflowResult = Invoke-EAGovGraphCollection -Uri 'https://graph.microsoft.com/v1.0/identityGovernance/lifecycleWorkflows/workflows?$select=id,displayName,description,category,isEnabled,isSchedulingEnabled,createdDateTime,lastModifiedDateTime,executionConditions&$top=999'
+    $workflowConditionErrors = New-Object System.Collections.Generic.List[object]
     $workflowRows = @(if ($workflowResult.Success) {
         @($workflowResult.Rows | ForEach-Object {
+            # A workflow is on-demand only when its execution condition has the type
+            # onDemandExecutionOnly (for example the 'Real-time employee termination'
+            # template). Those run manually or from automation, so isSchedulingEnabled=false
+            # is by design. executionConditions is required on every workflow, so a missing
+            # value means it was not returned, not that the workflow is on-demand. Re-read the
+            # workflow by id when the answer changes the result (enabled, scheduling off); if
+            # the type is still unknown, IsOnDemand stays $null and the workflow is judged as
+            # a scheduled one.
+            $conditions = Get-EAGovProperty $_ 'executionConditions'
+            $workflowId = [string](Get-EAGovProperty $_ 'id')
+            if ($null -eq $conditions -and $workflowId -and (Get-EAGovProperty $_ 'isEnabled') -eq $true -and
+                (Get-EAGovProperty $_ 'isSchedulingEnabled') -ne $true) {
+                $detail = Invoke-EAGovGraphObject -Uri ("https://graph.microsoft.com/v1.0/identityGovernance/lifecycleWorkflows/workflows/{0}" -f [uri]::EscapeDataString($workflowId))
+                if ($detail.Success) { $conditions = Get-EAGovProperty $detail.Value 'executionConditions' }
+                if ($null -eq $conditions) {
+                    $workflowConditionErrors.Add([pscustomobject]@{
+                        WorkflowId=$workflowId; DisplayName=Get-EAGovProperty $_ 'displayName'; StatusCode=$detail.StatusCode
+                        Reason=$(if ($detail.Success) { 'executionConditions was not returned' } else { [string]$detail.Error.Exception.Message })
+                    }) | Out-Null
+                }
+            }
+            $conditionType = [string](Get-EAGovProperty $conditions '@odata.type')
+            $isOnDemand = if ($conditionType -match '(?i)onDemandExecutionOnly$') { $true } elseif ($conditionType) { $false } else { $null }
             [pscustomobject]@{
                 Id=Get-EAGovProperty $_ 'id'; DisplayName=Get-EAGovProperty $_ 'displayName'; Description=Get-EAGovProperty $_ 'description'
                 Category=Get-EAGovProperty $_ 'category'; IsEnabled=Get-EAGovProperty $_ 'isEnabled'; IsSchedulingEnabled=Get-EAGovProperty $_ 'isSchedulingEnabled'
                 CreatedDateTime=Get-EAGovProperty $_ 'createdDateTime'; LastModifiedDateTime=Get-EAGovProperty $_ 'lastModifiedDateTime'
-                ExecutionConditions=ConvertTo-EAGovCompactJson (Get-EAGovProperty $_ 'executionConditions')
+                ExecutionConditions=ConvertTo-EAGovCompactJson $conditions
+                IsOnDemand=$isOnDemand
             }
         })
     } else { @() })
@@ -2190,28 +2258,44 @@ function Invoke-Check-IdentityGovernance {
             -RecommendedAction 'Document the authoritative joiner/mover/leaver process and consider Lifecycle Workflows where it improves timely deprovisioning' `
             -DocumentationUrl $workflowDoc -SourceFile $workflowSrc -RuleId 'lifecycle-workflows-none'
     } else {
+        # Scheduled workflows must be enabled and scheduled; on-demand workflows can never
+        # be scheduled, so they are judged on IsEnabled only. An unknown trigger type
+        # (IsOnDemand=$null) is judged like a scheduled workflow, never passed silently.
+        $inactiveWorkflow = { param($w) $w.IsEnabled -ne $true -or ($w.IsOnDemand -ne $true -and $w.IsSchedulingEnabled -ne $true) }
+        $unknownTriggerNote = {
+            param($flagged)
+            $count = @($flagged | Where-Object { $_.IsEnabled -eq $true -and $null -eq $_.IsOnDemand }).Count
+            if ($count -gt 0) { " For {0} of them the trigger type (scheduled or on-demand) could not be read, so they were treated as scheduled." -f $count } else { '' }
+        }
         $disabledLeavers = @($workflowRows | Where-Object {
-            [string]$_.Category -ieq 'leaver' -and ($_.IsEnabled -ne $true -or $_.IsSchedulingEnabled -ne $true)
+            [string]$_.Category -ieq 'leaver' -and (& $inactiveWorkflow $_)
         })
         if ($disabledLeavers.Count -gt 0) {
             Add-EAGovFinding -Severity 'Medium' -CheckId $checkId -Category 'Identity Governance' `
                 -Title ("{0} configured leaver workflow(s) are disabled or not scheduled" -f $disabledLeavers.Count) `
-                -Evidence 'The workflow category is leaver, but IsEnabled or IsSchedulingEnabled is not true.' `
+                -Evidence ('The workflow category is leaver, but it is disabled, or it is a scheduled workflow whose scheduling is turned off. On-demand workflows (such as real-time termination) are checked for IsEnabled only.' + (& $unknownTriggerNote $disabledLeavers)) `
                 -WhyItMatters 'A configured but inactive leaver workflow can create false assurance while terminated-user cleanup tasks do not run.' `
                 -RecommendedAction 'Validate execution conditions and task ownership, enable scheduling, and test the complete leaver path with a controlled account' `
                 -DocumentationUrl $workflowDoc -SourceFile $workflowSrc -ResultRows $disabledLeavers -RuleId 'leaver-workflow-disabled'
         }
         $otherDisabled = @($workflowRows | Where-Object {
-            [string]$_.Category -ine 'leaver' -and ($_.IsEnabled -ne $true -or $_.IsSchedulingEnabled -ne $true)
+            [string]$_.Category -ine 'leaver' -and (& $inactiveWorkflow $_)
         })
         if ($otherDisabled.Count -gt 0) {
             Add-EAGovFinding -Severity 'Low' -CheckId $checkId -Category 'Identity Governance' `
                 -Title ("{0} lifecycle workflow(s) are disabled or not scheduled" -f $otherDisabled.Count) `
-                -Evidence 'Configured workflows are not currently both enabled and scheduled.' `
+                -Evidence ('These workflows are disabled, or are scheduled workflows whose scheduling is turned off. On-demand workflows are checked for IsEnabled only.' + (& $unknownTriggerNote $otherDisabled)) `
                 -WhyItMatters 'Disabled workflows can be intentional drafts, but stale workflow definitions create operational ambiguity.' `
                 -RecommendedAction 'Document staged workflows and retire obsolete definitions; enable and test workflows intended for production' `
                 -DocumentationUrl $workflowDoc -SourceFile $workflowSrc -ResultRows $otherDisabled -RuleId 'lifecycle-workflow-disabled'
         }
+    }
+    if ($workflowConditionErrors.Count -gt 0) {
+        $workflowConditionSrc = Write-Evidence -BaseName 'governance_lifecycle_workflow_condition_errors' -Rows $workflowConditionErrors.ToArray() `
+            -Title 'Identity Governance - Lifecycle Workflow Trigger Type Gaps'
+        Add-EAGovCoverageFinding -CheckId $checkId -Category 'Identity Governance' -DataSource 'Lifecycle workflow execution conditions' `
+            -Reason ("the trigger type (scheduled or on-demand) of {0} enabled workflow(s) with scheduling turned off could not be read, so they were treated as scheduled workflows." -f $workflowConditionErrors.Count) `
+            -RequiredScope 'LifecycleWorkflows.Read.All' -DocumentationUrl $workflowDoc -SourceFile $workflowConditionSrc
     }
 
     # ------------------------- Terms of Use -------------------------
