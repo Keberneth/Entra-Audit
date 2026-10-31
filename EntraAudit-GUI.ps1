@@ -16,8 +16,7 @@
 
   Requirements:
     - PowerShell 7 (pwsh.exe)
-    - EntraAudit-PS7.ps1 and both EntraAudit-Checks-*.ps1 companion libraries
-      in the same folder as this script
+    - The complete EntraAudit folder, including Checks, Library and the check manifest
 #>
 
 [CmdletBinding()]
@@ -34,10 +33,10 @@ Write-Host "Opening Entra Audit GUI..."
 
 $ScriptDir = $PSScriptRoot
 $AuditScriptPath = Join-Path $ScriptDir 'EntraAudit-PS7.ps1'
-$RequiredAuditFiles = @('EntraAudit-PS7.ps1','EntraAudit-Checks-Governance.ps1','EntraAudit-Checks-Applications.ps1')
+$RequiredAuditFiles = @('EntraAudit-PS7.ps1','EntraAudit.Checks.psd1','Library/EntraAudit.Loader.ps1','Library/EntraAudit.Common.ps1','Library/EntraAudit.Graph.ps1','Library/EntraAudit.Governance.ps1','Library/EntraAudit.Applications.ps1','Library/EntraAudit.FollowUp.ps1','Library/EntraAudit.Report.ps1')
 $MissingAuditFiles = @($RequiredAuditFiles | Where-Object { -not (Test-Path -LiteralPath (Join-Path $ScriptDir $_) -PathType Leaf) })
 if ($MissingAuditFiles.Count -gt 0) {
-    Write-Error "Required audit file(s) not found in '$ScriptDir': $($MissingAuditFiles -join ', '). Keep the GUI, main script, and both check libraries together."
+    Write-Error "Required audit file(s) not found in '$ScriptDir': $($MissingAuditFiles -join ', '). Copy the whole EntraAudit folder, including Checks and Library."
     exit 1
 }
 
@@ -60,44 +59,11 @@ function Msg-Info([string]$Message) {
 # 734 px label (at most about 120 characters, roughly 650 px in Segoe UI 9 pt); longer text is
 # cut with "..." and shown in full on hover.
 # -------------------------
-$AuditChecks = [ordered]@{
-    tenantinfo     = "Tenant overview: organization details, verified domains and licenses"
-    privroles      = "MAIN CHECK: who holds admin roles permanently vs only when activated (just-in-time roles need Entra ID P2)"
-    directoryroles = "How many Global Administrators and other admin-role holders the tenant has"
-    accounts       = "Account clean-up: disabled accounts that are old or still licensed, passwords that never expire, no manager"
-    staleusers     = "Users who have not signed in for a long time, or never (needs Entra ID P1)"
-    guests         = "Guest (external) users: who may invite them, invitations never accepted, guests with admin roles"
-    mfa            = "Multi-factor authentication (MFA): who has registered it and how strong the methods are, admins first"
-    legacyauth     = "Sign-ins with old protocols that cannot do MFA (legacy authentication; reads sign-in logs, needs P1)"
-    tenantposture  = "Tenant-wide settings: Security Defaults, and what ordinary users may do (register apps, approve app access)"
-    capolicies     = "Conditional Access sign-in rules (MFA, risk, locations) - enter break-glass accounts in Step 4 first"
-    riskyusers     = "Users Microsoft flags as risky (possibly compromised) and recent risk detections (needs Entra ID P2)"
-    riskyserviceprincipals = "Apps and service principals Microsoft flags as risky (needs a Workload Identities Premium license)"
-    apps           = "Apps with powerful permissions: who owns them, unverified publishers, apps with no owner"
-    appcredentials = "App registration secrets and certificates that have expired or expire soon"
-    consentgrants  = "Access that users or admins granted to apps (consent grants), high-impact grants first"
-    devices        = "Devices that have not signed in for a long time, are not managed, or are not compliant"
-    trusts         = "Trust in other organizations' Microsoft tenants: their MFA and device checks, guest access (cross-tenant access)"
-    recentchanges  = "Users and groups created recently, and recent admin-role changes (from the audit log)"
-    tenanthealth   = "Sync from on-premises Active Directory: last sync, Password Hash Sync, sync settings (hybrid only)"
-    pimpolicies    = "Rules for activating admin roles in Privileged Identity Management (PIM): MFA, approval, reason, time limit (needs P2)"
-    breakglass     = "Emergency-access (break-glass) admin accounts: are they set up and ready - enter them in Step 4"
-    authmethodpolicy = "Allowed sign-in methods: weak ones (text message, voice call) vs phishing-resistant (security keys)"
-    accesspaths    = "Hidden routes to admin rights: duplicate role paths, owners of groups and apps that grant admin rights"
-    staleapps      = "Apps nobody has used for a long time, especially ones that still have valid secrets (needs P1)"
-    recommendations = "Microsoft Entra recommendations that are still open, high-impact ones first"
-    securescore    = "Microsoft Identity Secure Score and the improvement actions not yet done"
-    accessreviews  = "Access reviews: what is reviewed, how often, by whom, and what happens to the results"
-    identitygovernance = "Access packages, lifecycle workflows, Terms of Use and PIM for Groups (may need extra licenses)"
-    authrecovery   = "Self-service password reset and account recovery, MFA registration campaign, system-preferred MFA"
-    groupgovernance = "Groups: missing owners, groups that can hold admin roles, dynamic membership rules, expiry settings"
-    externaldelegation = "Outside access: partner admin relationships (GDAP), guest sponsors and partner tenant settings"
-    federationhealth = "Federated domains: signing-certificate expiry, sign-in endpoints and hybrid sign-in settings"
-    workloadcredentials = "Secrets, certificates and federated credentials on apps and service principals, and credential policies"
-    enterpriseapps = "Enterprise apps: owners, who is allowed to use them, and high-impact permissions"
-    monitoring     = "Logging and alerting: are sign-in and audit logs kept and exported, and do alert rules exist"
-    changemonitoring = "Recent security-sensitive changes to users, roles, policies, apps, consent and federation"
-}
+$AuditChecks = [ordered]@{}
+$checkManifest = Import-PowerShellDataFile -LiteralPath (Join-Path $ScriptDir 'EntraAudit.Checks.psd1')
+foreach ($check in $checkManifest.Checks) { $AuditChecks[$check.Switch] = $check.Description }
+$missingChecks = @($checkManifest.Checks | Where-Object { -not (Test-Path -LiteralPath (Join-Path (Join-Path $ScriptDir 'Checks') $_.File) -PathType Leaf) })
+if ($missingChecks.Count -gt 0) { throw "Check files are missing: $($missingChecks.File -join ', '). Copy the complete EntraAudit folder." }
 
 # -------------------------
 # Form
@@ -392,6 +358,28 @@ $chkNoLaunch = Add-Check "Don't open the report automatically when the audit fin
 Add-Tip $chkNoLaunch "When the audit finishes, the report normally opens in your web browser, whichever sign-in you chose. Tick this to only save it; the audit window then shows where the report is. Runs without a desktop session, such as scheduled tasks, never open it."
 $y += $rowHeight + 6
 
+Add-Label 'Previous Findings.json (optional):' $y | Out-Null
+$txtPreviousRun = Add-TextBox $y -Width 560
+$btnPreviousRun = Add-Button 'Browse...' $y 110 24 ($leftInput + 570)
+Add-Tip $txtPreviousRun 'Compare with an earlier audit of the same tenant, ruleset and assessment settings. Skipped checks never make old findings look resolved.'
+$y += $rowHeight
+Add-Label 'Exceptions JSON (optional):' $y | Out-Null
+$txtExceptions = Add-TextBox $y -Width 560
+$btnExceptions = Add-Button 'Browse...' $y 110 24 ($leftInput + 570)
+Add-Tip $txtExceptions 'Documented risk acceptances with owner, reason and expiration. Findings remain visible and scored. See README.md for the file format.'
+$y += $rowHeight
+$chkFailIncomplete = Add-Check 'Return a failure status for every incomplete check (-FailOnIncomplete)' $y $false 800 $leftLabel
+Add-Tip $chkFailIncomplete 'Collection errors already return exit code 2. This also returns 2 for partial coverage and expected licensing exclusions; security findings alone do not fail the process.'
+$y += $rowHeight + 6
+foreach ($pair in @(@{Button=$btnPreviousRun;Target=$txtPreviousRun},@{Button=$btnExceptions;Target=$txtExceptions})) {
+    $pair.Button.Tag = $pair.Target
+    $pair.Button.Add_Click({
+        $dialog = [System.Windows.Forms.OpenFileDialog]::new()
+        $dialog.Filter = 'JSON files (*.json)|*.json'
+        try { if ($dialog.ShowDialog() -eq 'OK') { $this.Tag.Text = $dialog.FileName } } finally { $dialog.Dispose() }
+    })
+}
+
 $panel.AutoScrollMinSize = [System.Drawing.Size]::new(0, ($y + 20))
 
 # === BOTTOM BAR (always visible): COMMAND PREVIEW + RUN / CLOSE ===
@@ -507,6 +495,9 @@ function Build-LaunchArgs {
     if ($script:txtRecentDays.Text.Trim() -and $script:txtRecentDays.Text.Trim() -ne '30') { $a += @('-RecentChangeDays', $script:txtRecentDays.Text.Trim()) }
     if ($script:txtStaleApp.Text.Trim() -and $script:txtStaleApp.Text.Trim() -ne '90')     { $a += @('-StaleAppDays', $script:txtStaleApp.Text.Trim()) }
     if ($script:txtModulesPath.Text.Trim()) { $a += @('-ModulesPath', $script:txtModulesPath.Text.Trim()) }
+    if ($script:txtPreviousRun.Text.Trim()) { $a += @('-PreviousRunPath', $script:txtPreviousRun.Text.Trim()) }
+    if ($script:txtExceptions.Text.Trim()) { $a += @('-ExceptionsPath', $script:txtExceptions.Text.Trim()) }
+    if ($script:chkFailIncomplete.Checked) { $a += '-FailOnIncomplete' }
     if ($script:txtBreakGlass.Text.Trim()) {
         $bgList = (($script:txtBreakGlass.Text -split '[;,]') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ';'
         if ($bgList) { $a += @('-BreakGlassUpns', $bgList) }
@@ -582,6 +573,9 @@ $txtStaleApp.Add_TextChanged({ Update-Preview })
 $txtBreakGlass.Add_TextChanged({ Update-Preview })
 $txtOutput.Add_TextChanged({ Update-Preview })
 $txtModulesPath.Add_TextChanged({ Update-Preview })
+$txtPreviousRun.Add_TextChanged({ Update-Preview })
+$txtExceptions.Add_TextChanged({ Update-Preview })
+$chkFailIncomplete.Add_CheckedChanged({ Update-Preview })
 $chkNoLaunch.Add_CheckedChanged({ Update-Preview })
 
 $btnBrowse.Add_Click({
@@ -644,6 +638,11 @@ $btnRun.Add_Click({
     }
     if ($script:txtModulesPath.Text.Trim() -and -not (Test-Path -LiteralPath $script:txtModulesPath.Text.Trim() -PathType Container)) {
         Msg-Error "The offline modules folder does not exist."; return
+    }
+    foreach ($inputFile in @($script:txtPreviousRun.Text.Trim(), $script:txtExceptions.Text.Trim())) {
+        if ($inputFile -and -not (Test-Path -LiteralPath $inputFile -PathType Leaf)) {
+            Msg-Error "The selected JSON file does not exist: $inputFile"; return
+        }
     }
     try {
         Start-PwshWithArgs (Build-LaunchArgs)

@@ -10,9 +10,27 @@ That's it — the HTML reports open when it finishes. Because the audit is **rea
 
 ---
 
-## What's new (September 2026 update)
+## What's new in v2.2.0 (October 2026)
 
-The tool still reports itself as `EntraAudit-PS7 v2.0`. Compared with the previous published documentation:
+- **Consistent population counts.** Findings carry explicit affected identities/counts and, when collected, assessed and unknown counts. Scoring deduplicates affected identities within each issue. Evidence-table rows are never assumed to be distinct objects. Unrecorded populations and overlap that cannot be resolved are labelled explicitly.
+- **Clearer priorities.** Confirmed risk, action priority, highest confirmed severity and assessment coverage are shown separately. Accepted risks retain their severity and points, but carry their owner/review date instead of silently occupying the immediate remediation list.
+- **Complete operational handoff.** The Action Register includes selected checks skipped before producing findings, actual affected identities, rule-specific verification, and tenant/run/version details. Historical-event review and manual tests have different completion criteria from configuration fixes or collection failures.
+- **Usable summaries and exports.** Priority actions appear sooner, compatible-run changes are summarized, long action details can be expanded, and the register supports filtering. Shared print styles and keyboard controls improve offline use.
+- **New comparison baseline.** The scoring ruleset is now **2.2.0**. Start a new baseline; earlier rulesets are not compared automatically. Existing finding IDs remain stable. `Follow-Up.json` is now schema 2 and includes run metadata and population changes.
+
+### Earlier v2.1.0 improvements
+
+- **One file per check.** The 36 checks live in `Checks/Invoke-*Check.ps1`; shared collection, reporting and follow-up helpers live in `Library`. The runner and GUI use `EntraAudit.Checks.psd1`. Copy the whole folder when deploying; existing command-line switches still work.
+- **More reliable conclusions.** Custom authentication strengths must prove MFA. Effective app credential policies include creation-date cutoffs and custom overrides. Ordinary group-based app assignments are informational, with direct-membership semantics.
+- **Additional checks.** Failed/stalled lifecycle runs, access-review reviewer configuration and overdue denied-access removal, PIM membership approval and PIM-managed ordinary groups, plus application redirects and implicit access-token issuance.
+- **Clear urgency.** Highest confirmed severity is shown separately from the numeric risk index. A Critical issue remains urgent even when the index is Moderate.
+- **Follow-up.** A new Action Register provides suggested teams, next actions and verification steps. Optional previous-run comparison and expiring documented exceptions are available in both the GUI and CLI.
+- **Automation.** Exit code 2 identifies failed collection. `-FailOnIncomplete` also fails runs with partial coverage or expected licensing exclusions. Findings alone do not fail the process.
+- **Versioned comparisons.** Run metadata includes `RulesetVersion` and a fingerprint of the emergency-account list. Comparisons require the same ruleset and assessment settings. Existing finding IDs are retained; new rules add new IDs.
+
+### Earlier v2.0 improvements
+
+The September 2026 release introduced:
 
 - **Plain-language findings.** Every finding title, *Why it matters* and *What to do* text was rewritten for non-specialists. Findings link to the matching Microsoft Learn page (**Microsoft guidance**).
 - **Explicit rule ids everywhere — finding ids change once.** Every finding now carries an explicit `RuleId`. Automation that compares runs by finding id will see a one-time reset: start a new baseline with this version. Details in [Upgrade note: finding ids](#upgrade-note-finding-ids-change-once).
@@ -74,7 +92,7 @@ Name your emergency-access accounts for the best result — four checks use them
 
 - **PowerShell 7.x** on Windows (`pwsh.exe`). The GUI uses Windows Forms.
 - **Microsoft Graph PowerShell SDK v2.x** — 8 sub-modules (installed via `-installdeps`, or see [PREREQUISITE.md](PREREQUISITE.md) for offline install)
-- Keep `EntraAudit-PS7.ps1`, `EntraAudit-Checks-Governance.ps1`, and `EntraAudit-Checks-Applications.ps1` together. The main script loads the two check libraries at startup and stops with an error if one is missing. Keep `EntraAudit-GUI.ps1` with them when using the GUI.
+- Keep `EntraAudit-PS7.ps1`, `EntraAudit.Checks.psd1`, and the complete `Checks` and `Library` folders together. Startup validates every required file before connecting. Keep `EntraAudit-GUI.ps1` there when using the GUI.
 - A read-only auditor identity:
   - **Interactive:** an account with the **Global Reader** and **Security Reader** directory roles (recommended). Optionally sign in through your own read-only app registration with `-DelegatedClientId`.
   - **App-only / unattended:** a dedicated app registration with the read-only **application** permissions and a certificate.
@@ -98,6 +116,7 @@ Results are written to a new tenant-named, timestamped folder (mirrors the AD au
       Risk-Report.html                  # executive summary: risk level and score, do-first list, top risks, what drives the score
       Posture-Summary.html              # did every check run? per-check result and reason, licenses, run details
       Raw-Data.html                     # index of every evidence dataset (HTML/CSV/TXT links, producing check, findings that use it)
+      Action-Register.html              # ownership, next actions, verification, changes and documented exceptions
    Raw Data\Source\
       privileged_roles.html/.csv/.txt   # every dataset: styled HTML table + CSV + TXT
       accounts.html/.csv/.txt
@@ -106,10 +125,12 @@ Results are written to a new tenant-named, timestamped folder (mirrors the AD au
       ... (one or more datasets per check)
    Findings.json                        # everything, machine-readable (automation / trend) - see below
    Findings.csv                         # all findings, flat (operations hand-off)
+   Action-Register.csv                  # editable owner, team, due date and status for operational handoff
+   Follow-Up.json                       # action register, comparison, exceptions and input warnings
    EntraAudit-Run.log                   # everything the run printed: warnings, skips, errors
 ```
 
-The four reports share a top navigation bar (Audit Results · Risk Report · Posture Summary · Raw Data) and a light/dark theme button. The theme follows your operating system until you click the button; the choice is then remembered in the browser for all four pages.
+The five reports share navigation (Audit Results · Risk Report · Posture Summary · Raw Data · Action Register) and a light/dark theme button. `HTML Reports/Action-Register.html` links to `Action-Register.csv` for operational handoff and `Follow-Up.json` for comparison and exception details. The theme follows your operating system until you choose one.
 
 **Every check writes its full evidence three ways** — a styled, searchable, sortable **HTML** table, a **CSV** (data) and a **TXT** (plain text) — even when the check passes, so you always have the underlying data in a readable form. The TXT file is never cut off: very wide datasets are written as one block per row instead of a table. An empty dataset still gets a CSV (one `NoData` row) so automation can rely on the file existing. Each finding links to its dataset's HTML page, and the **Raw Data** tab indexes them all.
 
@@ -121,34 +142,37 @@ The four reports share a top navigation bar (Audit Results · Risk Report · Pos
 
 `Findings.csv` has one row per finding, with these columns:
 
-`FindingId, Severity, Category, CheckId, RuleId, Rule, IssueKey, ObjectType, ObjectId, Title, AffectedPrincipal, Evidence, WhyItMatters, RecommendedAction, DocumentationUrl, SourceFile, CoverageGap`
+`FindingId, Severity, Category, CheckId, RuleId, Rule, IssueKey, ObjectType, ObjectId, Title, AffectedPrincipal, Evidence, WhyItMatters, RecommendedAction, DocumentationUrl, SourceFile, CoverageGap, ChangeStatus, AcceptedRisk, ExceptionReason, ExceptionOwner, ExceptionExpiresUtc`
 
 - `FindingId` — stable id `TenantId|CheckId|Rule|ObjectType|ObjectId|PathHash` (ObjectId falls back to the affected principal, else `tenant`). Use it for run-over-run comparison.
 - `Rule` — the explicit `RuleId` (every current finding has one). `IssueKey` — `CheckId|Rule|Severity`, the "problem" the reports group by and the risk score counts once.
 - `CoverageGap` — `True` for *Not assessed* findings (something could not be read), `False` for confirmed facts.
 - `DocumentationUrl` — the Microsoft guidance link; `SourceFile` — the evidence page the finding came from.
+- `AcceptedRisk` and the exception fields document a current acceptance without changing severity or score. `ChangeStatus` records the comparison result, or `Not compared` when no compatible baseline was supplied.
+- Population fields include `AffectedObjectIds`, `AffectedObjectType`, `AffectedCount`, `AssessedCount`, `UnknownCount` and `PopulationLabel`. An absent count means unknown, not zero. JSON preserves the identity array; CSV flattens it for handoff. `VerificationType` and `VerificationSteps` describe how to complete the action.
 - The CSV is UTF-8 with BOM (opens correctly in Excel). Cells that start with `=`, `+`, `-`, `@`, a tab or a line break get a leading `'` so a spreadsheet cannot run them as a formula; `Findings.json` keeps the original values.
 
-`Findings.json` is **an object**, not a plain list (it was a list before this version — read `.Findings` now). Its shape, with field names only:
+`Findings.json` is **an object**, not a plain list (it was a list before v2.0 — read `.Findings` now). Its shape, with field names only:
 
 ```jsonc
 {
   "SchemaVersion": 2,
   "GeneratedUtc": "2026-09-23T17:56:39Z",
   "RunInfo": {                 // who/what/when
-    "ToolVersion", "StartedUtc", "FinishedUtc", "DurationSeconds",
+    "ToolVersion", "RulesetVersion", "RunId", "StartedUtc", "FinishedUtc", "DurationSeconds", "CollectionExitCode",
     "AuthMode",                // Delegated | AppOnly
     "Account",                 // signed-in account, or the app's client id
     "TenantId", "TenantName", "GrantedScopes": [], "SelectedChecks": [], "ExcludedChecks": [],
     "Settings": { "InactiveDays", "ExpiringCredentialDays", "RecentChangeDays", "StaleAppDays",
-                  "DisabledAccountDays", "BreakGlassUpnsCount", "DelegatedClientId",
-                  "UseDeviceCode", "OfflineModulesPath" },   // break-glass names are NOT stored, only the count
+                  "DisabledAccountDays", "BreakGlassUpnsCount", "BreakGlassUpnsHash", "DelegatedClientId",
+                  "UseDeviceCode", "OfflineModulesPath" },   // count and fingerprint here; names can appear in evidence
     "PowerShellVersion", "GraphModuleVersion",
     "Licenses": { "P1", "P2", "WorkloadIdPremium", "Known", "Skus": [], "Notes": [] },
     "LogFile": "EntraAudit-Run.log"
   },
   "Score": {
     "Score", "Band", "ScoreBand", "ConfirmedScore", "NotAssessedPoints", "CoverageComplete",
+    "HighestConfirmedSeverity", "RemediationUrgency", "OpenRemediationUrgency", "ScoringVersion",
     "Counts": { "Critical", "High", "Medium", "Low", "Information" },   // every finding
     "ConfirmedCounts": {}, "NotAssessedCounts": {},                    // split by CoverageGap
     "Coverage": { "Known", "Complete", "Total", "Selected", "Evaluated", "FullyEvaluated",
@@ -183,9 +207,9 @@ $run.CheckStatus | Where-Object { $_.Selected -and $_.Status -notmatch '^(Pass|I
 
 ### Upgrade note: finding ids change once
 
-This version gives every finding an explicit `RuleId`, and the finding titles were rewritten. Before, many findings had no `RuleId` and their id was built from the title text, so the rewrite changes those ids **once**. From this version on, ids no longer depend on the wording or on counts ("5 stale users" → "7" keeps the same id).
+Version 2.0 gave every finding an explicit `RuleId`, and the finding titles were rewritten. Before, many findings had no `RuleId` and their id was built from the title text, so that rewrite changed those ids **once**. Since v2.0, ids no longer depend on the wording or on counts ("5 stale users" → "7" keeps the same id). Version 2.2.0 preserves those IDs, but comparisons require a new **2.2.0 baseline** because the population-based scoring rules changed.
 
-What changes when you compare a run of this version with an older run:
+What changed when comparing v2.0 with older runs:
 
 - **Runs from commit `0552807` (July 2026) or older:** almost every finding of the 24 core checks (`-tenantinfo` … `-staleapps`, in `EntraAudit-PS7.ps1`) gets a new id. Only the Conditional Access admin-MFA rules (`ENTRA-CA-ADMIN-*`), `app-credential-expired`, `app-credential-expiring` and `capolicies-named-location-coverage-unknown` keep theirs. The library checks (`-recommendations` … `-changemonitoring`) keep their ids, except the four notes and the GDAP finding listed in the next bullet.
 - **Runs from commit `a992521` (23 September 2026, which already had most RuleIds):** only these ids change:
@@ -253,7 +277,7 @@ The same labels appear on every page; `Findings.json` → `CheckStatus[].Status`
 | No result | `NoResult` | Selected but recorded no result (the run may have stopped early) | error |
 | Not run | `NotRun` | Not selected for this run — says nothing about the tenant | not run |
 
-Only *Passed* and *Passed (with notes)* are clean. A check that Microsoft Graph refused at run time or that stopped with an error also adds a *Not assessed* finding (`<checkId>-check-did-not-finish`) with the error text; a check skipped before it started (missing permission or license) is listed with its reason in *Check coverage* and the Posture Summary. A check that was skipped or stopped does **not** make the run fail (exit code 0); it is listed with its reason in the Posture Summary and the run log.
+Only *Passed* and *Passed (with notes)* are clean. A check that Microsoft Graph refused at run time or that stopped with an error also adds a *Not assessed* finding (`<checkId>-check-did-not-finish`) with the error text; a check skipped before it started is listed with its reason in *Check coverage* and the Posture Summary. Errors, missing scope/permission and unknown licensing produce exit code 2. Known licensing exclusions and partial sub-control coverage remain visible without failing the process unless `-FailOnIncomplete` is selected.
 
 ---
 
@@ -365,12 +389,82 @@ Several checks look at the same objects from a different angle. Where two checks
 | `-ExpiringCredentialDays <n>` | Warn on app secrets/certificates expiring within N days (1–3650, default 30). Used by `appcredentials`, `workloadcredentials` |
 | `-RecentChangeDays <n>` | Look-back window for recent changes (1–3650, default 30). Used by `recentchanges`, `changemonitoring`. Entra keeps audit logs 7 days on Free and 30 days with P1/P2; a longer window is reported as *Not assessed* |
 | `-StaleAppDays <n>` | Days with no sign-in before an application counts as unused (1–3650, default 90). Used by `staleapps`, `enterpriseapps` |
-| `-BreakGlassUpns <upns>` | Your cloud-only emergency-access Global Administrator accounts (`;` or `,` separated). Used by `privroles` (they may stay permanent GA), `capolicies` (accepted CA exclusions), `pimpolicies`, `breakglass` and `monitoring`. Only the number of accounts is stored in `Findings.json` |
+| `-BreakGlassUpns <upns>` | Your cloud-only emergency-access Global Administrator accounts (`;` or `,` separated). Used by role, CA, PIM, break-glass and monitoring checks. Run settings store the count and a SHA-256 fingerprint for reliable comparison; account names remain in relevant findings/evidence |
 | `-OutputRoot <path>` | Where to create the run folder (default: the script folder) |
 | `-ModulesPath <path>` | Offline: folder containing `Save-Module` output; used for both import and `-installdeps` |
 | `-NoLaunch` | Do not open the results page when finished. It is also not opened in non-interactive sessions (scheduled tasks, services) |
+| `-PreviousRunPath <file>` | Previous `Findings.json` from the same tenant, ruleset and assessment settings. Adds New / Still present / Resolved / No longer assessed / Previously not assessed comparisons |
+| `-ExceptionsPath <file>` | JSON risk-acceptance records with exact rule/object, owner, reason and expiration. Findings remain visible and scored |
+| `-FailOnIncomplete` | Return exit code 2 for every incomplete or skipped selected check, including known licensing exclusions |
 
 ---
+
+## Follow-up and documented exceptions
+
+```powershell
+.\EntraAudit-PS7.ps1 -all -NoLaunch `
+  -PreviousRunPath 'D:\Audits\previous-run\Findings.json' `
+  -ExceptionsPath 'D:\Audits\exceptions.json'
+```
+
+Comparison requires the same tenant, ruleset and assessment settings. A finding disappears as **Resolved** only if its check was fully assessed in the new run. If the check was skipped or incomplete, it is **No longer assessed**. Newly visible findings following an incomplete baseline are **Previously not assessed**. Incompatible or malformed inputs produce visible warnings; they do not prevent the regular audit reports from being generated.
+
+Historical-event findings are different: an event can leave the rolling window without any remediation. Their disappearance is labelled **Outside current window**, not Resolved. Completion requires review or verification evidence, as described in the action.
+
+An aggregate finding can remain present while its affected accounts change. When both runs have complete identity lists, comparison also shows added and removed identities. Removed identities are not considered resolved when current assessment is incomplete. A count alone cannot identify which accounts changed.
+
+Exceptions are local reporting records, not tenant changes. Use exact values from `Findings.json`; wildcards are not allowed. For an aggregate finding without an object ID, use `tenant`. An exception is active only before its timezone-qualified expiration. Invalid, expired and unmatched records are shown but do not accept any risk.
+
+For a grouped population, also supply `AffectedObjectIds` with the exact full identity list from the finding. If that population changes, the exception needs review and is not automatically applied to newly affected accounts. Incomplete/count-only aggregate populations cannot receive a blanket acceptance. A tenant-wide setting with no affected-object population still uses the ordinary `tenant` scope.
+
+```json
+{
+  "SchemaVersion": 1,
+  "TenantId": "11111111-2222-3333-4444-555555555555",
+  "Exceptions": [
+    {
+      "RuleId": "copy-the-exact-rule-id-from-Findings.json",
+      "ObjectId": "copy-the-exact-object-id-or-tenant",
+      "Reason": "Approved temporary dependency; migration is scheduled.",
+      "Owner": "Identity operations",
+      "ExpiresUtc": "2027-01-31T23:59:59Z"
+    }
+  ]
+}
+```
+
+The Action Register groups work by issue and separates administrator/team actions from end-user or application-owner actions. Suggested teams are routing guidance; no assignments are sent. Edit owner, due date and status in your copy of the CSV; the HTML remains a snapshot. Accepted findings retain their severity and score, and partial acceptance of a group of findings is labelled explicitly. Every register identifies its tenant, run, timestamps and ruleset. Configuration fixes, collection failures, historical-event reviews and manual tests have distinct verification instructions; record manual-test evidence and dates in the work item rather than treating an accepted risk as proof of a successful test.
+
+## Check coverage added in v2.1.0
+
+- **Access reviews:** reviewer and multistage settings, sensitive self-review, absent fallback reviewers, denied decisions still unapplied after seven days. A completed review is not proof that access was removed. Decision reads are bounded to 500 review instances.
+- **Lifecycle workflows:** recent run failures, failed users/tasks reported by run counters, and processing stalled for over 24 hours within a 30-day lookback. No recent run is informational; incomplete or truncated execution evidence is a coverage gap. Reads are bounded to 500 workflows.
+- **PIM for Groups:** cloud security/Microsoft 365 groups are considered in addition to role-assignable groups. Discovery is bounded to 2,000 candidate groups; reaching a limit is reported as incomplete. Member approval is checked for role-assignable groups as well as owner approval.
+- **Application credentials:** effective default/custom restrictions and object creation-date applicability. Audit review thresholds are 180 days for secrets/symmetric keys and 730 days for certificates; these are audit thresholds, not Microsoft service limits. Actor exemptions and unresolved applicability are explicit unknowns. Policies govern credential creation/update and do not revoke old credentials.
+- **Application authentication:** HTTP/wildcard redirects and implicit access-token issuance, with native-client loopback and public-client context. Redirect-domain ownership still requires manual validation.
+
+The new reads use existing documented read permissions: `Policy.Read.All`, `Application.Read.All`, `AccessReview.Read.All`, `LifecycleWorkflows.Read.All`, group reads and PIM-for-Groups reads. No apply-decisions, workflow-execution, credential-update or other write operation is performed.
+
+## Source layout and offline tests
+
+```text
+EntraAudit-PS7.ps1          runner and command-line parameters
+EntraAudit-GUI.ps1          graphical launcher
+EntraAudit.Checks.psd1      shared check IDs, switches, files, scopes and descriptions
+Checks/Invoke-*Check.ps1   one definition-only file for each check
+Library/                   shared state, Graph, governance, application and report helpers
+Tests/                     local offline tests (Git-ignored; not included on GitHub)
+```
+
+Check files retain their existing `Invoke-Check-*` function names and finding IDs. They are dot-sourced into the runner's script scope so shared caches work consistently; do not execute them directly with `&`. The loader validates the complete package before connecting. Add a check file, its manifest entry and corresponding CLI switch when introducing a new check.
+
+Local development copies may include the Git-ignored `Tests` folder. It is not included in GitHub clones or required to run the audit. When present, run these tests in PowerShell 7 without tenant credentials or Graph modules:
+
+```powershell
+pwsh -NoProfile -File .\Tests\Run-Tests.ps1
+```
+
+Each suite runs in a separate process with mocked collectors. Integration tests generate synthetic reports under the system temporary folder. Offline tests validate logic and report generation; deployment-specific permissions, licensing and live API behavior still need a read-only tenant run.
 
 ## Examples
 
@@ -411,11 +505,15 @@ Unattended (app-only, certificate), don't open a browser window:
 
 ## How the risk score works
 
-The Risk-Report **accumulates** points per finding by severity, with **diminishing returns for repeats of the same problem**: findings are grouped into *(check, rule, severity)* buckets — the *issue key* `CheckId|Rule|Severity` — and each bucket contributes **points × √count**. Every *"Permanent Global Administrator role (not just-in-time): `<user>`"* finding has the rule `privileged-roles-permanent-<role template id>`, so all permanent Global Administrators land in **one** bucket. A **higher score is worse** and volume still raises it — 28 permanent Global Admins (28 Critical findings in one bucket) score well above 8 (`25×√28 ≈ 132` vs `25×√8 ≈ 71`) — but one systemic problem repeated across many objects cannot drown out every other signal, while **distinct problems inside the same check each add their own weight**. The score is **unbounded**, so the magnitude stays visible.
+The headline **confirmed risk index** accumulates points for confirmed findings, grouped by *(check, rule, severity)* — the issue key `CheckId|Rule|Severity`. Each issue contributes **severity points × √scoring units**. Where collectors identify the affected population, units are distinct typed object IDs within that issue, independent of whether the collector emitted one grouped finding or many individual findings. Nine affected MFA administrators therefore contribute `25×√9 = 75` Critical points whether represented together or separately.
 
-The Risk-Report shows a **"What drives the score"** table — every problem with its finding count, its points and its share of the total — so the score is explainable rather than a black box.
+Populations are explicit; evidence-table rows are not scoring units. One application can have several expired credentials, and one principal can have several access paths. If only counts are available, overlapping populations are not blindly added: the largest supported population is used as a labelled lower bound. If no population is recorded, the report explicitly uses finding records. Assessed/unknown denominators are shown only when the collector supplied them. A missing count is unknown, not zero.
 
-| Severity | Points (per bucket, × √count) |
+The index is unbounded and a higher value means more accumulated audit findings. It is not a percentage secure or a probability of compromise. Compare the same tenant, ruleset, selected scope and assessment settings, and check coverage before interpreting a decrease. Version 2.2.0 introduces these population scoring rules; older rulesets require a new baseline.
+
+The Risk Report shows the population/scoring basis, finding-record count and contribution for each issue. **Highest confirmed severity** always remains visible, including accepted risks. **Action priority** and immediate actions consider work that has not been accepted; accepted risks remain in the report with their owner and expiry, and retain every point. Within open remediation, severity takes priority over accumulated points.
+
+| Severity | Points (per issue, × √scoring units) |
 |---|---|
 | Critical | 25 |
 | High | 10 |
@@ -433,7 +531,7 @@ The Risk-Report shows a **"What drives the score"** table — every problem with
 
 **Coverage is part of the result.** A score of 0 is shown as **Not fully assessed** (not *Clean*) when any selected check was skipped, stopped with an error or could not read all of its data, when there is a *Not assessed* finding, or when it is unknown which checks ran — and as **Not assessed** when none of the selected checks gave a result. `Findings.json` keeps the plain threshold band in `Score.ScoreBand` and the coverage-aware one in `Score.Band`.
 
-**Not assessed findings add points** at their severity, because a blind spot (for example an unverifiable log export) is itself a risk; they are always shown apart from confirmed problems. If a problem is confirmed on some objects and could not be checked on others, it is still **one** bucket: the confirmed part scores what it would score alone and the not-assessed part only adds the extra, so `ConfirmedScore + NotAssessedPoints = Score`. Checks that were skipped or stopped add no points — instead the band can never say *Clean*.
+**Assessment gaps are a separate measure.** `ConfirmedScore` includes confirmed findings only. `NotAssessedPoints` describes risk-bearing assessment gaps. The secondary combined operational index remains available as `Score`; it includes the confirmed contribution and the marginal contribution of gaps sharing an issue key. The exported rounded components sum to the combined total. Selected checks skipped before collection may have no finding points, but still appear in coverage and the Action Register. A lower index with less coverage does not establish improvement.
 
 Severity for standing role assignments is also **tiered by role**: tier-0 roles (Global Administrator, Privileged Role Administrator, Privileged Authentication Administrator) and guest-held roles are **Critical**; every other privileged role caps at **High**, with the risk factors (service-principal/group principal, not MFA-capable, on-prem synced) recorded on the finding instead of inflating its severity.
 
@@ -446,7 +544,7 @@ Severity for standing role assignments is also **tiered by role**: tier-0 roles 
 - **Coverage severity:** a *Not assessed* finding can carry a risk-bearing severity (including High) and affect the overall score because a monitoring/audit blind spot is itself operational risk. It is counted under *Incomplete*, not under *Problems found*, unless the same check also found a separate confirmed problem.
 - **Failed reads are never "clean":** when a Graph or optional Azure Resource Manager read that feeds a check fails, the check reports *Incomplete*, *Skipped* or *Error* instead of silently passing. A check can keep its confirmed findings and still be marked incomplete when another evidence source was unavailable. Large reads that are cut short (throttling, access denied part-way, page limits) are reported as partial reads, never as the full picture.
 - **Stable finding ids:** `Findings.json`/`.csv` ids are count- and wording-independent (a finding's id doesn't change when "5 stale users" becomes "7"), so they're usable for run-over-run trend/diff — from this version on (see the [upgrade note](#upgrade-note-finding-ids-change-once)). Every check also always writes its CSV (a `NoData` row when empty) so automation can rely on the file existing.
-- **Exit code:** the script exits `1` when the run fails: sign-in refused (including the read-only check), unknown `-select` id or empty selection, a missing check library, failed module install, run folder not writable, an output file (report page, `Findings.json`/`.csv`) that could not be written, or an unexpected error. A check that was skipped or stopped does not fail the run — see the Posture Summary and the run log.
+- **Exit codes:** `0` means no process/collection failure under the selected policy; it does not mean the tenant has no findings. `1` means startup, package, authentication, output or unexpected runner failure. `2` means a check errored or was skipped for missing scopes/permissions or unknown licensing; `-FailOnIncomplete` additionally includes partial coverage and known licensing exclusions. Reports are still written for collection failures. See `RunInfo.CollectionExitCode`, the Posture Summary and the log.
 - **Sign-in logs** are retained ~30 days; the legacy-auth check only sees that window (the legacy-client filter is applied server-side, so large tenants do not download the full sign-in log).
 - **Hybrid sync settings:** the directory-sync settings (Password Hash Sync, soft-match blocking, accidental-deletion protection, password writeback) are read from Microsoft Graph's on-premises synchronization API. If Graph refuses that read for the audit account or app, those sub-controls are *Not assessed* and the finding says how to check them in Entra Connect — do not run the audit as Global Administrator just for them (see [PREREQUISITE.md](PREREQUISITE.md#a1-directory-roles-for-the-auditor-account)).
 - A few signals (password writeback to on-premises AD, parts of the on-premises banned-password configuration, some Identity Protection detail, whether an alert really reaches someone) are not fully exposed by Graph read APIs and are reported as *must be checked by hand*.

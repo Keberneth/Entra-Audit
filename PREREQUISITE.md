@@ -12,7 +12,7 @@ There are two ways to authenticate — pick one:
 ## 0. Software prerequisites
 
 - **PowerShell 7.x** (`pwsh.exe`) on Windows.
-- `EntraAudit-PS7.ps1` and both companion check libraries (`EntraAudit-Checks-Governance.ps1` and `EntraAudit-Checks-Applications.ps1`) in the same folder. Keep `EntraAudit-GUI.ps1` there too when using the GUI.
+- The complete package: `EntraAudit-PS7.ps1`, `EntraAudit.Checks.psd1`, `Checks/` and `Library/`. Keep `EntraAudit-GUI.ps1` there too when using the GUI. The old two companion check libraries have been replaced by one file per check.
 - **Microsoft Graph PowerShell SDK v2.x** — the script uses these 8 sub-modules (not the giant meta-module):
 
   | Module | Provides |
